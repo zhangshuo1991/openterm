@@ -1,0 +1,18 @@
+[package]
+name = "openterm-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+directories.workspace = true
+libc.workspace = true
+openterm-config = { path = "../openterm-config" }
+openterm-core = { path = "../openterm-core" }
+openterm-ssh = { path = "../openterm-ssh" }
+openterm-storage = { path = "../openterm-storage" }
+tokio.workspace = true

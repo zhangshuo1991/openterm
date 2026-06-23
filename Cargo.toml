@@ -1,0 +1,52 @@
+[workspace]
+members = [
+    "crates/openterm-app",
+    "crates/openterm-cli",
+    "crates/openterm-config",
+    "crates/openterm-core",
+    "crates/openterm-crypto",
+    "crates/openterm-ssh",
+    "crates/openterm-storage",
+    "crates/openterm-terminal",
+    "crates/openterm-ui",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://example.invalid/openterm"
+rust-version = "1.82"
+
+[workspace.dependencies]
+alacritty_terminal = "0.25.1"
+anyhow = "1.0.102"
+argon2 = "0.5.3"
+async-trait = "0.1.89"
+base64 = "0.22.1"
+chacha20poly1305 = { version = "0.10.1", features = ["std"] }
+clap = { version = "4.5.58", features = ["derive"] }
+directories = "5.0.1"
+iced = { version = "0.14.0", features = ["tokio", "canvas", "advanced"] }
+libc = "0.2.186"
+redb = "2.6.3"
+russh = "0.61.1"
+russh-sftp = "2.3.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+thiserror = "2.0.18"
+tokio = { version = "1.50.0", features = ["rt-multi-thread", "macros", "sync", "time", "io-std", "io-util", "fs", "net"] }
+toml = "0.9.12"
+uuid = { version = "1.22.0", features = ["v4", "serde"] }
+zeroize = { version = "1.8.2", features = ["derive"] }
+rfd = { version = "0.15.2", features = ["tokio"] }
+
+# Optimize the shipped binary for size (the "small package" goal) without
+# hurting runtime correctness. LTO + a single codegen unit + symbol stripping
+# trade compile time for a noticeably smaller binary.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
