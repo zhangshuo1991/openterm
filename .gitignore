@@ -1,0 +1,25 @@
+# Build output
+target/
+
+# macOS
+.DS_Store
+
+# Local databases
+*.redb
+
+# Logs
+*.log
+.setting/
+
+# Distribution artifacts
+dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# AI / agent configuration
+.claude/
