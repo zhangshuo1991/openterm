@@ -8,6 +8,8 @@
 
 ---
 
+![OpenTerm Terminal Workspace](images/screenshot-main.png)
+
 ## Why OpenTerm
 
 OpenTerm is an open-source alternative to commercial SSH clients like Termius. It gives you
@@ -22,6 +24,9 @@ cloud, or running a Chromium shell.
 ## Features
 
 ### Terminal
+
+![Terminal with Tabs](images/screenshot-terminal.png)
+
 - Full PTY shell via [russh](https://github.com/warp-tech/russh)
 - Horizontal session tabs for multiple simultaneous connections
 - Scrollback, search, copy/paste, bracket paste
@@ -42,6 +47,9 @@ cloud, or running a Chromium shell.
 
 ### File Transfer
 - Dual-pane SFTP workspace (local + remote)
+
+![SFTP Dual-pane Workspace](images/screenshot-sftp.png)
+
 - Upload, download, mkdir, rename, and delete workflows
 - Local and remote directory browsing
 
@@ -71,6 +79,8 @@ cloud, or running a Chromium shell.
 - Terminal paste (`Ctrl/Cmd + Shift + V`)
 - Terminal clear (`Ctrl/Cmd + Shift + L`)
 - Right-click context menu with search, copy, paste, and clear
+
+![Settings and Themes](images/screenshot-settings.png)
 
 ## Installation
 
