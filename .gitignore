@@ -23,3 +23,6 @@ dist/
 
 # AI / agent configuration
 .claude/
+
+# Scripts
+scripts/
