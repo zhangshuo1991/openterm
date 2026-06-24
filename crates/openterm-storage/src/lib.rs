@@ -270,6 +270,7 @@ mod tests {
             terminal_font_size: 18,
             default_user: "me".to_string(),
             default_port: 2222,
+            color_scheme: "DarkTeal".to_string(),
         };
 
         assert_eq!(store.get_ui_settings().unwrap(), None);

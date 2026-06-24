@@ -395,6 +395,27 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             apply_grid(app)
         }
 
+        Message::RailDragStart => {
+            app.rail_dragging = true;
+            Task::none()
+        }
+        Message::RailDragMove(point) => {
+            if app.rail_dragging {
+                // Rail hugs the right edge: width = window_width - cursor_x.
+                let w = (app.window_size.width - point.x).clamp(180.0, 520.0);
+                app.rail_width = w;
+                let (cols, rows) = app.current_grid();
+                if let Some(session) = app.active_session_mut() {
+                    session.resize_grid(cols, rows);
+                }
+            }
+            Task::none()
+        }
+        Message::RailDragEnd => {
+            app.rail_dragging = false;
+            apply_grid(app)
+        }
+
         // --- SFTP ---
         Message::ShowFiles(show) => {
             let (sort, asc) = (app.sftp_sort, app.sftp_sort_asc);
@@ -434,6 +455,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                         let _ = tx.try_send(Command::SampleMetrics);
                         if session.monitor_panel.is_some() {
                             let _ = tx.try_send(Command::SampleProcesses);
+                            let _ = tx.try_send(Command::SamplePorts);
                         }
                     }
                 }
@@ -501,6 +523,15 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             let double = register_click(app, crate::session::SftpSide::Remote, i);
             if double && !toggle && !range && is_remote_dir(app, i) {
                 return enter_remote(app, i);
+            }
+            // Double-click a file → open in the file viewer.
+            if double && !toggle && !range && !is_remote_dir(app, i) {
+                if let Some(session) = app.active_session() {
+                    if let Some(entry) = session.remote_files.get(i) {
+                        let path = join_remote(&session.remote_path, &entry.name);
+                        return open_file_viewer(app, path);
+                    }
+                }
             }
             if let Some(session) = app.active_session_mut() {
                 session.select_click(crate::session::SftpSide::Remote, i, toggle, range);
@@ -850,6 +881,128 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
 
+        // --- File viewer ---
+        Message::OpenFileViewer(path) => open_file_viewer(app, path),
+        Message::FileViewerClose => {
+            if let Some(s) = app.active_session_mut() { s.file_viewer = None; }
+            Task::none()
+        }
+        Message::FileViewerChunk { offset, data, total } => file_viewer_chunk(app, offset, data, total),
+        Message::FileViewerToggleEdit => {
+            if let Some(s) = app.active_session_mut() {
+                if let Some(fv) = &mut s.file_viewer {
+                    let entering_edit = fv.mode != crate::session::ViewerMode::Edit;
+                    fv.mode = if entering_edit {
+                        // Populate the text_editor from current content.
+                        let text = match &fv.content {
+                            crate::session::ViewerContent::Loaded(t) => t.clone(),
+                            _ => String::new(),
+                        };
+                        fv.editor = iced::widget::text_editor::Content::with_text(&text);
+                        crate::session::ViewerMode::Edit
+                    } else {
+                        crate::session::ViewerMode::Preview
+                    };
+                }
+            }
+            Task::none()
+        }
+        Message::FileViewerAction(action) => {
+            if let Some(s) = app.active_session_mut() {
+                if let Some(fv) = &mut s.file_viewer {
+                    let is_edit = matches!(action, iced::widget::text_editor::Action::Edit(_));
+                    fv.editor.perform(action);
+                    if is_edit { fv.dirty = true; }
+                }
+            }
+            Task::none()
+        }
+        Message::FileViewerTextChanged(_) => Task::none(), // superseded by FileViewerAction
+        Message::FileViewerSearchChanged(q) => {
+            if let Some(s) = app.active_session_mut() {
+                if let Some(fv) = &mut s.file_viewer {
+                    fv.search = q;
+                    fv.refresh_matches();
+                }
+            }
+            Task::none()
+        }
+        Message::FileViewerReplaceChanged(r) => {
+            if let Some(s) = app.active_session_mut() {
+                if let Some(fv) = &mut s.file_viewer { fv.replace = r; }
+            }
+            Task::none()
+        }
+        Message::FileViewerSearchNext => {
+            if let Some(s) = app.active_session_mut() {
+                if let Some(fv) = &mut s.file_viewer {
+                    if !fv.matches.is_empty() {
+                        fv.match_idx = (fv.match_idx + 1) % fv.matches.len();
+                    }
+                }
+            }
+            Task::none()
+        }
+        Message::FileViewerSearchPrev => {
+            if let Some(s) = app.active_session_mut() {
+                if let Some(fv) = &mut s.file_viewer {
+                    if !fv.matches.is_empty() {
+                        fv.match_idx = fv.match_idx.checked_sub(1).unwrap_or(fv.matches.len() - 1);
+                    }
+                }
+            }
+            Task::none()
+        }
+        Message::FileViewerReplaceOne => {
+            if let Some(s) = app.active_session_mut() {
+                if let Some(fv) = &mut s.file_viewer {
+                    if let crate::session::ViewerContent::Loaded(ref mut c) = fv.content {
+                        if let Some(&off) = fv.matches.get(fv.match_idx) {
+                            let end = off + fv.search.len();
+                            if end <= c.len() {
+                                c.replace_range(off..end, &fv.replace.clone());
+                                fv.dirty = true;
+                                fv.refresh_matches();
+                            }
+                        }
+                    }
+                }
+            }
+            Task::none()
+        }
+        Message::FileViewerReplaceAll => {
+            if let Some(s) = app.active_session_mut() {
+                if let Some(fv) = &mut s.file_viewer {
+                    if let crate::session::ViewerContent::Loaded(ref mut c) = fv.content {
+                        if !fv.search.is_empty() {
+                            *c = c.replace(&fv.search.clone(), &fv.replace.clone());
+                            fv.dirty = true;
+                            fv.refresh_matches();
+                        }
+                    }
+                }
+            }
+            Task::none()
+        }
+        Message::FileViewerSave => file_viewer_save(app),
+        Message::FileViewerSaved(result) => {
+            if let Some(s) = app.active_session_mut() {
+                if let Some(fv) = &mut s.file_viewer {
+                    fv.saving = false;
+                    if result.is_ok() { fv.dirty = false; }
+                }
+            }
+            Task::none()
+        }
+        Message::FileViewerNextPage => file_viewer_page(app, true),
+        Message::FileViewerPrevPage => file_viewer_page(app, false),
+        Message::FileViewerScroll(v) => {
+            if let Some(s) = app.active_session_mut() {
+                if let Some(fv) = &mut s.file_viewer { fv.scroll = v; }
+            }
+            Task::none()
+        }
+
         // --- Worker events ---
         Message::Conn(event) => handle_conn_event(app, event),
     }
@@ -982,7 +1135,6 @@ fn close_tab(app: &mut App, index: usize) -> Task<Message> {
             }
         }
         app.sessions.clear();
-        app.next_session_id = 1;
         app.spawn_session(config, cols, rows);
         return Task::none();
     }
@@ -1502,8 +1654,35 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
             }
             session.processes = procs;
         }
+        ConnEvent::Ports { raw, .. } => {
+            session.ports = crate::metrics::parse_ports(&raw);
+        }
         ConnEvent::Exit { code, .. } => {
             session.status = format!("Process exited ({code})");
+        }
+        ConnEvent::FileChunk { path, offset, data, total, .. } => {
+            if let Some(fv) = &mut session.file_viewer {
+                if fv.path == path {
+                    let text = String::from_utf8_lossy(&data).into_owned();
+                    if total <= crate::session::FileViewerState::SMALL_FILE_LIMIT {
+                        fv.content = crate::session::ViewerContent::Loaded(text);
+                    } else {
+                        fv.mode = crate::session::ViewerMode::Log;
+                        fv.content = crate::session::ViewerContent::Streaming {
+                            text,
+                            total,
+                            page_offset: offset,
+                        };
+                    }
+                    fv.refresh_matches();
+                }
+            }
+        }
+        ConnEvent::FileSaved { result, .. } => {
+            if let Some(fv) = &mut session.file_viewer {
+                fv.saving = false;
+                if result.is_ok() { fv.dirty = false; }
+            }
         }
         ConnEvent::Closed { .. } => {
             session.phase = Phase::Idle;
@@ -1561,6 +1740,65 @@ fn parent_remote(path: &str) -> String {
 
 fn join_local(base: &str, name: &str) -> String {
     std::path::Path::new(base).join(name).display().to_string()
+}
+
+fn open_file_viewer(app: &mut App, path: String) -> Task<Message> {
+    use crate::session::FileViewerState;
+    let Some(session) = app.active_session_mut() else { return Task::none(); };
+    session.file_viewer = Some(FileViewerState::new_loading(path.clone()));
+    let Some(tx) = session.cmd_tx.clone() else { return Task::none(); };
+    let _ = tx.try_send(Command::ReadFileRange {
+        path,
+        offset: 0,
+        len: FileViewerState::SMALL_FILE_LIMIT,
+    });
+    Task::none()
+}
+
+/// `Message::FileViewerChunk` is never dispatched by the UI — file chunks arrive
+/// via `Message::Conn(ConnEvent::FileChunk)` and are handled in `handle_conn_event`.
+/// This stub satisfies the match arm.
+#[allow(unused_variables)]
+fn file_viewer_chunk(app: &mut App, offset: u64, data: Vec<u8>, total: u64) -> Task<Message> {
+    Task::none()
+}
+
+fn file_viewer_save(app: &mut App) -> Task<Message> {
+    let Some(session) = app.active_session_mut() else { return Task::none(); };
+    let Some(fv) = session.file_viewer.as_mut() else { return Task::none(); };
+    // In edit mode, the source of truth is the text_editor; otherwise use loaded content.
+    let data = if fv.mode == crate::session::ViewerMode::Edit {
+        fv.editor.text().into_bytes()
+    } else {
+        match &fv.content {
+            crate::session::ViewerContent::Loaded(t) => t.as_bytes().to_vec(),
+            _ => return Task::none(),
+        }
+    };
+    let path = fv.path.clone();
+    fv.saving = true;
+    let Some(tx) = session.cmd_tx.clone() else { return Task::none(); };
+    let _ = tx.try_send(Command::WriteFile { path, data });
+    Task::none()
+}
+
+fn file_viewer_page(app: &mut App, next: bool) -> Task<Message> {    use crate::session::{FileViewerState, ViewerContent};
+    let Some(session) = app.active_session_mut() else { return Task::none(); };
+    let Some(fv) = session.file_viewer.as_mut() else { return Task::none(); };
+    let (page_offset, total, path) = match &fv.content {
+        ViewerContent::Streaming { page_offset, total, .. } => (*page_offset, *total, fv.path.clone()),
+        _ => return Task::none(),
+    };
+    let new_offset = if next {
+        (page_offset + FileViewerState::PAGE_SIZE).min(total.saturating_sub(FileViewerState::PAGE_SIZE))
+    } else {
+        page_offset.saturating_sub(FileViewerState::PAGE_SIZE)
+    };
+    if new_offset == page_offset { return Task::none(); }
+    fv.content = ViewerContent::Loading;
+    let Some(tx) = session.cmd_tx.clone() else { return Task::none(); };
+    let _ = tx.try_send(Command::ReadFileRange { path, offset: new_offset, len: FileViewerState::PAGE_SIZE });
+    Task::none()
 }
 
 #[cfg(test)]

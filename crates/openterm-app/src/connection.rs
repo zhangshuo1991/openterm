@@ -85,8 +85,14 @@ pub enum Command {
     SampleMetrics,
     /// Sample the remote process list (for the monitor's CPU/Memory drill-down).
     SampleProcesses,
+    /// Sample listening TCP/UDP ports via `ss`.
+    SamplePorts,
     /// Change permissions of a remote file.
     SftpChmod { path: String, mode: u32 },
+    /// Read a byte range of a remote file for the file viewer.
+    ReadFileRange { path: String, offset: u64, len: u64 },
+    /// Write (overwrite) a remote file from the editor.
+    WriteFile { path: String, data: Vec<u8> },
     /// Close the shell and disconnect.
     Disconnect,
 }
@@ -156,6 +162,24 @@ pub enum Event {
         session_id: u64,
         raw: String,
     },
+    /// Raw stdout of `ss` port sample, parsed by the UI side.
+    Ports {
+        session_id: u64,
+        raw: String,
+    },
+    /// A chunk of a remote file for the file viewer (offset, data, file total size).
+    FileChunk {
+        session_id: u64,
+        path: String,
+        offset: u64,
+        data: Vec<u8>,
+        total: u64,
+    },
+    /// Result of writing a remote file from the editor.
+    FileSaved {
+        session_id: u64,
+        result: Result<(), String>,
+    },
     Exit {
         session_id: u64,
         code: u32,
@@ -184,6 +208,9 @@ impl Event {
             | Event::TransferFinished { session_id, .. }
             | Event::Metrics { session_id, .. }
             | Event::Processes { session_id, .. }
+            | Event::Ports { session_id, .. }
+            | Event::FileChunk { session_id, .. }
+            | Event::FileSaved { session_id, .. }
             | Event::Exit { session_id, .. }
             | Event::Closed { session_id }
             | Event::Failed { session_id, .. } => *session_id,
@@ -291,10 +318,12 @@ async fn run_connection(
         tokio::select! {
             cmd = cmd_rx.recv() => match cmd {
                 Some(Command::Write(bytes)) => {
-                    let _ = pty_in_tx.send(PtyInput::Write(bytes)).await;
+                    // Non-blocking: drop keystrokes rather than stalling the select loop
+                    // under SSH back-pressure.
+                    let _ = pty_in_tx.try_send(PtyInput::Write(bytes));
                 }
                 Some(Command::Resize { cols, rows }) => {
-                    let _ = pty_in_tx.send(PtyInput::Resize(PtySize { cols, rows })).await;
+                    let _ = pty_in_tx.try_send(PtyInput::Resize(PtySize { cols, rows }));
                 }
                 Some(Command::Connect(_)) => {
                     // Already connected; ignore duplicate connects.
@@ -340,13 +369,27 @@ async fn run_connection(
                 Some(Command::SampleProcesses) => {
                     spawn_processes(session_id, session.clone(), out.clone());
                 }
+                Some(Command::SamplePorts) => {
+                    spawn_ports(session_id, session.clone(), out.clone());
+                }
+                Some(Command::ReadFileRange { path, offset, len }) => {
+                    spawn_read_file(session_id, session.clone(), out.clone(), path, offset, len);
+                }
+                Some(Command::WriteFile { path, data }) => {
+                    spawn_write_file(session_id, session.clone(), out.clone(), path, data);
+                }
                 Some(Command::Disconnect) => break ShellOutcome::Disconnected,
                 None => break ShellOutcome::WorkerDropped,
             },
             ev = pty_ev_rx.recv() => match ev {
                 Some(PtyEvent::Output(bytes)) => {
-                    if out.send(Event::Output { session_id, bytes }).await.is_err() {
-                        break ShellOutcome::WorkerDropped;
+                    // try_send: if the UI is falling behind, drop the frame rather
+                    // than blocking the entire multiplexing loop. Only break when the
+                    // channel itself is gone (session removed from the UI).
+                    match out.try_send(Event::Output { session_id, bytes }) {
+                        Ok(()) => {}
+                        Err(e) if e.is_disconnected() => break ShellOutcome::WorkerDropped,
+                        Err(_) => {} // full — drop frame; terminal lags, doesn't freeze
                     }
                 }
                 Some(PtyEvent::ExitStatus(code)) => {
@@ -713,6 +756,38 @@ fn spawn_processes(session_id: u64, session: Arc<RusshSession>, mut out: OutSink
         if let Ok(output) = session.exec_capture(crate::metrics::PROCESS_COMMAND).await {
             let raw = String::from_utf8_lossy(&output.stdout).into_owned();
             let _ = out.send(Event::Processes { session_id, raw }).await;
+        }
+    });
+}
+
+fn spawn_read_file(session_id: u64, session: Arc<RusshSession>, mut out: OutSink, path: String, offset: u64, len: u64) {
+    tokio::spawn(async move {
+        match session.read_file_range(&path, offset, len).await {
+            Ok((data, total)) => {
+                let _ = out.send(Event::FileChunk { session_id, path, offset, data, total }).await;
+            }
+            Err(e) => {
+                let _ = out.send(Event::FileChunk {
+                    session_id, path, offset, data: Vec::new(), total: 0,
+                }).await;
+                let _ = out.send(Event::FileSaved { session_id, result: Err(e.to_string()) }).await;
+            }
+        }
+    });
+}
+
+fn spawn_write_file(session_id: u64, session: Arc<RusshSession>, mut out: OutSink, path: String, data: Vec<u8>) {
+    tokio::spawn(async move {
+        let result = session.write_file(&path, data).await.map_err(|e| e.to_string());
+        let _ = out.send(Event::FileSaved { session_id, result }).await;
+    });
+}
+
+fn spawn_ports(session_id: u64, session: Arc<RusshSession>, mut out: OutSink) {
+    tokio::spawn(async move {
+        if let Ok(output) = session.exec_capture(crate::metrics::PORT_COMMAND).await {
+            let raw = String::from_utf8_lossy(&output.stdout).into_owned();
+            let _ = out.send(Event::Ports { session_id, raw }).await;
         }
     });
 }

@@ -168,6 +168,8 @@ pub struct Session {
     pub monitor_panel: Option<MonitorPanel>,
     /// Latest process sample for the drill-down table.
     pub processes: Vec<crate::metrics::ProcessInfo>,
+    /// Listening ports sampled from `ss`.
+    pub ports: Vec<crate::metrics::PortInfo>,
     /// Recent history for the rail's line charts (cap 60). CPU%/Memory% are
     /// 0..100; network and disk-IO are bytes/s (auto-scaled when charted).
     pub cpu_history: std::collections::VecDeque<f32>,
@@ -207,6 +209,8 @@ pub struct Session {
     pub selection: Option<(usize, usize, usize, usize)>,
     /// Pending chmod operation (modal open).
     pub sftp_chmod: Option<ChmodState>,
+    /// File viewer panel (shown in the SFTP workspace right column).
+    pub file_viewer: Option<FileViewerState>,
 }
 
 /// A local filesystem entry shown in the SFTP local pane.
@@ -274,8 +278,100 @@ pub enum SftpPromptKind {
     Rename { index: usize, old: String },
 }
 
-/// A pending delete awaiting the user's confirmation. Captured when the user
-/// picks "Delete" from the context menu; the actual delete runs only on confirm.
+/// Viewing mode for the file viewer panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewerMode {
+    /// Read-only with syntax highlighting.
+    Preview,
+    /// Editable text; save writes back to the server.
+    Edit,
+    /// Large file / log: paged view with search only (no edit).
+    Log,
+}
+
+/// Content state for the file viewer.
+#[derive(Debug, Clone)]
+pub enum ViewerContent {
+    Loading,
+    /// Full text loaded (small files or edit mode).
+    Loaded(String),
+    /// Streamed view: chunks received so far, total file size, and the current page offset.
+    Streaming { text: String, total: u64, page_offset: u64 },
+    Error(String),
+}
+
+/// The right-column file viewer panel in the SFTP workspace.
+/// The right-column file viewer panel in the SFTP workspace.
+pub struct FileViewerState {
+    pub path: String,
+    pub mode: ViewerMode,
+    pub content: ViewerContent,
+    /// Multi-line editor content — used only in Edit mode.
+    pub editor: iced::widget::text_editor::Content,
+    pub scroll: f32,
+    /// Language/syntax name (empty = plain text).
+    pub lang: String,
+    pub search: String,
+    pub replace: String,
+    /// Byte offsets of search matches in the current text.
+    pub matches: Vec<usize>,
+    pub match_idx: usize,
+    pub dirty: bool,
+    pub saving: bool,
+}
+
+impl FileViewerState {
+    pub const PAGE_SIZE: u64 = 64 * 1024; // 64 KB per page
+    pub const SMALL_FILE_LIMIT: u64 = 256 * 1024; // below this: load all
+
+    pub fn new_loading(path: String) -> Self {
+        let lang = crate::highlight::lang_from_ext(&path).to_owned();
+        Self {
+            path,
+            mode: ViewerMode::Preview,
+            content: ViewerContent::Loading,
+            editor: iced::widget::text_editor::Content::new(),
+            scroll: 0.0,
+            lang,
+            search: String::new(),
+            replace: String::new(),
+            matches: Vec::new(),
+            match_idx: 0,
+            dirty: false,
+            saving: false,
+        }
+    }
+
+    /// Current displayable text (if any).
+    pub fn text(&self) -> Option<&str> {
+        match &self.content {
+            ViewerContent::Loaded(s) => Some(s.as_str()),
+            ViewerContent::Streaming { text, .. } => Some(text.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Recompute match offsets for the current search query.
+    pub fn refresh_matches(&mut self) {
+        self.matches.clear();
+        self.match_idx = 0;
+        let q = self.search.to_ascii_lowercase();
+        if q.is_empty() { return; }
+        let text = match &self.content {
+            ViewerContent::Loaded(s) => s.clone(),
+            ViewerContent::Streaming { text, .. } => text.clone(),
+            _ => return,
+        };
+        let lower = text.to_ascii_lowercase();
+        let mut start = 0;
+        while let Some(pos) = lower[start..].find(&q) {
+            self.matches.push(start + pos);
+            start += pos + q.len().max(1);
+        }
+    }
+}
+
+/// A pending delete awaiting the user's confirmation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SftpConfirm {
     pub side: SftpSide,
@@ -323,6 +419,7 @@ impl Session {
             sftp_open: false,
             monitor_panel: None,
             processes: Vec::new(),
+            ports: Vec::new(),
             cpu_history: std::collections::VecDeque::new(),
             mem_history: std::collections::VecDeque::new(),
             net_history: std::collections::VecDeque::new(),
@@ -345,6 +442,7 @@ impl Session {
             has_output: false,
             selection: None,
             sftp_chmod: None,
+            file_viewer: None,
         }
     }
 

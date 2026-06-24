@@ -7,6 +7,7 @@
 //!   the live SSH connection and multiplexes shell + SFTP over it.
 
 mod connection;
+mod highlight;
 mod keys;
 mod message;
 mod metrics;
@@ -97,6 +98,9 @@ pub struct App {
     /// Whether the always-on resource rail is collapsed (hidden) to reclaim
     /// width. Shown by default whenever the active session is connected.
     rail_collapsed: bool,
+    /// Current width of the resource rail (user-resizable by dragging its left edge).
+    rail_width: f32,
+    rail_dragging: bool,
     /// Last press on the title/drag strip, for double-click-to-zoom detection.
     last_title_click: Option<std::time::Instant>,
     /// Active name prompt (new folder / rename), shown as an overlay.
@@ -188,6 +192,8 @@ impl App {
             sftp_menu: None,
             last_sftp_click: None,
             rail_collapsed: false,
+            rail_width: ui::RAIL_WIDTH,
+            rail_dragging: false,
             last_title_click: None,
             sftp_prompt: None,
             sftp_confirm: None,
@@ -360,6 +366,14 @@ impl App {
         self.rail_collapsed
     }
 
+    pub fn rail_dragging(&self) -> bool {
+        self.rail_dragging
+    }
+
+    pub fn rail_width_value(&self) -> f32 {
+        self.rail_width
+    }
+
     /// Whether the resource rail should be shown: the active session is
     /// connected and the user hasn't collapsed it.
     pub fn rail_visible(&self) -> bool {
@@ -394,7 +408,7 @@ impl App {
             0.0
         };
         let rail = if self.rail_visible() {
-            ui::RAIL_WIDTH
+            self.rail_width
         } else {
             0.0
         };

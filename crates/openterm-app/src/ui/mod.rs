@@ -4,6 +4,7 @@
 //! on top.
 
 mod connect_card;
+mod file_viewer;
 mod footer;
 mod history;
 mod hostkey;
@@ -113,6 +114,20 @@ pub fn view(app: &App) -> Element<'_, Message> {
         .interaction(iced::mouse::Interaction::ResizingHorizontally)
         .on_move(Message::SidebarDragMove)
         .on_release(Message::SidebarDragEnd)
+        .into();
+        layers = layers.push(overlay);
+    }
+
+    // Same capture trick for the rail resize divider.
+    if app.rail_dragging() {
+        let overlay: Element<'_, Message> = mouse_area(
+            container(iced::widget::Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .interaction(iced::mouse::Interaction::ResizingHorizontally)
+        .on_move(Message::RailDragMove)
+        .on_release(Message::RailDragEnd)
         .into();
         layers = layers.push(overlay);
     }

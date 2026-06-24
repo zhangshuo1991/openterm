@@ -21,12 +21,24 @@ pub fn view(app: &App) -> Element<'_, Message> {
         return container(Space::new()).into();
     };
 
-    let panes = row![
-        container(local_pane(app, session)).width(Length::FillPortion(1)),
-        container(remote_pane(app, session)).width(Length::FillPortion(1)),
-    ]
-    .spacing(12)
-    .height(Length::Fill);
+    // When the file viewer is open, hide the local pane and show Remote + Viewer.
+    let panes: Element<'_, Message> = if let Some(fv) = &session.file_viewer {
+        row![
+            container(remote_pane(app, session)).width(Length::FillPortion(2)),
+            container(super::file_viewer::view(fv)).width(Length::FillPortion(3)),
+        ]
+        .spacing(12)
+        .height(Length::Fill)
+        .into()
+    } else {
+        row![
+            container(local_pane(app, session)).width(Length::FillPortion(1)),
+            container(remote_pane(app, session)).width(Length::FillPortion(1)),
+        ]
+        .spacing(12)
+        .height(Length::Fill)
+        .into()
+    };
 
     let mut root = column![panes].spacing(10);
     if !session.transfers.is_empty() {

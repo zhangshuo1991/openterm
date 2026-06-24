@@ -2,11 +2,11 @@
 //! charts, a summary row, and a footer grid.
 
 use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke};
-use iced::widget::{button, column, container, row, scrollable, text, Space};
+use iced::widget::{button, column, container, mouse_area, row, scrollable, text, Space};
 use iced::{Border, Color, Element, Length, Point, Rectangle, Renderer, Theme};
 
 use crate::message::Message;
-use crate::metrics::{ProcessInfo, SessionMetrics};
+use crate::metrics::{PortInfo, ProcessInfo, SessionMetrics};
 use crate::session::{MonitorPanel, Session};
 use crate::theme;
 use crate::ui::RAIL_WIDTH;
@@ -87,6 +87,8 @@ pub fn view(app: &App) -> Element<'_, Message> {
                 footer_row(m),
                 divider(),
                 process_section(session),
+                divider(),
+                ports_section(session),
             ]
             .spacing(10)
             .padding([14, 14]);
@@ -94,18 +96,33 @@ pub fn view(app: &App) -> Element<'_, Message> {
         }
     };
 
-    container(body)
-        .width(Length::Fixed(RAIL_WIDTH))
+    let rail_w = app.rail_width_value();
+    let content = container(body)
+        .width(Length::Fill)
         .height(Length::Fill)
         .style(|_| container::Style {
             background: Some(theme::surface_1().into()),
-            border: Border {
-                color: theme::border_subtle(),
-                width: 1.0,
-                radius: 0.0.into(),
-            },
+            border: Border { color: theme::border_subtle(), width: 1.0, radius: 0.0.into() },
             ..Default::default()
-        })
+        });
+
+    // Left-edge drag divider (6px wide, ResizingHorizontally cursor).
+    let divider = mouse_area(
+        container(Space::new())
+            .width(Length::Fixed(6.0))
+            .height(Length::Fill)
+            .style(|_| container::Style {
+                background: Some(theme::border_subtle().into()),
+                ..Default::default()
+            }),
+    )
+    .interaction(iced::mouse::Interaction::ResizingHorizontally)
+    .on_press(Message::RailDragStart)
+    .on_release(Message::RailDragEnd);
+
+    row![divider, content]
+        .width(Length::Fixed(rail_w))
+        .height(Length::Fill)
         .into()
 }
 
@@ -336,16 +353,58 @@ fn process_row(p: &ProcessInfo, panel: MonitorPanel) -> Element<'_, Message> {
         MonitorPanel::Cpu => p.cpu,
         MonitorPanel::Memory => p.mem,
     };
-    let name = if p.command.chars().count() > 18 {
-        format!("{}…", p.command.chars().take(17).collect::<String>())
+    let name = if p.command.chars().count() > 14 {
+        format!("{}…", p.command.chars().take(13).collect::<String>())
     } else {
         p.command.clone()
     };
     row![
-        text(name).font(theme::TERMINAL_FONT).size(11).color(theme::text_high()).width(Length::Fill),
-        text(format!("{value:.1}%")).font(theme::TERMINAL_FONT).size(11).color(theme::accent_strong()),
+        text(format!("{}", p.pid)).font(theme::TERMINAL_FONT).size(10)
+            .color(theme::text_dim()).width(Length::Fixed(44.0)),
+        text(name).font(theme::TERMINAL_FONT).size(11)
+            .color(theme::text_high()).width(Length::Fill),
+        text(format!("{value:.1}%")).font(theme::TERMINAL_FONT).size(11)
+            .color(theme::accent_strong()),
     ]
-    .spacing(6)
+    .spacing(4)
+    .align_y(iced::Alignment::Center)
+    .into()
+}
+
+// ── Ports section ─────────────────────────────────────────────────────────────
+
+const MAX_PORTS: usize = 12;
+
+fn ports_section(session: &Session) -> Element<'_, Message> {
+    let header = text("LISTENING PORTS").size(10).color(theme::text_dim());
+    let mut list = column![header].spacing(2);
+    if session.ports.is_empty() || session.monitor_panel.is_none() {
+        return list.into();
+    }
+    for p in session.ports.iter().take(MAX_PORTS) {
+        list = list.push(port_row(p));
+    }
+    list.into()
+}
+
+fn port_row(p: &PortInfo) -> Element<'_, Message> {
+    let proto_color = if p.proto == "udp" { theme::text_muted() } else { theme::accent() };
+    let proc = if p.process.is_empty() {
+        p.pid.map(|id| id.to_string()).unwrap_or_else(|| "—".to_string())
+    } else if p.process.chars().count() > 12 {
+        format!("{}…", p.process.chars().take(11).collect::<String>())
+    } else {
+        p.process.clone()
+    };
+    row![
+        text(p.proto.to_uppercase()).font(theme::TERMINAL_FONT).size(9)
+            .color(proto_color).width(Length::Fixed(30.0)),
+        text(format!(":{}", p.port)).font(theme::TERMINAL_FONT).size(11)
+            .color(theme::text_high()).width(Length::Fixed(52.0)),
+        text(proc).font(theme::TERMINAL_FONT).size(10)
+            .color(theme::text_muted()).width(Length::Fill),
+    ]
+    .spacing(4)
     .align_y(iced::Alignment::Center)
     .into()
 }

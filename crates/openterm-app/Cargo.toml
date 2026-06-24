@@ -19,3 +19,5 @@ openterm-ui = { path = "../openterm-ui" }
 tokio.workspace = true
 rfd.workspace = true
 libc.workspace = true
+syntect = { version = "5.2", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
+once_cell = "1.20"

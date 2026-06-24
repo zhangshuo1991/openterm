@@ -965,6 +965,25 @@ impl RusshSession {
         Ok(bytes)
     }
 
+    /// Read `len` bytes starting at `offset` from a remote file.
+    pub async fn read_file_range(&self, remote_path: &str, offset: u64, len: u64) -> Result<(Vec<u8>, u64), SshError> {
+        let sftp = self.open_sftp().await?;
+        let total = sftp.metadata(remote_path).await?.size.unwrap_or(0);
+        let mut file = sftp.open(remote_path).await?;
+        file.seek(std::io::SeekFrom::Start(offset)).await?;
+        let cap = len.min(total.saturating_sub(offset)) as usize;
+        let mut buf = vec![0u8; cap];
+        let mut pos = 0;
+        while pos < cap {
+            let n = file.read(&mut buf[pos..]).await?;
+            if n == 0 { break; }
+            pos += n;
+        }
+        buf.truncate(pos);
+        let _ = sftp.close().await;
+        Ok((buf, total))
+    }
+
     pub async fn write_file(&self, remote_path: &str, bytes: Vec<u8>) -> Result<(), SshError> {
         let sftp = self.open_sftp().await?;
         let mut file = sftp.create(remote_path).await?;

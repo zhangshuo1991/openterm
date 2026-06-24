@@ -32,6 +32,10 @@ pub enum Message {
     SidebarDragStart,
     SidebarDragMove(Point),
     SidebarDragEnd,
+    /// Drag the left edge of the resource rail to resize it.
+    RailDragStart,
+    RailDragMove(Point),
+    RailDragEnd,
 
     // --- Session tabs ---
     SelectTab(usize),
@@ -171,6 +175,37 @@ pub enum Message {
     PaletteRunSelected,
     PaletteRun(Box<Message>),
     ClosePalette,
+
+    // --- File Viewer ---
+    /// Open the file viewer for the given remote path (single click in SFTP).
+    OpenFileViewer(String),
+    /// Close the file viewer panel.
+    FileViewerClose,
+    /// A chunk of file content arrived from the connection actor.
+    FileViewerChunk { offset: u64, data: Vec<u8>, total: u64 },
+    /// Switch between Preview and Edit mode.
+    FileViewerToggleEdit,
+    /// Editor action (multi-line text_editor widget).
+    FileViewerAction(iced::widget::text_editor::Action),
+    /// Text changed in the editor (legacy single-line path, unused).
+    FileViewerTextChanged(String),
+    /// Search query changed.
+    FileViewerSearchChanged(String),
+    /// Replace string changed.
+    FileViewerReplaceChanged(String),
+    FileViewerSearchNext,
+    FileViewerSearchPrev,
+    FileViewerReplaceOne,
+    FileViewerReplaceAll,
+    /// Save the edited file back to the server.
+    FileViewerSave,
+    /// FileSaved event: Ok or Err message.
+    FileViewerSaved(Result<(), String>),
+    /// Load the next page (log mode).
+    FileViewerNextPage,
+    FileViewerPrevPage,
+    /// Scroll position updated.
+    FileViewerScroll(f32),
 
     // --- Connection worker events ---
     Conn(ConnEvent),

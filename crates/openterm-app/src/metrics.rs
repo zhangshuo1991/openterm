@@ -112,6 +112,71 @@ pub const PROCESS_COMMAND: &str = "\
 echo @@PS@@; ps -eo pid,user:20,pcpu,pmem,rss,comm 2>/dev/null; \
 echo @@END@@";
 
+/// A listening TCP/UDP port sampled from `ss`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortInfo {
+    pub port: u16,
+    pub proto: String,   // "tcp" or "udp"
+    pub pid: Option<u32>,
+    pub process: String,
+}
+
+/// Sample listening ports via `ss -tlnp` (TCP) + `ss -ulnp` (UDP).
+/// Falls back gracefully: if `ss` is absent the output is empty → no rows shown.
+pub const PORT_COMMAND: &str = "\
+echo @@PORTS@@; \
+ss -tlnp 2>/dev/null; \
+ss -ulnp 2>/dev/null; \
+echo @@END@@";
+
+/// Parse `ss -tlnp / -ulnp` output (between `@@PORTS@@` and `@@END@@`).
+/// ss row: `State  Recv-Q  Send-Q  Local  Peer  Process`
+/// Local field looks like `0.0.0.0:22` or `*:8080`.
+pub fn parse_ports(stdout: &str) -> Vec<PortInfo> {
+    let mut out = Vec::new();
+    let mut in_section = false;
+    for line in stdout.lines() {
+        if let Some(marker) = line.strip_prefix("@@").and_then(|l| l.strip_suffix("@@")) {
+            in_section = marker == "PORTS";
+            continue;
+        }
+        if !in_section { continue; }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        // Expect ≥5 fields; first is State (LISTEN), 4th is Local:Port
+        if fields.len() < 5 { continue; }
+        let state = fields[0];
+        if !matches!(state, "LISTEN" | "UNCONN") { continue; }
+        let proto = if state == "UNCONN" { "udp" } else { "tcp" };
+        let local = fields[3];
+        let port_str = local.rsplit(':').next().unwrap_or("");
+        let port = match port_str.parse::<u16>() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        // Process field looks like `users:(("sshd",pid=1234,fd=3),...)`
+        let (pid, process) = fields.get(5).map(|s| parse_ss_process(s))
+            .unwrap_or((None, String::new()));
+        out.push(PortInfo { port, proto: proto.to_string(), pid, process });
+    }
+    out.sort_by_key(|p| p.port);
+    out.dedup_by_key(|p| (p.port, p.proto.clone()));
+    out
+}
+
+fn parse_ss_process(s: &str) -> (Option<u32>, String) {
+    // users:(("nginx",pid=12345,fd=6))
+    let pid = s.find("pid=")
+        .and_then(|i| s[i + 4..].split(',').next())
+        .and_then(|p| p.split(')').next())
+        .and_then(|p| p.parse::<u32>().ok());
+    let name = s.trim_start_matches("users:((\"")
+        .split('"')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    (pid, name)
+}
+
 /// Parse `ps` output (between `@@PS@@` and `@@END@@`) into process rows.
 /// Layout: `PID USER %CPU %MEM RSS COMMAND` — the first 5 columns are
 /// whitespace-delimited; everything after is the command (may contain spaces).
