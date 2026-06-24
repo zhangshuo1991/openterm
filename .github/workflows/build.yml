@@ -1,0 +1,87 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release -p openterm-app
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist/OpenTerm
+          cp target/release/openterm-app.exe dist/OpenTerm/OpenTerm.exe
+          cd dist
+          7z a OpenTerm-windows-x86_64.zip OpenTerm/
+          ls -lh OpenTerm-windows-x86_64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenTerm-windows-x86_64
+          path: dist/OpenTerm-windows-x86_64.zip
+
+  macos-arm64:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release -p openterm-app
+
+      - name: Package
+        shell: bash
+        run: |
+          APP="dist/OpenTerm.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cat > "$APP/Contents/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleDevelopmentRegion</key><string>en</string>
+            <key>CFBundleDisplayName</key><string>OpenTerm</string>
+            <key>CFBundleExecutable</key><string>OpenTerm</string>
+            <key>CFBundleIdentifier</key><string>dev.openterm.app</string>
+            <key>CFBundleName</key><string>OpenTerm</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>0.1.0</string>
+            <key>CFBundleVersion</key><string>1</string>
+            <key>LSMinimumSystemVersion</key><string>12.0</string>
+            <key>CFBundleIconFile</key><string>AppIcon</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict></plist>
+          PLIST
+          cp target/release/openterm-app "$APP/Contents/MacOS/OpenTerm"
+          chmod +x "$APP/Contents/MacOS/OpenTerm"
+          cp assets/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+          touch "$APP"
+          /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP" 2>/dev/null || true
+          cd dist
+          zip -qr OpenTerm-macos-arm64.zip OpenTerm.app
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenTerm-macos-arm64
+          path: dist/OpenTerm-macos-arm64.zip
