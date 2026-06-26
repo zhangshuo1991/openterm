@@ -202,6 +202,17 @@ pub struct Session {
     input_buf: Vec<u8>,
     /// Whether we're skipping an ANSI escape sequence during capture.
     input_escape: bool,
+    /// Enter was pressed but we haven't seen the shell's response yet;
+    /// commit command history on the next `write_output` call (after tab
+    /// completion bytes are guaranteed to be in the terminal).
+    enter_pending: bool,
+    /// Accumulates output bytes after command commit for Terminal Memory.
+    output_buf: Vec<u8>,
+    /// Whether output capture is active (between command commit and next Enter).
+    capturing_output: bool,
+    /// Snapshot of the previous command's output (ANSI-stripped, capped),
+    /// finalized when the next command arrives.
+    pub committed_output: String,
     /// Whether any remote output has been written (keeps the terminal visible
     /// after disconnect so the final screen stays readable).
     pub has_output: bool,
@@ -209,6 +220,8 @@ pub struct Session {
     pub selection: Option<(usize, usize, usize, usize)>,
     /// Pending chmod operation (modal open).
     pub sftp_chmod: Option<ChmodState>,
+    /// Error from the last local `read_dir` (e.g. macOS TCC permission denied).
+    pub local_error: Option<String>,
     /// File viewer panel (shown in the SFTP workspace right column).
     pub file_viewer: Option<FileViewerState>,
 }
@@ -439,9 +452,14 @@ impl Session {
             command_history: Vec::new(),
             input_buf: Vec::new(),
             input_escape: false,
+            enter_pending: false,
+            output_buf: Vec::new(),
+            capturing_output: false,
+            committed_output: String::new(),
             has_output: false,
             selection: None,
             sftp_chmod: None,
+            local_error: None,
             file_viewer: None,
         }
     }
@@ -477,6 +495,25 @@ impl Session {
 
     /// Feed remote bytes into this session's own grid.
     pub fn write_output(&mut self, bytes: &[u8]) {
+        // Commit deferred history entry before writing new output.
+        // At this point all tab-completion bytes are already in the terminal
+        // (SSH stream is ordered), so cursor_line_text() sees the full command.
+        if self.enter_pending {
+            // Snapshot previous command's output and start a fresh capture.
+            self.committed_output = strip_ansi_truncated(&self.output_buf, 5_000);
+            self.output_buf.clear();
+            self.capturing_output = true;
+
+            let tline = self.terminal.cursor_line_text();
+            self.commit_input_line(Some(&tline));
+            self.enter_pending = false;
+        } else if self.capturing_output {
+            self.output_buf.extend_from_slice(bytes);
+            // Hard cap: stop accumulating after 5 KB to bound memory usage.
+            if self.output_buf.len() >= 5_000 {
+                self.capturing_output = false;
+            }
+        }
         let _ = self.terminal.write_remote_output(bytes);
         self.has_output = true;
     }
@@ -497,7 +534,13 @@ impl Session {
             }
             match b {
                 0x1b => self.input_escape = true, // ESC
-                b'\r' | b'\n' => self.commit_input_line(),
+                b'\r' | b'\n' => {
+                    // Don't commit yet: tab-completion bytes from the remote
+                    // shell may still be in flight. Defer to write_output so
+                    // the terminal is fully updated before we read it.
+                    // input_buf is kept as fallback (cleared by commit_input_line).
+                    self.enter_pending = true;
+                }
                 0x7f | 0x08 => {
                     // Backspace: drop the last full UTF-8 char.
                     while self.input_buf.pop().is_some_and(|c| (c & 0xc0) == 0x80) {}
@@ -510,21 +553,24 @@ impl Session {
         }
     }
 
-    fn commit_input_line(&mut self) {
-        if self.input_buf.is_empty() {
-            return;
-        }
-        let line = String::from_utf8_lossy(&self.input_buf).trim().to_string();
+    fn commit_input_line(&mut self, terminal_line: Option<&str>) {
+        // strip_prompt is a module-level fn defined below.
+        // Prefer the terminal's current line (post-tab-completion) over the raw
+        // typed bytes. Fall back to input_buf if no recognisable prompt is found.
+        let line = terminal_line
+            .and_then(strip_prompt)
+            .map(str::to_string)
+            .or_else(|| {
+                let s = String::from_utf8_lossy(&self.input_buf).trim().to_string();
+                if s.is_empty() { None } else { Some(s) }
+            });
         self.input_buf.clear();
-        if line.is_empty() {
-            return;
-        }
+        let Some(line) = line else { return };
         // Skip consecutive duplicates.
         if self.command_history.last().map(String::as_str) == Some(line.as_str()) {
             return;
         }
         self.command_history.push(line);
-        // Bound memory.
         if self.command_history.len() > 200 {
             let overflow = self.command_history.len() - 200;
             self.command_history.drain(0..overflow);
@@ -547,25 +593,31 @@ impl Session {
     /// Re-read the local directory into `local_files`, applying `sort`.
     pub fn refresh_local(&mut self, sort: SortField, ascending: bool) {
         let mut entries = Vec::new();
-        if let Ok(read) = std::fs::read_dir(&self.local_path) {
-            for entry in read.flatten() {
-                let path = entry.path();
-                let meta = entry.metadata().ok();
-                let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-                let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-                let modified = meta
-                    .as_ref()
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                entries.push(LocalEntry {
-                    name: entry.file_name().to_string_lossy().to_string(),
-                    path,
-                    is_dir,
-                    size,
-                    modified,
-                });
+        match std::fs::read_dir(&self.local_path) {
+            Ok(read) => {
+                for entry in read.flatten() {
+                    let path = entry.path();
+                    let meta = entry.metadata().ok();
+                    let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+                    let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                    let modified = meta
+                        .as_ref()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    entries.push(LocalEntry {
+                        name: entry.file_name().to_string_lossy().to_string(),
+                        path,
+                        is_dir,
+                        size,
+                        modified,
+                    });
+                }
+                self.local_error = None;
+            }
+            Err(e) => {
+                self.local_error = Some(format!("Cannot read directory: {e}"));
             }
         }
         sort_local(&mut entries, sort, ascending);
@@ -619,6 +671,43 @@ impl Session {
             }
         }
     }
+}
+
+/// Strip ANSI escape sequences from terminal output and truncate to max_bytes.
+fn strip_ansi_truncated(bytes: &[u8], max_bytes: usize) -> String {
+    let raw = String::from_utf8_lossy(bytes);
+    let mut result = String::new();
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                while let Some(&ch) = chars.peek() {
+                    chars.next();
+                    if ch.is_ascii_alphabetic() || ch == '~' {
+                        break;
+                    }
+                }
+            }
+        } else {
+            result.push(c);
+            if result.len() >= max_bytes {
+                break;
+            }
+        }
+    }
+    result.trim_end().to_string()
+}
+
+/// Strip a shell prompt from `line` and return the command portion.
+/// Finds the rightmost occurrence of `$ `, `# `, or `% ` and returns everything after it.
+fn strip_prompt(line: &str) -> Option<&str> {
+    ["$ ", "# ", "% "]
+        .iter()
+        .filter_map(|t| line.rfind(t).map(|pos| (pos, line[pos + t.len()..].trim())))
+        .max_by_key(|(pos, _)| *pos)
+        .map(|(_, cmd)| cmd)
+        .filter(|s| !s.is_empty())
 }
 
 /// Order local entries: directories always first, then by the chosen field.
@@ -685,7 +774,9 @@ mod tests {
     fn captures_typed_commands_on_enter() {
         let mut s = session();
         s.track_input(b"ls -la\r");
+        s.write_output(b"\r\n");
         s.track_input(b"whoami\n");
+        s.write_output(b"\r\n");
         assert_eq!(s.command_history, vec!["ls -la", "whoami"]);
     }
 
@@ -729,6 +820,7 @@ mod tests {
         s.track_input(b"echoo"); // trailing typo
         s.track_input(&[0x7f]); // erase the extra 'o'
         s.track_input(b" hi\r");
+        s.write_output(b"\r\n");
         assert_eq!(s.command_history, vec!["echo hi"]);
     }
 
@@ -737,6 +829,7 @@ mod tests {
         let mut s = session();
         // Up-arrow (ESC [ A) in the middle should be skipped, not recorded.
         s.track_input(b"cd \x1b[A/tmp\r");
+        s.write_output(b"\r\n");
         assert_eq!(s.command_history, vec!["cd /tmp"]);
     }
 
@@ -746,6 +839,7 @@ mod tests {
         s.track_input(b"rm -rf /"); // oops
         s.track_input(&[0x03]); // Ctrl-C
         s.track_input(b"ls\r");
+        s.write_output(b"\r\n");
         assert_eq!(s.command_history, vec!["ls"]);
     }
 
@@ -753,7 +847,9 @@ mod tests {
     fn skips_consecutive_duplicates() {
         let mut s = session();
         s.track_input(b"ls\r");
+        s.write_output(b"\r\n");
         s.track_input(b"ls\r");
+        s.write_output(b"\r\n");
         assert_eq!(s.command_history, vec!["ls"]);
     }
 }

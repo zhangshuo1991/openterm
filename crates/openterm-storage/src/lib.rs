@@ -18,6 +18,9 @@ pub struct HistoryEntry {
     /// "user@host" label for the session this command came from.
     pub host: String,
     pub cmd: String,
+    /// First ~5 KB of the command's output (ANSI-stripped). Empty for old entries.
+    #[serde(default)]
+    pub output: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -219,6 +222,31 @@ impl WorkspaceStore {
             .collect();
         entries.reverse(); // newest-first
         Ok(entries)
+    }
+
+    /// Backfill the output field of the most recent history entry.
+    pub fn update_last_history_output(&self, output: &str) -> Result<(), StorageError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(HISTORY)?;
+            // Collect key + updated bytes before any mutable borrow.
+            let update = table
+                .iter()?
+                .next_back()
+                .transpose()?
+                .map(|(k, v)| -> Result<_, StorageError> {
+                    let key = k.value();
+                    let mut entry: HistoryEntry = serde_json::from_slice(v.value())?;
+                    entry.output = output.to_string();
+                    Ok((key, serde_json::to_vec(&entry)?))
+                })
+                .transpose()?;
+            if let Some((key, bytes)) = update {
+                table.insert(key, bytes.as_slice())?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
     }
 
     /// Delete all history entries.

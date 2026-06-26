@@ -221,33 +221,9 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
 
         // --- Terminal ---
         Message::TerminalInput(bytes) => {
-            // Collect a new entry (if any) before any other borrow of `app`.
-            let new_entry: Option<openterm_storage::HistoryEntry> = {
-                if let Some(session) = app.active_session_mut() {
-                    session.terminal.scroll_to_bottom();
-                    let prev_len = session.command_history.len();
-                    session.track_input(&bytes);
-                    if session.command_history.len() > prev_len {
-                        session.command_history.last().map(|cmd| openterm_storage::HistoryEntry {
-                            ts_ms: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis() as u64,
-                            host: session.config.target_label(),
-                            cmd: cmd.clone(),
-                        })
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            };
-            if let Some(entry) = new_entry {
-                if let Ok(store) = openterm_storage::WorkspaceStore::open(&app.db_path) {
-                    let _ = store.append_history(&entry);
-                }
-                app.all_history.insert(0, entry);
+            if let Some(session) = app.active_session_mut() {
+                session.terminal.scroll_to_bottom();
+                session.track_input(&bytes);
             }
             if let Some(session) = app.active_session() {
                 if let Some(tx) = &session.cmd_tx {
@@ -489,24 +465,40 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             refresh_local_active(app);
             sftp_refresh(app)
         }
-        Message::SftpSetSort(field) => {
-            // Toggle direction if same field, else switch field ascending.
-            if app.sftp_sort == field {
-                app.sftp_sort_asc = !app.sftp_sort_asc;
+        Message::SftpSetSort(side, field) => {
+            use crate::session::SftpSide;
+            let (cur_sort, cur_asc) = match side {
+                SftpSide::Local => (app.sftp_sort_local, app.sftp_sort_asc_local),
+                SftpSide::Remote => (app.sftp_sort, app.sftp_sort_asc),
+            };
+            let (new_sort, new_asc) = if cur_sort == field {
+                (field, !cur_asc)
             } else {
-                app.sftp_sort = field;
-                app.sftp_sort_asc = true;
+                (field, true)
+            };
+            match side {
+                SftpSide::Local => {
+                    app.sftp_sort_local = new_sort;
+                    app.sftp_sort_asc_local = new_asc;
+                }
+                SftpSide::Remote => {
+                    app.sftp_sort = new_sort;
+                    app.sftp_sort_asc = new_asc;
+                }
             }
-            let (sort, asc) = (app.sftp_sort, app.sftp_sort_asc);
             if let Some(session) = app.active_session_mut() {
-                crate::session::sort_local(&mut session.local_files, sort, asc);
-                crate::session::sort_remote(&mut session.remote_files, sort, asc);
-                // Indices change under a re-sort; clear selection to avoid
-                // pointing at the wrong rows.
-                session.selected_local.clear();
-                session.selected_remote.clear();
-                session.local_anchor = None;
-                session.remote_anchor = None;
+                match side {
+                    SftpSide::Local => {
+                        crate::session::sort_local(&mut session.local_files, new_sort, new_asc);
+                        session.selected_local.clear();
+                        session.local_anchor = None;
+                    }
+                    SftpSide::Remote => {
+                        crate::session::sort_remote(&mut session.remote_files, new_sort, new_asc);
+                        session.selected_remote.clear();
+                        session.remote_anchor = None;
+                    }
+                }
             }
             Task::none()
         }
@@ -1530,7 +1522,37 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
             touch_host_id = session.config.host_id;
         }
         ConnEvent::Output { bytes, .. } => {
+            let prev_len = session.command_history.len();
             session.write_output(&bytes);
+            let new_entry = if session.command_history.len() > prev_len {
+                // Backfill the previous in-memory entry with its now-captured output.
+                let committed = std::mem::take(&mut session.committed_output);
+                if !committed.is_empty() {
+                    if let Some(prev) = app.all_history.first_mut() {
+                        prev.output.clone_from(&committed);
+                    }
+                    if let Ok(store) = openterm_storage::WorkspaceStore::open(&app.db_path) {
+                        let _ = store.update_last_history_output(&committed);
+                    }
+                }
+                session.command_history.last().map(|cmd: &String| openterm_storage::HistoryEntry {
+                    ts_ms: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64,
+                    host: session.config.target_label(),
+                    cmd: cmd.clone(),
+                    output: String::new(),
+                })
+            } else {
+                None
+            };
+            if let Some(entry) = new_entry {
+                if let Ok(store) = openterm_storage::WorkspaceStore::open(&app.db_path) {
+                    let _ = store.append_history(&entry);
+                }
+                app.all_history.insert(0, entry);
+            }
             crate::smoke::record(&smoke, "output");
             // Smoke: once the shell is producing output, open SFTP once to
             // exercise the GUI list path end-to-end. Deferred until after the

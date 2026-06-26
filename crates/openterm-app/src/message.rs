@@ -116,7 +116,7 @@ pub enum Message {
     /// Collapse the process expander.
     MonitorCloseDetail,
     SftpRefresh,
-    SftpSetSort(crate::session::SortField),
+    SftpSetSort(crate::session::SftpSide, crate::session::SortField),
     SftpRemotePathChanged(String),
     SftpSelectRemote(usize),
     /// Enter the remote directory at this index (single click on a folder).

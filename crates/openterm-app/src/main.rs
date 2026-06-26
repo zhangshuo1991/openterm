@@ -90,6 +90,8 @@ pub struct App {
     /// SFTP sort field + direction (shared by both panes).
     sftp_sort: session::SortField,
     sftp_sort_asc: bool,
+    sftp_sort_local: session::SortField,
+    sftp_sort_asc_local: bool,
     /// Which SFTP row (if any) has its context menu open: (side, index).
     sftp_menu: Option<(session::SftpSide, usize)>,
     /// Last SFTP row click (side, index, time) for double-click detection:
@@ -189,6 +191,8 @@ impl App {
             default_port: settings.default_port.to_string(),
             sftp_sort: session::SortField::Name,
             sftp_sort_asc: true,
+            sftp_sort_local: session::SortField::Name,
+            sftp_sort_asc_local: true,
             sftp_menu: None,
             last_sftp_click: None,
             rail_collapsed: false,
@@ -561,10 +565,12 @@ impl App {
             timeout: CONNECT_TIMEOUT,
         };
 
+        let jump = parse_jump_host(config.jump_host.trim(), user)?;
+
         Ok(ConnectRoute {
             target: profile,
             target_options: options,
-            jump: None,
+            jump,
         })
     }
 
@@ -707,6 +713,52 @@ fn default_known_hosts_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".ssh")
         .join("known_hosts")
+}
+
+/// Parse a jump-host string of the form `[user@]host[:port]` into a
+/// `(HostProfile, ConnectOptions)` pair ready for `ConnectRoute::jump`.
+/// Returns `Ok(None)` when the string is empty (no jump host configured).
+fn parse_jump_host(
+    s: &str,
+    default_user: &str,
+) -> Result<Option<(HostProfile, ConnectOptions)>, String> {
+    if s.is_empty() {
+        return Ok(None);
+    }
+    // Split user@rest
+    let (user, rest) = match s.split_once('@') {
+        Some((u, r)) => (u.to_string(), r),
+        None => (default_user.to_string(), s),
+    };
+    // Split host:port (use rsplit to handle IPv6 like [::1]:22)
+    let (host, port) = match rest.rsplit_once(':') {
+        Some((h, p)) => {
+            let port: u16 = p
+                .parse()
+                .map_err(|_| "Jump host port must be a number between 1 and 65535.".to_string())?;
+            (h.to_string(), port)
+        }
+        None => (rest.to_string(), 22u16),
+    };
+    if host.is_empty() {
+        return Err("Jump host address is required.".to_string());
+    }
+    if user.is_empty() {
+        return Err("Jump host username is required.".to_string());
+    }
+    let mut profile = HostProfile::new(host.clone(), host);
+    profile.port = port;
+    profile.username = Some(user.clone());
+    let options = ConnectOptions {
+        username: user,
+        auth: AuthMethod::AgentOrDefault,
+        trust_unknown_host_keys: false,
+        host_key_policy: HostKeyPolicy::ConfirmNew {
+            known_hosts: default_known_hosts_path(),
+        },
+        timeout: CONNECT_TIMEOUT,
+    };
+    Ok(Some((profile, options)))
 }
 
 fn current_timestamp() -> String {

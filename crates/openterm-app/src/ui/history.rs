@@ -65,7 +65,9 @@ pub fn view(app: &App) -> Element<'_, Message> {
             if q.is_empty() {
                 true
             } else {
-                e.cmd.to_lowercase().contains(&q) || e.host.to_lowercase().contains(&q)
+                e.cmd.to_lowercase().contains(&q)
+                || e.host.to_lowercase().contains(&q)
+                || e.output.to_lowercase().contains(&q)
             }
         })
         .collect();
@@ -143,7 +145,23 @@ fn history_row(entry: &openterm_storage::HistoryEntry) -> Element<'_, Message> {
         .color(theme::text_high())
         .wrapping(iced::widget::text::Wrapping::None);
 
-    let inner = column![meta, cmd_label].spacing(2);
+    let mut inner = column![meta, cmd_label].spacing(2);
+
+    // Add 2-line output preview if output exists
+    if !entry.output.is_empty() {
+        let preview: String = entry
+            .output
+            .lines()
+            .take(2)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let output_preview = text(preview)
+            .font(theme::TERMINAL_FONT)
+            .size(11)
+            .color(theme::text_dim())
+            .wrapping(iced::widget::text::Wrapping::None);
+        inner = inner.push(output_preview);
+    }
 
     button(inner)
         .width(Length::Fill)

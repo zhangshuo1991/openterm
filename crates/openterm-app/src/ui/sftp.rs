@@ -86,6 +86,11 @@ fn local_pane<'a>(app: &'a App, session: &'a Session) -> Element<'a, Message> {
     .align_y(iced::Alignment::Center);
 
     let mut list = column![].spacing(1);
+    if let Some(err) = &session.local_error {
+        list = list.push(
+            text(err.clone()).size(11).color(iced::Color::from_rgb(0.9, 0.3, 0.3)),
+        );
+    }
     for (index, entry) in session.local_files.iter().enumerate() {
         let selected = session.selected_local.contains(&index);
         // Single click selects; a double click on a folder enters it (the
@@ -108,7 +113,7 @@ fn local_pane<'a>(app: &'a App, session: &'a Session) -> Element<'a, Message> {
         ));
     }
 
-    pane("Local", app, toolbar, list)
+    pane("Local", SftpSide::Local, app, toolbar, list)
 }
 
 fn remote_pane<'a>(app: &'a App, session: &'a Session) -> Element<'a, Message> {
@@ -149,11 +154,12 @@ fn remote_pane<'a>(app: &'a App, session: &'a Session) -> Element<'a, Message> {
         ));
     }
 
-    pane("Remote", app, toolbar, list)
+    pane("Remote", SftpSide::Remote, app, toolbar, list)
 }
 
 fn pane<'a>(
     title: &'a str,
+    side: SftpSide,
     app: &'a App,
     toolbar: iced::widget::Row<'a, Message>,
     list: iced::widget::Column<'a, Message>,
@@ -163,9 +169,9 @@ fn pane<'a>(
             .size(14)
             .color(theme::text_high())
             .width(Length::Fill),
-        sort_button("Name", SortField::Name, app),
-        sort_button("Size", SortField::Size, app),
-        sort_button("Date", SortField::Modified, app),
+        sort_button("Name", SortField::Name, side, app),
+        sort_button("Size", SortField::Size, side, app),
+        sort_button("Date", SortField::Modified, side, app),
     ]
     .spacing(6)
     .align_y(iced::Alignment::Center);
@@ -192,11 +198,14 @@ fn pane<'a>(
 
 // --- shared widgets ---
 
-fn sort_button<'a>(label: &'a str, field: SortField, app: &'a App) -> Element<'a, Message> {
-    let active = app.sftp_sort == field;
-    // Direction caret only on the active field. ▲/▼ are common geometric glyphs.
+fn sort_button<'a>(label: &'a str, field: SortField, side: SftpSide, app: &'a App) -> Element<'a, Message> {
+    let (cur_sort, cur_asc) = match side {
+        SftpSide::Local => (app.sftp_sort_local, app.sftp_sort_asc_local),
+        SftpSide::Remote => (app.sftp_sort, app.sftp_sort_asc),
+    };
+    let active = cur_sort == field;
     let caption = if active {
-        format!("{label} {}", if app.sftp_sort_asc { "▲" } else { "▼" })
+        format!("{label} {}", if cur_asc { "▲" } else { "▼" })
     } else {
         label.to_string()
     };
@@ -206,7 +215,7 @@ fn sort_button<'a>(label: &'a str, field: SortField, app: &'a App) -> Element<'a
         theme::text_muted()
     }))
     .padding([4, 8])
-    .on_press(Message::SftpSetSort(field))
+    .on_press(Message::SftpSetSort(side, field))
     .style(move |_, status| {
         let hovered = matches!(status, button::Status::Hovered);
         button::Style {
