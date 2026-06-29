@@ -764,13 +764,16 @@ impl RusshSession {
     /// this does not require ownership, so an actor holding `Arc<RusshSession>` can tear
     /// the connection down while shell and SFTP channels are multiplexed over it.
     pub async fn disconnect(&self) -> Result<(), SshError> {
-        self.handle
-            .disconnect(Disconnect::ByApplication, "", "English")
-            .await?;
+        let timeout = std::time::Duration::from_secs(5);
+        let _ = tokio::time::timeout(
+            timeout,
+            self.handle.disconnect(Disconnect::ByApplication, "", "English"),
+        ).await;
         if let Some(jump_handle) = &self.jump_handle {
-            jump_handle
-                .disconnect(Disconnect::ByApplication, "", "English")
-                .await?;
+            let _ = tokio::time::timeout(
+                timeout,
+                jump_handle.disconnect(Disconnect::ByApplication, "", "English"),
+            ).await;
         }
         Ok(())
     }
@@ -927,78 +930,87 @@ impl RusshSession {
     /// Resolve a (possibly relative) remote path to its absolute form.
     pub async fn canonicalize(&self, path: &str) -> Result<String, SshError> {
         let sftp = self.open_sftp().await?;
-        let resolved = sftp.canonicalize(path).await?;
+        let result = sftp.canonicalize(path).await.map_err(SshError::from);
         let _ = sftp.close().await;
-        Ok(resolved)
+        result
     }
 
     pub async fn list_dir(&self, path: &str) -> Result<Vec<RemoteFileEntry>, SshError> {
         let sftp = self.open_sftp().await?;
-        let mut entries = sftp
-            .read_dir(path)
-            .await?
-            .map(|entry| {
-                let metadata = entry.metadata();
-                RemoteFileEntry {
-                    name: entry.file_name(),
-                    path: entry.path(),
-                    kind: remote_file_kind(metadata.file_type()),
-                    size: metadata.size,
-                    permissions: metadata.permissions,
-                    modified: metadata.mtime,
-                }
-            })
-            .collect::<Vec<_>>();
-        entries.sort_by(|a, b| {
-            let a_dir = matches!(a.kind, RemoteFileKind::Directory);
-            let b_dir = matches!(b.kind, RemoteFileKind::Directory);
-            b_dir.cmp(&a_dir).then_with(|| a.name.cmp(&b.name))
-        });
+        let result: Result<Vec<RemoteFileEntry>, SshError> = async {
+            let mut entries = sftp
+                .read_dir(path)
+                .await?
+                .map(|entry| {
+                    let metadata = entry.metadata();
+                    RemoteFileEntry {
+                        name: entry.file_name(),
+                        path: entry.path(),
+                        kind: remote_file_kind(metadata.file_type()),
+                        size: metadata.size,
+                        permissions: metadata.permissions,
+                        modified: metadata.mtime,
+                    }
+                })
+                .collect::<Vec<_>>();
+            entries.sort_by(|a, b| {
+                let a_dir = matches!(a.kind, RemoteFileKind::Directory);
+                let b_dir = matches!(b.kind, RemoteFileKind::Directory);
+                b_dir.cmp(&a_dir).then_with(|| a.name.cmp(&b.name))
+            });
+            Ok(entries)
+        }.await;
         let _ = sftp.close().await;
-        Ok(entries)
+        result
     }
 
     pub async fn read_file(&self, remote_path: &str) -> Result<Vec<u8>, SshError> {
         let sftp = self.open_sftp().await?;
-        let bytes = sftp.read(remote_path).await?;
+        let result = sftp.read(remote_path).await.map_err(SshError::from);
         let _ = sftp.close().await;
-        Ok(bytes)
+        result
     }
 
     /// Read `len` bytes starting at `offset` from a remote file.
     pub async fn read_file_range(&self, remote_path: &str, offset: u64, len: u64) -> Result<(Vec<u8>, u64), SshError> {
         let sftp = self.open_sftp().await?;
-        let total = sftp.metadata(remote_path).await?.size.unwrap_or(0);
-        let mut file = sftp.open(remote_path).await?;
-        file.seek(std::io::SeekFrom::Start(offset)).await?;
-        let cap = len.min(total.saturating_sub(offset)) as usize;
-        let mut buf = vec![0u8; cap];
-        let mut pos = 0;
-        while pos < cap {
-            let n = file.read(&mut buf[pos..]).await?;
-            if n == 0 { break; }
-            pos += n;
-        }
-        buf.truncate(pos);
+        let result: Result<(Vec<u8>, u64), SshError> = async {
+            let total = sftp.metadata(remote_path).await?.size.unwrap_or(0);
+            let mut file = sftp.open(remote_path).await?;
+            file.seek(std::io::SeekFrom::Start(offset)).await?;
+            let cap = len.min(total.saturating_sub(offset)) as usize;
+            let mut buf = vec![0u8; cap];
+            let mut pos = 0;
+            while pos < cap {
+                let n = file.read(&mut buf[pos..]).await?;
+                if n == 0 { break; }
+                pos += n;
+            }
+            buf.truncate(pos);
+            Ok((buf, total))
+        }.await;
         let _ = sftp.close().await;
-        Ok((buf, total))
+        result
     }
 
     pub async fn write_file(&self, remote_path: &str, bytes: Vec<u8>) -> Result<(), SshError> {
         let sftp = self.open_sftp().await?;
-        let mut file = sftp.create(remote_path).await?;
-        file.write_all(&bytes).await?;
-        file.shutdown().await?;
+        let result: Result<(), SshError> = async {
+            let mut file = sftp.create(remote_path).await?;
+            file.write_all(&bytes).await?;
+            file.shutdown().await?;
+            Ok(())
+        }.await;
         let _ = sftp.close().await;
-        Ok(())
+        result
     }
 
     /// Size of a remote file in bytes (0 if unknown).
     pub async fn remote_file_size(&self, remote_path: &str) -> Result<u64, SshError> {
         let sftp = self.open_sftp().await?;
-        let size = sftp.metadata(remote_path).await?.size.unwrap_or(0);
+        let result = sftp.metadata(remote_path).await.map(|m| m.size.unwrap_or(0)).map_err(SshError::from);
         let _ = sftp.close().await;
-        Ok(size)
+        result
     }
 
     /// Download a remote file to a local path, streaming in chunks and reporting
@@ -1132,68 +1144,48 @@ impl RusshSession {
         progress: mpsc::Sender<u64>,
     ) -> Result<u64, SshError> {
         let sftp = self.open_sftp().await?;
-        let total = tokio::fs::metadata(local_path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let part = format!("{remote_path}.part");
-
-        // Resume from a valid-prefix remote `.part`; otherwise start fresh.
-        let existing = match sftp.metadata(&part).await {
-            Ok(m) => m.size.unwrap_or(0),
-            Err(_) => 0,
-        };
-        let resume = if existing > 0 && existing <= total {
-            existing
-        } else {
-            0
-        };
-
-        let mut local = tokio::fs::File::open(local_path).await?;
-        let mut remote = if resume > 0 {
-            // Keep the partial bytes (no TRUNCATE) and append from the offset.
-            let mut f = sftp
-                .open_with_flags(&part, OpenFlags::WRITE | OpenFlags::CREATE)
-                .await?;
-            local.seek(std::io::SeekFrom::Start(resume)).await?;
-            f.seek(std::io::SeekFrom::Start(resume)).await?;
-            f
-        } else {
-            sftp.open_with_flags(
-                &part,
-                OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE,
-            )
-            .await?
-        };
-
-        let mut transferred = resume;
-        let _ = progress.send(transferred).await;
-        let mut buffer = vec![0_u8; 256 * 1024];
-        loop {
-            let read = local.read(&mut buffer).await?;
-            if read == 0 {
-                break;
-            }
-            remote.write_all(&buffer[..read]).await?;
-            transferred += read as u64;
+        let result: Result<u64, SshError> = async {
+            let total = tokio::fs::metadata(local_path).await.map(|m| m.len()).unwrap_or(0);
+            let part = format!("{remote_path}.part");
+            let existing = match sftp.metadata(&part).await {
+                Ok(m) => m.size.unwrap_or(0),
+                Err(_) => 0,
+            };
+            let resume = if existing > 0 && existing <= total { existing } else { 0 };
+            let mut local = tokio::fs::File::open(local_path).await?;
+            let mut remote = if resume > 0 {
+                let mut f = sftp.open_with_flags(&part, OpenFlags::WRITE | OpenFlags::CREATE).await?;
+                local.seek(std::io::SeekFrom::Start(resume)).await?;
+                f.seek(std::io::SeekFrom::Start(resume)).await?;
+                f
+            } else {
+                sftp.open_with_flags(&part, OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE).await?
+            };
+            let mut transferred = resume;
             let _ = progress.send(transferred).await;
-        }
-        remote.flush().await?; // drain outstanding write acks
-        remote.shutdown().await?;
-
-        // Promote `.part` → final. SSH_FXP_RENAME fails if the target exists, so
-        // remove any existing final first (the chosen overwrite policy).
-        let _ = sftp.remove_file(remote_path).await;
-        sftp.rename(&part, remote_path).await?;
+            let mut buffer = vec![0_u8; 256 * 1024];
+            loop {
+                let read = local.read(&mut buffer).await?;
+                if read == 0 { break; }
+                remote.write_all(&buffer[..read]).await?;
+                transferred += read as u64;
+                let _ = progress.send(transferred).await;
+            }
+            remote.flush().await?;
+            remote.shutdown().await?;
+            let _ = sftp.remove_file(remote_path).await;
+            sftp.rename(&part, remote_path).await?;
+            Ok(transferred)
+        }.await;
         let _ = sftp.close().await;
-        Ok(transferred)
+        result
     }
 
     pub async fn create_dir(&self, remote_path: &str) -> Result<(), SshError> {
         let sftp = self.open_sftp().await?;
-        sftp.create_dir(remote_path).await?;
+        let result = sftp.create_dir(remote_path).await.map_err(SshError::from);
         let _ = sftp.close().await;
-        Ok(())
+        result
     }
 
     pub async fn remove_path(
@@ -1214,9 +1206,9 @@ impl RusshSession {
 
     pub async fn rename_path(&self, old_path: &str, new_path: &str) -> Result<(), SshError> {
         let sftp = self.open_sftp().await?;
-        sftp.rename(old_path, new_path).await?;
+        let result = sftp.rename(old_path, new_path).await.map_err(SshError::from);
         let _ = sftp.close().await;
-        Ok(())
+        result
     }
 
     /// Change the permissions of a remote file (SFTP setstat).
@@ -1224,9 +1216,9 @@ impl RusshSession {
         let sftp = self.open_sftp().await?;
         let mut attrs = FileAttributes::default();
         attrs.permissions = Some(mode);
-        sftp.set_metadata(path, attrs).await?;
+        let result = sftp.set_metadata(path, attrs).await.map_err(SshError::from);
         let _ = sftp.close().await;
-        Ok(())
+        result
     }
 
     pub async fn run_local_forward(

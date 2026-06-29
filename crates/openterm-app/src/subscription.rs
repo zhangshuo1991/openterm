@@ -39,6 +39,28 @@ pub fn subscription(app: &App) -> Subscription<Message> {
         .unwrap_or(false);
     let palette_open = app.palette_open;
 
+    // Vault auto-lock heartbeat: a 60s tick drives both the 15-minute idle
+    // timeout and sleep detection (a large gap between ticks implies the
+    // machine slept). Always on so the vault locks even while idle.
+    let vault_tick = iced::time::every(std::time::Duration::from_secs(60))
+        .map(|_| Message::VaultCheckLock);
+
+    // While the vault overlay is up it gates everything: only Enter (submit)
+    // and Esc (manual lock when already unlockable) reach the app, and no
+    // keystrokes leak to the terminal.
+    if app.vault_overlay_active() {
+        let keys = keyboard::listen().filter_map(|event| {
+            let keyboard::Event::KeyPressed { key, .. } = event else {
+                return None;
+            };
+            match key.as_ref() {
+                Key::Named(key::Named::Enter) => Some(Message::VaultSubmit),
+                _ => None,
+            }
+        });
+        return Subscription::batch([connections, modifiers, keys, vault_tick]);
+    }
+
     // While the settings overlay is open, Esc closes it.
     if app.settings_open {
         let keys = keyboard::listen().filter_map(|event| {
@@ -50,7 +72,37 @@ pub fn subscription(app: &App) -> Subscription<Message> {
                 _ => None,
             }
         });
-        return Subscription::batch([connections, modifiers, keys]);
+        return Subscription::batch([connections, modifiers, keys, vault_tick]);
+    }
+
+    // While terminal search is open, Esc closes it and app shortcuts still
+    // work; typing flows to the focused search box (Enter jumps to the next
+    // match), not the terminal.
+    if app.terminal_search.is_some() {
+        let search_keys = keyboard::listen().filter_map(|event| {
+            let keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
+                return None;
+            };
+            // App shortcuts (Cmd+F again, copy, etc.) still work.
+            if let Some(message) = app_shortcut(&key, modifiers) {
+                return Some(message);
+            }
+            match key.as_ref() {
+                Key::Named(key::Named::Escape) => Some(Message::TerminalSearchClose),
+                _ => None,
+            }
+        });
+        let frames = if app.any_animating() {
+            window::frames().map(Message::Tick)
+        } else {
+            Subscription::none()
+        };
+        let metrics = if active_connected {
+            iced::time::every(std::time::Duration::from_secs(2)).map(|_| Message::MetricsTick)
+        } else {
+            Subscription::none()
+        };
+        return Subscription::batch([connections, modifiers, search_keys, frames, metrics, vault_tick]);
     }
 
     // While the palette is open it owns the keyboard (nav + run + close).
@@ -67,12 +119,12 @@ pub fn subscription(app: &App) -> Subscription<Message> {
                 _ => None,
             }
         });
-        let frames = if app.card_animating() {
-            window::frames().map(Message::Tick)
-        } else {
-            Subscription::none()
-        };
-        return Subscription::batch([connections, modifiers, palette_keys, frames]);
+    let frames = if app.any_animating() {
+        window::frames().map(Message::Tick)
+    } else {
+        Subscription::none()
+    };
+    return Subscription::batch([connections, modifiers, palette_keys, frames, vault_tick]);
     }
 
     // `with` carries the connected flag into the (non-capturing) filter_map.
@@ -113,7 +165,7 @@ pub fn subscription(app: &App) -> Subscription<Message> {
 
     // Animation frames — only subscribed while an animation is in flight, so
     // idle CPU stays at zero.
-    let frames = if app.card_animating() {
+    let frames = if app.any_animating() {
         window::frames().map(Message::Tick)
     } else {
         Subscription::none()
@@ -122,6 +174,13 @@ pub fn subscription(app: &App) -> Subscription<Message> {
     // Ping saved hosts every 30s to show latency in the sidebar.
     let ping_tick = iced::time::every(std::time::Duration::from_secs(30))
         .map(|_| Message::PingTick);
+
+    // Connecting-dot pulse: slow heartbeat while any session is handshaking.
+    let pulse = if app.sessions.iter().any(|s| s.phase == Phase::Connecting) {
+        iced::time::every(std::time::Duration::from_millis(700)).map(|_| Message::PulseTick)
+    } else {
+        Subscription::none()
+    };
 
     // IME commit events (Chinese/Japanese/Korean input confirmed).
     let ime = if active_connected {
@@ -136,7 +195,7 @@ pub fn subscription(app: &App) -> Subscription<Message> {
         Subscription::none()
     };
 
-    Subscription::batch([connections, modifiers, typing, resize, metrics, frames, ping_tick, ime])
+    Subscription::batch([connections, modifiers, typing, resize, metrics, frames, ping_tick, pulse, ime, vault_tick])
 }
 
 /// Builder for `Subscription::run_with` — must be a non-capturing fn pointer.
@@ -159,6 +218,7 @@ fn app_shortcut(key: &Key, modifiers: Modifiers) -> Option<Message> {
         Key::Character(v) if v.eq_ignore_ascii_case("t") => Some(Message::NewTab),
         Key::Character(v) if v.eq_ignore_ascii_case("w") => Some(Message::CloseTab(usize::MAX)),
         Key::Character(v) if v.eq_ignore_ascii_case("k") => Some(Message::TogglePalette),
+        Key::Character(v) if v.eq_ignore_ascii_case("f") => Some(Message::TerminalSearchOpen),
         Key::Character(v) if v.eq_ignore_ascii_case("c") => Some(Message::TerminalCopy),
         Key::Character(v) if v.eq_ignore_ascii_case("v") => Some(Message::PasteRequested),
         Key::Character(v) if v == "+" || v == "=" => Some(Message::FontSizeDelta(1)),

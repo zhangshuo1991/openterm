@@ -312,6 +312,12 @@ async fn run_connection(
             .event_shell(shell_opts, &mut pty_in_rx, pty_ev_tx)
             .await
     });
+    // #16: track all fire-and-forget tasks so they're aborted on disconnect.
+    let mut bg_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    // #5: accumulate output bytes and flush at ~60fps to reduce per-byte overhead.
+    let mut output_buf: Vec<u8> = Vec::new();
+    let mut flush_tick = tokio::time::interval(std::time::Duration::from_millis(16));
+    flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Main multiplexing loop.
     let outcome = loop {
@@ -329,73 +335,85 @@ async fn run_connection(
                     // Already connected; ignore duplicate connects.
                 }
                 Some(Command::SftpList(path)) => {
-                    spawn_sftp_list(session_id, session.clone(), out.clone(), path);
+                    bg_tasks.push(spawn_sftp_list(session_id, session.clone(), out.clone(), path));
                 }
                 Some(Command::SftpDownload { id, name, remote, local, size, is_dir }) => {
-                    spawn_transfer(
+                    bg_tasks.push(spawn_transfer(
                         session_id,
                         session.clone(),
                         out.clone(),
                         Transfer { id, name, direction: Direction::Download, remote, local, size, is_dir },
-                    );
+                    ));
                 }
                 Some(Command::SftpUpload { id, name, local, remote, size, is_dir }) => {
-                    spawn_transfer(
+                    bg_tasks.push(spawn_transfer(
                         session_id,
                         session.clone(),
                         out.clone(),
                         Transfer { id, name, direction: Direction::Upload, remote, local, size, is_dir },
-                    );
+                    ));
                 }
                 Some(Command::SftpMkdir(path)) => {
-                    spawn_sftp_simple(session_id, session.clone(), out.clone(),
-                        SftpOp::Mkdir(path));
+                    bg_tasks.push(spawn_sftp_simple(session_id, session.clone(), out.clone(),
+                        SftpOp::Mkdir(path)));
                 }
                 Some(Command::SftpRemove { path, is_dir }) => {
-                    spawn_sftp_simple(session_id, session.clone(), out.clone(),
-                        SftpOp::Remove { path, is_dir });
+                    bg_tasks.push(spawn_sftp_simple(session_id, session.clone(), out.clone(),
+                        SftpOp::Remove { path, is_dir }));
                 }
                 Some(Command::SftpRename { from, to }) => {
-                    spawn_sftp_simple(session_id, session.clone(), out.clone(),
-                        SftpOp::Rename { from, to });
+                    bg_tasks.push(spawn_sftp_simple(session_id, session.clone(), out.clone(),
+                        SftpOp::Rename { from, to }));
                 }
                 Some(Command::SftpChmod { path, mode }) => {
-                    spawn_sftp_simple(session_id, session.clone(), out.clone(),
-                        SftpOp::Chmod { path, mode });
+                    bg_tasks.push(spawn_sftp_simple(session_id, session.clone(), out.clone(),
+                        SftpOp::Chmod { path, mode }));
                 }
                 Some(Command::SampleMetrics) => {
-                    spawn_metrics(session_id, session.clone(), out.clone());
+                    bg_tasks.push(spawn_metrics(session_id, session.clone(), out.clone()));
                 }
                 Some(Command::SampleProcesses) => {
-                    spawn_processes(session_id, session.clone(), out.clone());
+                    bg_tasks.push(spawn_processes(session_id, session.clone(), out.clone()));
                 }
                 Some(Command::SamplePorts) => {
-                    spawn_ports(session_id, session.clone(), out.clone());
+                    bg_tasks.push(spawn_ports(session_id, session.clone(), out.clone()));
                 }
                 Some(Command::ReadFileRange { path, offset, len }) => {
-                    spawn_read_file(session_id, session.clone(), out.clone(), path, offset, len);
+                    bg_tasks.push(spawn_read_file(session_id, session.clone(), out.clone(), path, offset, len));
                 }
                 Some(Command::WriteFile { path, data }) => {
-                    spawn_write_file(session_id, session.clone(), out.clone(), path, data);
+                    bg_tasks.push(spawn_write_file(session_id, session.clone(), out.clone(), path, data));
                 }
                 Some(Command::Disconnect) => break ShellOutcome::Disconnected,
                 None => break ShellOutcome::WorkerDropped,
             },
             ev = pty_ev_rx.recv() => match ev {
                 Some(PtyEvent::Output(bytes)) => {
-                    // try_send: if the UI is falling behind, drop the frame rather
-                    // than blocking the entire multiplexing loop. Only break when the
-                    // channel itself is gone (session removed from the UI).
+                    output_buf.extend_from_slice(&bytes);
+                }
+                Some(PtyEvent::ExitStatus(code)) => {
+                    // Flush buffered bytes before the exit event so order is preserved.
+                    if !output_buf.is_empty() {
+                        let _ = out.try_send(Event::Output { session_id, bytes: std::mem::take(&mut output_buf) });
+                    }
+                    let _ = out.send(Event::Exit { session_id, code }).await;
+                }
+                Some(PtyEvent::Closed) | None => {
+                    if !output_buf.is_empty() {
+                        let _ = out.try_send(Event::Output { session_id, bytes: std::mem::take(&mut output_buf) });
+                    }
+                    break ShellOutcome::Closed;
+                }
+            },
+            _ = flush_tick.tick() => {
+                if !output_buf.is_empty() {
+                    let bytes = std::mem::take(&mut output_buf);
                     match out.try_send(Event::Output { session_id, bytes }) {
                         Ok(()) => {}
                         Err(e) if e.is_disconnected() => break ShellOutcome::WorkerDropped,
-                        Err(_) => {} // full — drop frame; terminal lags, doesn't freeze
+                        Err(_) => {}
                     }
                 }
-                Some(PtyEvent::ExitStatus(code)) => {
-                    let _ = out.send(Event::Exit { session_id, code }).await;
-                }
-                Some(PtyEvent::Closed) | None => break ShellOutcome::Closed,
             }
         }
     };
@@ -403,6 +421,7 @@ async fn run_connection(
     // Tear down this connection.
     let _ = session.disconnect().await;
     shell_task.abort();
+    for h in bg_tasks { h.abort(); }
 
     match outcome {
         ShellOutcome::WorkerDropped => ControlFlow::Break(()),
@@ -431,8 +450,8 @@ enum SftpOp {
 
 type OutSink = iced::futures::channel::mpsc::Sender<Event>;
 
-fn spawn_sftp_list(session_id: u64, session: Arc<RusshSession>, mut out: OutSink, path: String) {
-    tokio::spawn(async move {
+fn spawn_sftp_list(session_id: u64, session: Arc<RusshSession>, mut out: OutSink, path: String) -> tokio::task::JoinHandle<()> {
+    return tokio::spawn(async move {
         // Resolve relative paths (e.g. "." on connect) to an absolute path so
         // "Up" navigation has somewhere to go.
         let resolved = session
@@ -467,8 +486,8 @@ struct Transfer {
 /// A directory is walked first to build a flat file list and a true total, then
 /// every file streams with progress accumulated across the whole tree, so a
 /// folder appears as one transfer with one aggregate progress bar.
-fn spawn_transfer(session_id: u64, session: Arc<RusshSession>, mut out: OutSink, t: Transfer) {
-    tokio::spawn(async move {
+fn spawn_transfer(session_id: u64, session: Arc<RusshSession>, mut out: OutSink, t: Transfer) -> tokio::task::JoinHandle<()> {
+    return tokio::spawn(async move {
         // Build the work list of (remote, local, size) and the overall total.
         // A directory is expanded into its files (creating the destination
         // directory skeleton as a side effect); a single file is its own list.
@@ -697,8 +716,8 @@ fn join_remote(base: &str, name: &str) -> String {
     }
 }
 
-fn spawn_sftp_simple(session_id: u64, session: Arc<RusshSession>, mut out: OutSink, op: SftpOp) {
-    tokio::spawn(async move {
+fn spawn_sftp_simple(session_id: u64, session: Arc<RusshSession>, mut out: OutSink, op: SftpOp) -> tokio::task::JoinHandle<()> {
+    return tokio::spawn(async move {
         let message = match op {
             SftpOp::Mkdir(path) => session
                 .create_dir(&path)
@@ -740,8 +759,8 @@ fn spawn_sftp_simple(session_id: u64, session: Arc<RusshSession>, mut out: OutSi
 /// Sample remote resource usage in one round-trip and ship the raw stdout to
 /// the UI, which parses it (see `metrics.rs`). Errors are swallowed: a failed
 /// sample just means the monitor keeps its last values until the next tick.
-fn spawn_metrics(session_id: u64, session: Arc<RusshSession>, mut out: OutSink) {
-    tokio::spawn(async move {
+fn spawn_metrics(session_id: u64, session: Arc<RusshSession>, mut out: OutSink) -> tokio::task::JoinHandle<()> {
+    return tokio::spawn(async move {
         if let Ok(output) = session.exec_capture(crate::metrics::SAMPLE_COMMAND).await {
             let raw = String::from_utf8_lossy(&output.stdout).into_owned();
             let _ = out.send(Event::Metrics { session_id, raw }).await;
@@ -751,8 +770,8 @@ fn spawn_metrics(session_id: u64, session: Arc<RusshSession>, mut out: OutSink) 
 
 /// Sample the remote process list (`ps`) for the monitor's drill-down. Errors
 /// are swallowed: a failed sample keeps the last list until the next tick.
-fn spawn_processes(session_id: u64, session: Arc<RusshSession>, mut out: OutSink) {
-    tokio::spawn(async move {
+fn spawn_processes(session_id: u64, session: Arc<RusshSession>, mut out: OutSink) -> tokio::task::JoinHandle<()> {
+    return tokio::spawn(async move {
         if let Ok(output) = session.exec_capture(crate::metrics::PROCESS_COMMAND).await {
             let raw = String::from_utf8_lossy(&output.stdout).into_owned();
             let _ = out.send(Event::Processes { session_id, raw }).await;
@@ -760,8 +779,8 @@ fn spawn_processes(session_id: u64, session: Arc<RusshSession>, mut out: OutSink
     });
 }
 
-fn spawn_read_file(session_id: u64, session: Arc<RusshSession>, mut out: OutSink, path: String, offset: u64, len: u64) {
-    tokio::spawn(async move {
+fn spawn_read_file(session_id: u64, session: Arc<RusshSession>, mut out: OutSink, path: String, offset: u64, len: u64) -> tokio::task::JoinHandle<()> {
+    return tokio::spawn(async move {
         match session.read_file_range(&path, offset, len).await {
             Ok((data, total)) => {
                 let _ = out.send(Event::FileChunk { session_id, path, offset, data, total }).await;
@@ -776,15 +795,15 @@ fn spawn_read_file(session_id: u64, session: Arc<RusshSession>, mut out: OutSink
     });
 }
 
-fn spawn_write_file(session_id: u64, session: Arc<RusshSession>, mut out: OutSink, path: String, data: Vec<u8>) {
-    tokio::spawn(async move {
+fn spawn_write_file(session_id: u64, session: Arc<RusshSession>, mut out: OutSink, path: String, data: Vec<u8>) -> tokio::task::JoinHandle<()> {
+    return tokio::spawn(async move {
         let result = session.write_file(&path, data).await.map_err(|e| e.to_string());
         let _ = out.send(Event::FileSaved { session_id, result }).await;
     });
 }
 
-fn spawn_ports(session_id: u64, session: Arc<RusshSession>, mut out: OutSink) {
-    tokio::spawn(async move {
+fn spawn_ports(session_id: u64, session: Arc<RusshSession>, mut out: OutSink) -> tokio::task::JoinHandle<()> {
+    return tokio::spawn(async move {
         if let Ok(output) = session.exec_capture(crate::metrics::PORT_COMMAND).await {
             let raw = String::from_utf8_lossy(&output.stdout).into_owned();
             let _ = out.send(Event::Ports { session_id, raw }).await;

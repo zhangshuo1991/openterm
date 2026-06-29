@@ -32,8 +32,6 @@ use std::collections::HashMap;
 use crate::message::Message;
 use crate::session::{AuthMode, Session, SessionConfig};
 
-/// Default master password for the local vault (offline, account-free).
-const VAULT_MASTER: &str = "openterm-local-default-vault-v1";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn main() -> iced::Result {
@@ -116,7 +114,7 @@ pub struct App {
     history_width: f32,
     history_dragging: bool,
     /// All persisted history entries (newest-first), loaded at startup.
-    pub all_history: Vec<openterm_storage::HistoryEntry>,
+    pub all_history: std::collections::VecDeque<openterm_storage::HistoryEntry>,
     /// Live keyword filter for the history panel (not persisted).
     pub history_filter: String,
     /// Whether the settings panel overlay is open.
@@ -143,7 +141,42 @@ pub struct App {
     pub smoke_open_menu: bool,
     /// Entrance animation for the connection card; `now` is the latest frame.
     card_anim: Animation<bool>,
+    /// Sidebar collapse/expand slide animation (false = collapsed / 0 px).
+    sidebar_anim: Animation<bool>,
+    /// History panel slide animation (false = hidden / 0 px).
+    history_anim: Animation<bool>,
+    /// Settings overlay slide-in (false = hidden, true = fully shown).
+    settings_anim: Animation<bool>,
+    /// Toggled every ~700 ms while any session is connecting, drives the pulse.
+    pub connecting_pulse: bool,
     now: Instant,
+
+    // --- Terminal search (Cmd+F) ---
+    /// Current search query; None when the bar is closed.
+    pub terminal_search: Option<String>,
+    /// Which visible match is the "current" one (cycles mod match count).
+    pub terminal_search_idx: usize,
+
+    // --- Vault master password ---
+    /// In-memory master password. None while locked.
+    pub vault_master: Option<String>,
+    /// Whether a canary exists in storage (i.e. password was set up before).
+    pub vault_has_canary: bool,
+    /// Password field in the lock / setup dialog.
+    pub vault_pw: String,
+    /// Confirm field (only used during first-time setup).
+    pub vault_confirm: String,
+    /// Error string shown inside the vault dialog.
+    pub vault_err: Option<String>,
+    /// Time the vault was last used (encrypt/decrypt). Drives the 15 min auto-lock.
+    pub vault_last_use: Instant,
+    /// Time of the last VaultCheckLock tick. Large gaps imply the system slept.
+    pub vault_last_check: Instant,
+    /// When set, force the first-time master-password setup dialog even though
+    /// no canary exists yet (triggered by saving a credential on a fresh vault).
+    pub vault_setup_prompt: bool,
+    /// A `SaveHost` was deferred until the vault is set up/unlocked; re-run it after.
+    pub vault_resume_save: bool,
 }
 
 impl App {
@@ -154,7 +187,7 @@ impl App {
                 (
                     store.list_hosts().unwrap_or_default(),
                     store.get_ui_settings().ok().flatten().unwrap_or_default(),
-                    store.load_history().unwrap_or_default(),
+                    store.load_history().unwrap_or_default().into(),
                 )
             })
             .unwrap_or_default();
@@ -221,8 +254,29 @@ impl App {
             smoke_download_pending: false,
             smoke_open_menu: false,
             card_anim: Animation::new(false).quick(),
+            sidebar_anim: Animation::new(true).quick(),
+            history_anim: Animation::new(false).quick(),
+            settings_anim: Animation::new(false).quick(),
+            connecting_pulse: false,
             now: Instant::now(),
+            terminal_search: None,
+            terminal_search_idx: 0,
+            vault_master: None,
+            vault_has_canary: false, // will be set below
+            vault_pw: String::new(),
+            vault_confirm: String::new(),
+            vault_err: None,
+            vault_last_use: Instant::now(),
+            vault_last_check: Instant::now(),
+            vault_setup_prompt: false,
+            vault_resume_save: false,
         };
+        // Check whether a master-password canary already exists.
+        app.vault_has_canary = WorkspaceStore::open(&app.db_path)
+            .ok()
+            .and_then(|s| s.get_master_canary().ok())
+            .flatten()
+            .is_some();
         // Always start with one blank session so the workspace is never empty.
         app.spawn_session(app.blank_config(), cols, rows);
         // Kick off the entrance animation for the first card.
@@ -451,18 +505,74 @@ impl App {
         self.card_anim.is_animating(self.now)
     }
 
+    /// Visually-rendered sidebar width (0 → full during collapse/expand).
+    pub fn sidebar_visual_width(&self) -> f32 {
+        self.sidebar_anim.interpolate(0.0_f32, self.sidebar_width, self.now)
+    }
+
+    /// True while the sidebar slide is in progress (frames still needed).
+    pub fn sidebar_animating(&self) -> bool {
+        self.sidebar_anim.is_animating(self.now)
+    }
+
+    /// Visually-rendered history panel width (0 → full during open/close).
+    pub fn history_visual_width(&self) -> f32 {
+        self.history_anim.interpolate(0.0_f32, self.history_width, self.now)
+    }
+
+    /// True while the history slide is in progress.
+    pub fn history_animating(&self) -> bool {
+        self.history_anim.is_animating(self.now)
+    }
+
+    /// Settings overlay entrance progress 0.0→1.0.
+    pub fn settings_progress(&self) -> f32 {
+        self.settings_anim.interpolate(0.0_f32, 1.0_f32, self.now)
+    }
+
+    /// True while any animation needs frames.
+    pub fn any_animating(&self) -> bool {
+        self.card_anim.is_animating(self.now)
+            || self.sidebar_anim.is_animating(self.now)
+            || self.history_anim.is_animating(self.now)
+            || self.settings_anim.is_animating(self.now)
+    }
+
     // --- vault: encrypt/decrypt saved passwords ---
+
+    /// Bytes of the in-memory master password. Empty slice when locked.
+    fn vault_master_bytes(&self) -> &[u8] {
+        self.vault_master.as_deref().unwrap_or("").as_bytes()
+    }
+
+    /// True when the vault is locked (no master password in memory).
+    pub fn vault_locked(&self) -> bool {
+        self.vault_master.is_none()
+    }
+
+    /// Whether the blocking vault overlay should be shown: either a master
+    /// password exists and we're locked (must unlock to use saved creds), or a
+    /// credential save triggered first-time setup on a fresh vault.
+    pub fn vault_overlay_active(&self) -> bool {
+        (self.vault_has_canary && self.vault_locked()) || self.vault_setup_prompt
+    }
+
+    /// Reset the 15-minute inactivity timer.
+    pub fn touch_vault(&mut self) {
+        self.vault_last_use = Instant::now();
+    }
 
     fn vault(&self) -> LocalVault {
         LocalVault::new(VaultConfig::default())
     }
 
     fn decrypt_secret(&self, id: openterm_core::SecretId) -> Option<String> {
+        if self.vault_locked() { return None; }
         let store = WorkspaceStore::open(&self.db_path).ok()?;
         let secret = store.get_secret(id).ok().flatten()?;
         let bytes = self
             .vault()
-            .decrypt_secret(VAULT_MASTER.as_bytes(), &secret)
+            .decrypt_secret(self.vault_master_bytes(), &secret)
             .ok()?;
         String::from_utf8(bytes).ok()
     }
@@ -648,7 +758,7 @@ fn persist_host(app: &App, config: &SessionConfig) -> Result<HostId, String> {
         AuthMode::Agent => AuthRef::AgentOrDefault,
         AuthMode::Password => {
             let secret = vault
-                .encrypt_secret(VAULT_MASTER.as_bytes(), config.password.as_bytes())
+                .encrypt_secret(app.vault_master_bytes(), config.password.as_bytes())
                 .map_err(|e| e.to_string())?;
             let id = secret.id;
             store.save_secret(&secret).map_err(|e| e.to_string())?;
@@ -659,7 +769,7 @@ fn persist_host(app: &App, config: &SessionConfig) -> Result<HostId, String> {
                 None
             } else {
                 let secret = vault
-                    .encrypt_secret(VAULT_MASTER.as_bytes(), config.passphrase.as_bytes())
+                    .encrypt_secret(app.vault_master_bytes(), config.passphrase.as_bytes())
                     .map_err(|e| e.to_string())?;
                 let id = secret.id;
                 store.save_secret(&secret).map_err(|e| e.to_string())?;

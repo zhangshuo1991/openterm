@@ -1,7 +1,7 @@
 //! Message handling. Translates UI/worker messages into state changes and
 //! tasks. Connection lifecycle is the delicate part — see the `Conn` arm.
 
-use iced::{clipboard, Task};
+use iced::{animation::Animation, clipboard, Task};
 use openterm_terminal::TerminalEngine;
 
 use crate::connection::{Command, ConnectParams, Event as ConnEvent};
@@ -188,6 +188,24 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::SaveHost => {
+            let needs_secret = app
+                .active_session()
+                .map(|s| {
+                    matches!(s.config.auth, crate::session::AuthMode::Password)
+                        || (matches!(s.config.auth, crate::session::AuthMode::Key)
+                            && !s.config.passphrase.is_empty())
+                })
+                .unwrap_or(false);
+            // Encrypting a credential needs the vault unlocked. Defer the save
+            // and open the setup (fresh) or unlock (existing) dialog.
+            if needs_secret && app.vault_locked() {
+                app.vault_resume_save = true;
+                if !app.vault_has_canary {
+                    app.vault_setup_prompt = true;
+                }
+                app.status = "Set up your master password to save credentials.".to_string();
+                return iced::widget::operation::focus(crate::ui::vault::PW_INPUT_ID.clone());
+            }
             match app.active_session().map(|s| s.config.clone()) {
                 Some(config) => match persist_host(app, &config) {
                     Ok(host_id) => {
@@ -197,6 +215,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                         if let Ok(store) = openterm_storage::WorkspaceStore::open(&app.db_path) {
                             app.hosts = store.list_hosts().unwrap_or_default();
                         }
+                        app.touch_vault();
                         app.status = "Host saved.".to_string();
                     }
                     Err(error) => app.status = format!("Save failed: {error}"),
@@ -292,6 +311,8 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::ToggleHistory => {
             app.history_open = !app.history_open;
+            let now = std::time::Instant::now();
+            app.history_anim.go_mut(app.history_open, now);
             // Terminal width changed → resize grid + PTY.
             apply_grid(app)
         }
@@ -321,15 +342,9 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::HistoryDragMove(point) => {
             if app.history_dragging {
-                // Panel hugs the right edge: width = window_right - cursor_x.
                 let width = (app.window_size.width - point.x - crate::ui::HISTORY_DIVIDER_WIDTH)
                     .clamp(200.0, 520.0);
                 app.history_width = width;
-                // Keep the local grid correct during drag; PTY resize on release.
-                let (cols, rows) = app.current_grid();
-                if let Some(session) = app.active_session_mut() {
-                    session.resize_grid(cols, rows);
-                }
             }
             Task::none()
         }
@@ -345,6 +360,8 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::ToggleSidebar => {
             app.sidebar_collapsed = !app.sidebar_collapsed;
+            let now = std::time::Instant::now();
+            app.sidebar_anim.go_mut(!app.sidebar_collapsed, now);
             apply_grid(app)
         }
         Message::SidebarDragStart => {
@@ -358,11 +375,6 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                     crate::theme::SIDEBAR_MIN_WIDTH,
                     crate::theme::SIDEBAR_MAX_WIDTH,
                 );
-                // Keep the local grid correct during drag; PTY resize on release.
-                let (cols, rows) = app.current_grid();
-                if let Some(session) = app.active_session_mut() {
-                    session.resize_grid(cols, rows);
-                }
             }
             Task::none()
         }
@@ -377,13 +389,8 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::RailDragMove(point) => {
             if app.rail_dragging {
-                // Rail hugs the right edge: width = window_width - cursor_x.
                 let w = (app.window_size.width - point.x).clamp(180.0, 520.0);
                 app.rail_width = w;
-                let (cols, rows) = app.current_grid();
-                if let Some(session) = app.active_session_mut() {
-                    session.resize_grid(cols, rows);
-                }
             }
             Task::none()
         }
@@ -738,6 +745,9 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::OpenSettings => {
             app.settings_open = true;
             app.palette_open = false;
+            let now = std::time::Instant::now();
+            app.settings_anim = Animation::new(false).quick();
+            app.settings_anim.go_mut(true, now);
             Task::none()
         }
         Message::CloseSettings => {
@@ -872,6 +882,10 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             app.now = now;
             Task::none()
         }
+        Message::PulseTick => {
+            app.connecting_pulse = !app.connecting_pulse;
+            Task::none()
+        }
 
         // --- File viewer ---
         Message::OpenFileViewer(path) => open_file_viewer(app, path),
@@ -997,10 +1011,194 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
 
         // --- Worker events ---
         Message::Conn(event) => handle_conn_event(app, event),
+
+        // --- Terminal search (Cmd+F) ---
+        Message::TerminalSearchOpen => {
+            app.terminal_search = Some(app.terminal_search.take().unwrap_or_default());
+            app.terminal_search_idx = 0;
+            iced::widget::operation::focus(crate::ui::terminal::SEARCH_INPUT_ID.clone())
+        }
+        Message::TerminalSearchQuery(value) => {
+            app.terminal_search = Some(value);
+            app.terminal_search_idx = 0;
+            Task::none()
+        }
+        Message::TerminalSearchNext => {
+            // Unbounded; the canvas wraps it modulo the live match count.
+            app.terminal_search_idx = app.terminal_search_idx.wrapping_add(1);
+            Task::none()
+        }
+        Message::TerminalSearchPrev => {
+            // Match count lives in the render layer, so we can't wrap to the
+            // last match here; stop at the first instead of underflowing.
+            app.terminal_search_idx = app.terminal_search_idx.saturating_sub(1);
+            Task::none()
+        }
+        Message::TerminalSearchClose => {
+            app.terminal_search = None;
+            app.terminal_search_idx = 0;
+            Task::none()
+        }
+
+        // --- Vault master password ---
+        Message::VaultPasswordInput(value) => {
+            app.vault_pw = value;
+            app.vault_err = None;
+            Task::none()
+        }
+        Message::VaultConfirmInput(value) => {
+            app.vault_confirm = value;
+            app.vault_err = None;
+            Task::none()
+        }
+        Message::VaultSubmit => vault_submit(app),
+        Message::VaultLock => {
+            app.vault_master = None;
+            app.vault_pw.clear();
+            app.vault_confirm.clear();
+            app.status = "Vault locked.".to_string();
+            Task::none()
+        }
+        Message::VaultCheckLock => {
+            // Auto-lock on inactivity, and detect system sleep via a timer gap:
+            // if far more than the 60s tick has elapsed, the machine likely slept.
+            let now = std::time::Instant::now();
+            let since_check = now.duration_since(app.vault_last_check);
+            app.vault_last_check = now;
+            if app.vault_locked() {
+                return Task::none();
+            }
+            let slept = since_check > std::time::Duration::from_secs(150);
+            let idle = now.duration_since(app.vault_last_use) > VAULT_IDLE_TIMEOUT;
+            if slept || idle {
+                app.vault_master = None;
+                app.status = if slept {
+                    "Vault locked (system resumed from sleep).".to_string()
+                } else {
+                    "Vault locked (inactive).".to_string()
+                };
+            }
+            Task::none()
+        }
+        Message::VaultUnlockResult(result) => {
+            match result {
+                Ok(master) => {
+                    app.vault_master = Some(master);
+                    app.vault_pw.clear();
+                    app.vault_confirm.clear();
+                    app.vault_err = None;
+                    app.vault_setup_prompt = false;
+                    app.touch_vault();
+                    app.vault_last_check = std::time::Instant::now();
+                    app.status = "Vault unlocked.".to_string();
+                    if std::mem::take(&mut app.vault_resume_save) {
+                        return update(app, Message::SaveHost);
+                    }
+                    // Refresh hosts now that secrets can be decrypted.
+                    if let Ok(store) = openterm_storage::WorkspaceStore::open(&app.db_path) {
+                        app.hosts = store.list_hosts().unwrap_or_default();
+                    }
+                }
+                Err(reason) => {
+                    app.vault_pw.clear();
+                    app.vault_err = Some(reason);
+                }
+            }
+            Task::none()
+        }
+        Message::VaultSetupResult(result) => {
+            match result {
+                Ok(master) => {
+                    app.vault_master = Some(master);
+                    app.vault_has_canary = true;
+                    app.vault_pw.clear();
+                    app.vault_confirm.clear();
+                    app.vault_err = None;
+                    app.vault_setup_prompt = false;
+                    app.touch_vault();
+                    app.vault_last_check = std::time::Instant::now();
+                    app.status = "Master password created. Vault unlocked.".to_string();
+                    if std::mem::take(&mut app.vault_resume_save) {
+                        return update(app, Message::SaveHost);
+                    }
+                }
+                Err(reason) => {
+                    app.vault_err = Some(reason);
+                }
+            }
+            Task::none()
+        }
     }
 }
 
-/// Mutate the active session's config, returning no task.
+/// Auto-lock the vault after this much inactivity.
+const VAULT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Plaintext sentinel encrypted under the master password to verify it on unlock.
+const VAULT_CANARY_PLAINTEXT: &[u8] = b"OpenTerm vault v1";
+
+/// Handle vault setup (first run) or unlock, running Argon2id off the UI thread.
+fn vault_submit(app: &mut App) -> Task<Message> {
+    let db_path = app.db_path.clone();
+    let pw = app.vault_pw.clone();
+
+    if app.vault_has_canary {
+        // Unlock: derive key, try to decrypt the stored canary.
+        if pw.is_empty() {
+            app.vault_err = Some("Enter your master password.".to_string());
+            return Task::none();
+        }
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let store = openterm_storage::WorkspaceStore::open(&db_path)
+                        .map_err(|e| e.to_string())?;
+                    let canary = store
+                        .get_master_canary()
+                        .map_err(|e| e.to_string())?
+                        .ok_or_else(|| "No master password set.".to_string())?;
+                    let vault = openterm_crypto::LocalVault::new(openterm_crypto::VaultConfig::default());
+                    match vault.decrypt_secret(pw.as_bytes(), &canary) {
+                        Ok(plain) if plain == VAULT_CANARY_PLAINTEXT => Ok(pw),
+                        _ => Err("Incorrect master password.".to_string()),
+                    }
+                })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()))
+            },
+            Message::VaultUnlockResult,
+        )
+    } else {
+        // First-time setup: validate inputs, then encrypt & store the canary.
+        let confirm = app.vault_confirm.clone();
+        if pw.len() < 8 {
+            app.vault_err = Some("Master password must be at least 8 characters.".to_string());
+            return Task::none();
+        }
+        if pw != confirm {
+            app.vault_err = Some("Passwords do not match.".to_string());
+            return Task::none();
+        }
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let store = openterm_storage::WorkspaceStore::open(&db_path)
+                        .map_err(|e| e.to_string())?;
+                    let vault = openterm_crypto::LocalVault::new(openterm_crypto::VaultConfig::default());
+                    let canary = vault
+                        .encrypt_secret(pw.as_bytes(), VAULT_CANARY_PLAINTEXT)
+                        .map_err(|e| e.to_string())?;
+                    store.set_master_canary(&canary).map_err(|e| e.to_string())?;
+                    Ok(pw)
+                })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()))
+            },
+            Message::VaultSetupResult,
+        )
+    }
+}
+
 fn with_config<F: FnOnce(&mut SessionConfig)>(app: &mut App, f: F) -> Task<Message> {
     if let Some(session) = app.active_session_mut() {
         f(&mut session.config);
@@ -1497,6 +1695,8 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
     let (sort, sort_asc) = (app.sftp_sort, app.sftp_sort_asc);
     let app_download_pending = app.smoke_download_pending;
     let app_open_menu = app.smoke_open_menu;
+    // Async storage tasks accumulated by the Output branch (never blocking UI).
+    let mut extra_tasks: Vec<Task<Message>> = vec![];
     let mut open_sftp_after = false;
     let mut open_menu_after = false;
     let mut download_after: Option<usize> = None;
@@ -1528,12 +1728,21 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
                 // Backfill the previous in-memory entry with its now-captured output.
                 let committed = std::mem::take(&mut session.committed_output);
                 if !committed.is_empty() {
-                    if let Some(prev) = app.all_history.first_mut() {
+                    if let Some(prev) = app.all_history.front_mut() {
                         prev.output.clone_from(&committed);
                     }
-                    if let Ok(store) = openterm_storage::WorkspaceStore::open(&app.db_path) {
-                        let _ = store.update_last_history_output(&committed);
-                    }
+                    // #23: async write — never blocks the UI thread.
+                    let db = app.db_path.clone();
+                    extra_tasks.push(Task::perform(
+                        async move {
+                            let _ = tokio::task::spawn_blocking(move || {
+                                if let Ok(s) = openterm_storage::WorkspaceStore::open(&db) {
+                                    let _ = s.update_last_history_output(&committed);
+                                }
+                            }).await;
+                        },
+                        |_| Message::Noop,
+                    ));
                 }
                 session.command_history.last().map(|cmd: &String| openterm_storage::HistoryEntry {
                     ts_ms: std::time::SystemTime::now()
@@ -1548,10 +1757,20 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
                 None
             };
             if let Some(entry) = new_entry {
-                if let Ok(store) = openterm_storage::WorkspaceStore::open(&app.db_path) {
-                    let _ = store.append_history(&entry);
-                }
-                app.all_history.insert(0, entry);
+                // #23: async write — never blocks the UI thread.
+                let db = app.db_path.clone();
+                let e2 = entry.clone();
+                extra_tasks.push(Task::perform(
+                    async move {
+                        let _ = tokio::task::spawn_blocking(move || {
+                            if let Ok(s) = openterm_storage::WorkspaceStore::open(&db) {
+                                let _ = s.append_history(&e2);
+                            }
+                        }).await;
+                    },
+                    |_| Message::Noop,
+                ));
+                app.all_history.push_front(entry); // #10: O(1) push_front
             }
             crate::smoke::record(&smoke, "output");
             // Smoke: once the shell is producing output, open SFTP once to
@@ -1740,7 +1959,7 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
         app.smoke_open_menu = false;
         app.sftp_menu = Some((crate::session::SftpSide::Remote, 0));
     }
-    Task::none()
+    if extra_tasks.is_empty() { Task::none() } else { Task::batch(extra_tasks) }
 }
 
 // --- remote path helpers ---

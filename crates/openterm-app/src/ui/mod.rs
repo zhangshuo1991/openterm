@@ -15,7 +15,8 @@ mod settings;
 mod sftp;
 mod sidebar;
 mod tabs;
-mod terminal;
+pub mod terminal;
+pub mod vault;
 mod widgets;
 
 use iced::widget::{column, container, mouse_area, row, stack};
@@ -46,7 +47,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
     // divider; when collapsed it disappears entirely and an expand affordance
     // lives in the tab bar. The resource rail docks at the far right whenever the
     // active session is connected (unless the user collapsed it).
-    let mut main = if app.sidebar_collapsed() {
+    let mut main = if app.sidebar_collapsed() && !app.sidebar_animating() {
         row![workspace]
     } else {
         row![sidebar::view(app), sidebar::divider(), workspace]
@@ -86,6 +87,11 @@ pub fn view(app: &App) -> Element<'_, Message> {
     }
     if app.pending_host_delete().is_some() {
         layers = layers.push(sidebar::delete_host_overlay(app));
+    }
+
+    // The vault overlay sits above everything else: it gates credential access.
+    if app.vault_overlay_active() {
+        layers = layers.push(vault::view(app));
     }
 
     // While dragging the history divider, a full-window transparent capture
@@ -157,7 +163,7 @@ fn workspace_body(app: &App) -> Element<'_, Message> {
         sftp::view(app)
     } else if show_terminal {
         // Optionally split: terminal | divider | command-history panel.
-        if app.history_open {
+        if app.history_open || app.history_animating() {
             row![
                 container(terminal::view(app)).width(Length::Fill),
                 history::divider(),

@@ -159,18 +159,10 @@ impl AlacrittyTerminalBuffer {
     /// Returns the trimmed text of the line at the current cursor row.
     /// Used to capture the fully tab-completed command before Enter is sent.
     pub fn cursor_line_text(&self) -> String {
-        let snap = self.snapshot();
-        snap.cells
-            .get(snap.cursor.row)
-            .map(|row| {
-                row.iter()
-                    .filter(|c| !c.wide_spacer)
-                    .map(|c| c.ch)
-                    .collect::<String>()
-                    .trim_end()
-                    .to_string()
-            })
-            .unwrap_or_default()
+        // Read from the already-built text cache rather than calling snapshot().
+        let grid = self.term.grid();
+        let row = (grid.cursor.point.line.0 + grid.display_offset() as i32).max(0) as usize;
+        self.lines.get(row).map(|l| l.text.clone()).unwrap_or_default()
     }
 }
 

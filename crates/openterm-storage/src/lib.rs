@@ -7,7 +7,9 @@ const HOSTS: TableDefinition<&str, &[u8]> = TableDefinition::new("host_profiles"
 const SECRETS: TableDefinition<&str, &[u8]> = TableDefinition::new("encrypted_secrets");
 const SETTINGS: TableDefinition<&str, &[u8]> = TableDefinition::new("app_settings");
 const HISTORY: TableDefinition<u64, &[u8]> = TableDefinition::new("command_history");
+const VAULT: TableDefinition<&str, &[u8]> = TableDefinition::new("vault_meta");
 const UI_SETTINGS_KEY: &str = "ui";
+const VAULT_CANARY_KEY: &str = "canary";
 const MAX_HISTORY_ROWS: u64 = 5000;
 
 /// One persisted command-history entry.
@@ -173,6 +175,26 @@ impl WorkspaceStore {
         let Some(value) = table.get(UI_SETTINGS_KEY)? else {
             return Ok(None);
         };
+        Ok(Some(serde_json::from_slice(value.value())?))
+    }
+
+    /// Store the master-password verification canary (an EncryptedSecret whose
+    /// plaintext is a known sentinel; used to verify the password on unlock).
+    pub fn set_master_canary(&self, secret: &openterm_core::EncryptedSecret) -> Result<(), StorageError> {
+        let bytes = serde_json::to_vec(secret)?;
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(VAULT)?;
+            table.insert(VAULT_CANARY_KEY, bytes.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn get_master_canary(&self) -> Result<Option<openterm_core::EncryptedSecret>, StorageError> {
+        let txn = self.db.begin_read()?;
+        let Ok(table) = txn.open_table(VAULT) else { return Ok(None); };
+        let Some(value) = table.get(VAULT_CANARY_KEY)? else { return Ok(None); };
         Ok(Some(serde_json::from_slice(value.value())?))
     }
 

@@ -109,7 +109,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
     .height(Length::Fill);
 
     container(body)
-        .width(Length::Fixed(app.history_width_value()))
+        .width(Length::Fixed(app.history_visual_width()))
         .height(Length::Fill)
         .style(|_| container::Style {
             background: Some(theme::surface_1().into()),

@@ -10,6 +10,10 @@ use crate::ui::widgets;
 use crate::App;
 
 pub fn view(app: &App) -> Element<'_, Message> {
+    let progress = app.settings_progress();
+    let nudge = ((1.0 - progress) * 20.0).max(0.0);
+    let backdrop_alpha = progress * 0.5;
+
     let nav = nav_panel(app.settings_panel);
     let content = content_panel(app);
 
@@ -41,20 +45,25 @@ pub fn view(app: &App) -> Element<'_, Message> {
 
     let backdrop = button(Space::new().width(Length::Fill).height(Length::Fill))
         .on_press(Message::CloseSettings)
-        .style(|_, _| button::Style {
-            background: Some(Color::from_rgba(0.0, 0.0, 0.0, 0.5).into()),
+        .style(move |_, _| button::Style {
+            background: Some(Color::from_rgba(0.0, 0.0, 0.0, backdrop_alpha).into()),
             ..Default::default()
         });
 
-    iced::widget::stack![
-        backdrop,
-        container(card)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill),
-    ]
-    .into()
+    // Slide the card up from a small offset as it enters.
+    let centered = container(
+        column![
+            Space::new().height(Length::Fill),
+            Space::new().height(Length::Fixed(nudge)),
+            card,
+            Space::new().height(Length::Fill),
+        ]
+        .align_x(iced::Alignment::Center),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill);
+
+    iced::widget::stack![backdrop, centered].into()
 }
 
 fn nav_panel(active: SettingsPanel) -> Element<'static, Message> {
@@ -111,7 +120,7 @@ fn content_panel(app: &App) -> Element<'_, Message> {
         SettingsPanel::Ssh => ssh_panel(app),
         SettingsPanel::Keys => keys_panel(),
         SettingsPanel::Appearance => appearance_panel(app),
-        SettingsPanel::Advanced => advanced_panel(),
+        SettingsPanel::Advanced => advanced_panel(app),
     };
 
     container(body)
@@ -297,9 +306,29 @@ fn appearance_panel(app: &App) -> Element<'_, Message> {
 
 // ── Advanced ────────────────────────────────────────────────────────────────
 
-fn advanced_panel() -> Element<'static, Message> {
+fn advanced_panel(app: &App) -> Element<'_, Message> {
+    let vault_control: Element<'_, Message> = if app.vault_has_canary {
+        if app.vault_locked() {
+            container(text("Locked").size(12).color(theme::text_muted()))
+                .padding([4, 10])
+                .into()
+        } else {
+            widgets::small_button("Lock now", widgets::Tone::Neutral, Message::VaultLock)
+        }
+    } else {
+        container(text("Not set up").size(12).color(theme::text_dim()))
+            .padding([4, 10])
+            .into()
+    };
+
     column![
         panel_title("Advanced", "Power-user options."),
+        group_label("安全"),
+        setting_row(
+            "Credential vault",
+            "Saved SSH passwords are encrypted with your master password. The vault auto-locks after 15 minutes of inactivity or when the system sleeps.",
+            vault_control,
+        ),
         group_label("历史记录"),
         danger_row(
             "Clear command history",

@@ -143,9 +143,15 @@ fn input_style(_theme: &iced::Theme, status: text_input::Status) -> text_input::
     }
 }
 
-/// A colored status dot reflecting a session phase.
-pub fn status_dot<'a>(phase: &Phase) -> Element<'a, Message> {
-    let color = phase_color(phase);
+/// A colored status dot reflecting a session phase. `pulse` dims the dot on
+/// alternate ticks while the phase is Connecting, giving a breathing effect.
+pub fn status_dot<'a>(phase: &Phase, pulse: bool) -> Element<'a, Message> {
+    let base = phase_color(phase);
+    let color = if matches!(phase, Phase::Connecting) && pulse {
+        theme::with_alpha(base, 0.3)
+    } else {
+        base
+    };
     container(text("●").size(11).color(color)).into()
 }
 

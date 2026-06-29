@@ -110,6 +110,10 @@ pub struct TerminalCanvas {
     pub font_size: u16,
     /// Committed selection from the session (for cross-frame highlight when not dragging).
     pub selection: Option<(usize, usize, usize, usize)>,
+    /// Lowercased search query; empty disables highlighting.
+    pub search_query: String,
+    /// Index of the "current" match to emphasize (wraps modulo match count).
+    pub search_current: usize,
 }
 
 impl canvas::Program<Message> for TerminalCanvas {
@@ -179,6 +183,53 @@ impl canvas::Program<Message> for TerminalCanvas {
             self.selection.map(|(c1, r1, c2, r2)| ((c1, r1), (c2, r2)))
         };
 
+        // Compute search-match highlights: a set of matched cells, plus the
+        // cells belonging to the "current" match (emphasized differently).
+        let mut match_cells: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+        let mut current_cells: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+        if !self.search_query.is_empty() {
+            let mut matches: Vec<Vec<(usize, usize)>> = Vec::new();
+            for (row_index, row) in self.snapshot.cells.iter().enumerate() {
+                // Build the row's lowercased text and a parallel map back to columns.
+                let mut text = String::new();
+                let mut cols: Vec<usize> = Vec::new();
+                for cell in row {
+                    if cell.wide_spacer { continue; }
+                    for lc in cell.ch.to_lowercase() {
+                        text.push(lc);
+                        cols.push(cell.col);
+                    }
+                }
+                let qlen = self.search_query.chars().count();
+                let mut from = 0;
+                while let Some(byte_pos) = text[from..].find(&self.search_query) {
+                    let abs = from + byte_pos;
+                    let char_start = text[..abs].chars().count();
+                    let cells: Vec<(usize, usize)> = cols
+                        .iter()
+                        .skip(char_start)
+                        .take(qlen)
+                        .map(|&c| (row_index, c))
+                        .collect();
+                    if !cells.is_empty() {
+                        matches.push(cells);
+                    }
+                    from = abs + self.search_query.len();
+                }
+            }
+            if !matches.is_empty() {
+                let cur = self.search_current % matches.len();
+                for (i, cells) in matches.iter().enumerate() {
+                    for &c in cells {
+                        match_cells.insert(c);
+                        if i == cur {
+                            current_cells.insert(c);
+                        }
+                    }
+                }
+            }
+        }
+
         for (row_index, row) in self.snapshot.cells.iter().enumerate() {
             for cell in row {
                 if cell.wide_spacer { continue; }
@@ -189,8 +240,22 @@ impl canvas::Program<Message> for TerminalCanvas {
                     && self.snapshot.cursor.col == cell.col;
                 let selected = sel.is_some_and(|(s, e)| in_selection(cell.col, row_index, s, e));
                 let inverse = cell.inverse || cursor_here;
+                let is_match = match_cells.contains(&(row_index, cell.col));
+                let is_current = current_cells.contains(&(row_index, cell.col));
 
-                if selected {
+                if is_match {
+                    // Search highlight: orange for the current match, yellow otherwise.
+                    let hl = if is_current {
+                        Color::from_rgb(0.95, 0.55, 0.1)
+                    } else {
+                        Color::from_rgb(0.85, 0.78, 0.2)
+                    };
+                    frame.fill_rectangle(
+                        Point::new(x, y),
+                        Size::new(cell_draw_width(cell, m), m.line_height),
+                        hl,
+                    );
+                } else if selected {
                     frame.fill_rectangle(
                         Point::new(x, y),
                         Size::new(cell_draw_width(cell, m), m.line_height),
@@ -221,7 +286,9 @@ impl canvas::Program<Message> for TerminalCanvas {
                 }
                 if cell.ch == ' ' { continue; }
 
-                let fg = if selected {
+                let fg = if is_match {
+                    Color::from_rgb(0.05, 0.05, 0.05)
+                } else if selected {
                     theme::text_high()
                 } else if inverse {
                     theme::surface_0()

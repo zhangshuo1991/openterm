@@ -150,7 +150,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
     .height(Length::Fill);
 
     container(content)
-        .width(Length::Fixed(app.sidebar_width_value()))
+        .width(Length::Fixed(app.sidebar_visual_width()))
         .height(Length::Fill)
         .style(|_| container::Style {
             background: Some(theme::surface_1().into()),

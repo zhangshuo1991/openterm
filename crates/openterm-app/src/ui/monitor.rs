@@ -1,9 +1,9 @@
 //! Resource rail — redesigned with per-metric colors, big numbers, taller
 //! charts, a summary row, and a footer grid.
 
-use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke};
+use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke, Text};
 use iced::widget::{button, column, container, mouse_area, row, scrollable, text, Space};
-use iced::{Border, Color, Element, Length, Point, Rectangle, Renderer, Theme};
+use iced::{alignment, Border, Color, Element, Length, Point, Rectangle, Renderer, Theme};
 
 use crate::message::Message;
 use crate::metrics::{PortInfo, ProcessInfo, SessionMetrics};
@@ -191,7 +191,7 @@ fn pct_metric<'a>(
     column![
         head,
         meter(pct, available, color),
-        chart(history, color, 100.0, 44.0),
+        chart(history, color, 100.0, 44.0, ChartUnit::Percent),
     ]
     .spacing(6)
     .into()
@@ -218,7 +218,7 @@ fn rate_metric<'a>(
     ]
     .spacing(4);
 
-    column![head, rates, chart(history, color, 0.0, 44.0)]
+    column![head, rates, chart(history, color, 0.0, 44.0, ChartUnit::Rate)]
         .spacing(6)
         .into()
 }
@@ -483,14 +483,33 @@ fn hide_button() -> Element<'static, Message> {
 
 // ── Line chart (canvas) ───────────────────────────────────────────────────────
 
+/// How to format the numeric labels drawn on a chart.
+#[derive(Clone, Copy)]
+enum ChartUnit {
+    /// 0–100 percentage (CPU, Memory).
+    Percent,
+    /// Bytes per second (Network, Disk IO).
+    Rate,
+}
+
+impl ChartUnit {
+    fn fmt(self, v: f32) -> String {
+        match self {
+            ChartUnit::Percent => format!("{v:.0}%"),
+            ChartUnit::Rate => format!("{}/s", fmt_bytes(v as f64)),
+        }
+    }
+}
+
 fn chart<'a>(
     history: &std::collections::VecDeque<f32>,
     color: Color,
     max: f32,
     height: f32,
+    unit: ChartUnit,
 ) -> Element<'a, Message> {
     let points: Vec<f32> = history.iter().copied().collect();
-    canvas::Canvas::new(Sparkline { points, color, max })
+    canvas::Canvas::new(Sparkline { points, color, max, unit })
         .width(Length::Fill)
         .height(Length::Fixed(height))
         .into()
@@ -500,6 +519,7 @@ struct Sparkline {
     points: Vec<f32>,
     color: Color,
     max: f32,
+    unit: ChartUnit,
 }
 
 impl canvas::Program<Message> for Sparkline {
@@ -519,14 +539,26 @@ impl canvas::Program<Message> for Sparkline {
         if self.points.len() < 2 {
             return vec![frame.into_geometry()];
         }
-        let scale = if self.max > 0.0 {
-            self.max
-        } else {
-            self.points.iter().copied().fold(0.0_f32, f32::max).max(1.0)
-        };
+        // Adaptive min–max scaling: map the data's own range (with 10% padding)
+        // to the chart height so even small fluctuations are visible. A fixed
+        // 0–100 scale would render a steady ~15% memory line dead flat. The big
+        // "%" label above already conveys the absolute value; the chart is for
+        // trend. `self.max`, when > 0, acts as a lower bound on the visible span
+        // so a near-constant series doesn't amplify pure noise into wild swings.
+        let (lo, hi) = self
+            .points
+            .iter()
+            .copied()
+            .fold((f32::MAX, f32::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)));
+        let (raw_lo, raw_hi) = (lo, hi);
+        let noise_floor = if self.max > 0.0 { self.max * 0.02 } else { 1.0 };
+        let span = (hi - lo).max(noise_floor);
+        let pad = span * 0.1;
+        let lo = lo - pad;
+        let range = span + pad * 2.0;
         let n = self.points.len();
         let dx = w / (n as f32 - 1.0);
-        let y_for = |v: f32| h - (v / scale).clamp(0.0, 1.0) * (h - 2.0) - 1.0;
+        let y_for = |v: f32| h - ((v - lo) / range).clamp(0.0, 1.0) * (h - 2.0) - 1.0;
         let xy: Vec<Point> = self
             .points
             .iter()
@@ -551,6 +583,27 @@ impl canvas::Program<Message> for Sparkline {
         if let Some(last) = xy.last() {
             frame.fill(&Path::circle(*last, 2.5), self.color);
         }
+
+        // Y-axis reference labels: peak (top-left) and trough (bottom-left), so
+        // the trend line reads against concrete numbers. Skip the trough when it
+        // equals the peak (flat series) to avoid redundant clutter.
+        let label = |frame: &mut Frame, content: String, y: f32, valign: alignment::Vertical| {
+            frame.fill_text(Text {
+                content,
+                position: Point::new(2.0, y),
+                color: theme::with_alpha(theme::text_high(), 0.7),
+                size: 9.0.into(),
+                font: theme::TERMINAL_FONT,
+                align_x: alignment::Horizontal::Left.into(),
+                align_y: valign,
+                ..Default::default()
+            });
+        };
+        label(&mut frame, self.unit.fmt(raw_hi), 1.0, alignment::Vertical::Top);
+        if (raw_hi - raw_lo).abs() > f32::EPSILON {
+            label(&mut frame, self.unit.fmt(raw_lo), h - 1.0, alignment::Vertical::Bottom);
+        }
+
         vec![frame.into_geometry()]
     }
 }

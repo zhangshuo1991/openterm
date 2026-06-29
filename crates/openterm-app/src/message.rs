@@ -218,5 +218,26 @@ pub enum Message {
     PointerMoved(Point),
     /// Animation frame tick (only delivered while something is animating).
     Tick(std::time::Instant),
+    /// Slow heartbeat for the "connecting" status-dot pulse (≈700 ms).
+    PulseTick,
+
+    // --- Terminal search (Cmd+F) ---
+    TerminalSearchOpen,
+    TerminalSearchQuery(String),
+    TerminalSearchNext,
+    TerminalSearchPrev,
+    TerminalSearchClose,
+
+    // --- Vault master password ---
+    VaultPasswordInput(String),
+    VaultConfirmInput(String),
+    VaultSubmit,
+    VaultLock,
+    VaultCheckLock,
+    /// Result of async unlock attempt: Ok(master_password) or Err(reason).
+    VaultUnlockResult(Result<String, String>),
+    /// Result of async vault setup: Ok(master_password) or Err(reason).
+    VaultSetupResult(Result<String, String>),
+
     Noop,
 }

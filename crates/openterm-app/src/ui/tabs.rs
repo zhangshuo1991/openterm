@@ -15,15 +15,16 @@ pub fn view(app: &App) -> Element<'_, Message> {
     // When the sidebar is collapsed, the tab bar reaches the window's left edge,
     // so the floating traffic lights would overlap it. Reserve their space and
     // offer an expand affordance in that reclaimed strip.
-    if app.sidebar_collapsed() {
+    if app.sidebar_collapsed() && !app.sidebar_animating() {
         tabs = tabs
             .push(Space::new().width(Length::Fixed(theme::TRAFFIC_LIGHT_INSET)))
             .push(expand_button());
     }
 
+    let pulse = app.connecting_pulse;
     for (index, session) in app.sessions.iter().enumerate() {
         let active = index == app.active;
-        tabs = tabs.push(tab(index, session, active));
+        tabs = tabs.push(tab(index, session, active, pulse));
     }
 
     // New-tab button.
@@ -85,6 +86,7 @@ fn tab<'a>(
     index: usize,
     session: &'a crate::session::Session,
     active: bool,
+    pulse: bool,
 ) -> Element<'a, Message> {
     let title = session.title();
     let title = if title.chars().count() > 22 {
@@ -121,7 +123,7 @@ fn tab<'a>(
         });
 
     let body = row![
-        widgets::status_dot(&session.phase),
+        widgets::status_dot(&session.phase, pulse),
         text(title).size(13).color(if active {
             theme::text_high()
         } else {

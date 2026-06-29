@@ -29,7 +29,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
     let pill_color = widgets::phase_color(&phase_label);
     let pill = container(
         row![
-            widgets::status_dot(&phase_label),
+            widgets::status_dot(&phase_label, app.connecting_pulse),
             text(phase_word(&phase_label)).size(11).color(pill_color),
         ]
         .spacing(6)
