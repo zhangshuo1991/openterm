@@ -90,7 +90,7 @@ fn content_area(state: &FileViewerState) -> Element<'_, Message> {
                     .height(Length::Fill)
                     .into()
             } else {
-                highlighted_view(txt, &state.lang)
+                highlighted_view(txt, &state.highlight_cache)
             }
         }
 
@@ -101,7 +101,7 @@ fn content_area(state: &FileViewerState) -> Element<'_, Message> {
                 String::new()
             };
             column![
-                highlighted_view(txt, &state.lang),
+                highlighted_view(txt, &state.highlight_cache),
                 container(
                     text(format!("{}  total{pct}", human_size(*total)))
                         .size(11)
@@ -121,35 +121,55 @@ fn content_area(state: &FileViewerState) -> Element<'_, Message> {
         .into()
 }
 
-fn highlighted_view<'a>(content: &'a str, lang: &str) -> Element<'a, Message> {
-    let spans = crate::highlight::highlight(content, lang);
+fn highlighted_view<'a>(content: &'a str, spans: &[(iced::Color, String)]) -> Element<'a, Message> {
+    // Count '\n' chars so trailing newline and \r\n files are handled correctly.
+    let line_count = (content.chars().filter(|&c| c == '\n').count() + 1).max(1);
+    let gutter_width = line_count.to_string().len();
+    let gutter_color = theme::text_dim();
 
-    if spans.is_empty() {
-        return scrollable(
-            container(
-                text(content)
-                    .size(13)
-                    .font(iced::Font::MONOSPACE)
-                    .color(theme::text_high()),
-            )
-            .padding(12),
-        )
-        .into();
+    // Source spans: highlight cache, or one plain span if highlighting is off.
+    let src: Vec<(iced::Color, &str)> = if spans.is_empty() {
+        vec![(theme::text_high(), content)]
+    } else {
+        spans.iter().map(|(c, t)| (*c, t.as_str())).collect()
+    };
+
+    // Build a single rich_text where the line-number gutter is part of the
+    // same text flow as the code. This makes drift between the two columns
+    // physically impossible — they share one layout.
+    let make_span = |s: String, color: Option<iced::Color>| {
+        let sp = iced::widget::span(s).font(iced::Font::MONOSPACE).size(13.0);
+        match color {
+            Some(c) => sp.color(c),
+            None => sp,
+        }
+    };
+    let gutter = |n: usize| make_span(format!("{n:>gutter_width$}  "), Some(gutter_color));
+
+    let mut out: Vec<iced::widget::text::Span<'static, ()>> = Vec::new();
+    let mut line_no = 1usize;
+    out.push(gutter(line_no));
+    for (color, text) in src {
+        let mut parts = text.split('\n').peekable();
+        while let Some(part) = parts.next() {
+            if !part.is_empty() {
+                out.push(make_span(part.to_string(), Some(color)));
+            }
+            if parts.peek().is_some() {
+                out.push(make_span("\n".to_string(), None));
+                line_no += 1;
+                out.push(gutter(line_no));
+            }
+        }
     }
 
-    let iced_spans: Vec<iced::widget::text::Span<'static, ()>> = spans
-        .into_iter()
-        .map(|(color, txt)| {
-            iced::widget::span(txt)
-                .color(color)
-                .font(iced::Font::MONOSPACE)
-                .size(13.0)
-        })
-        .collect();
-
     scrollable(
-        container(iced::widget::rich_text(iced_spans).width(Length::Fill)).padding(12),
+        container(iced::widget::rich_text(out).width(Length::Shrink)).padding(12),
     )
+    .direction(iced::widget::scrollable::Direction::Both {
+        vertical: iced::widget::scrollable::Scrollbar::default(),
+        horizontal: iced::widget::scrollable::Scrollbar::default(),
+    })
     .into()
 }
 

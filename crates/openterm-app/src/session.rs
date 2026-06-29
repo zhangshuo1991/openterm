@@ -324,6 +324,8 @@ pub struct FileViewerState {
     pub scroll: f32,
     /// Language/syntax name (empty = plain text).
     pub lang: String,
+    /// Pre-computed syntax-highlighted spans; invalidated whenever content changes.
+    pub highlight_cache: Vec<(iced::Color, String)>,
     pub search: String,
     pub replace: String,
     /// Byte offsets of search matches in the current text.
@@ -346,6 +348,7 @@ impl FileViewerState {
             editor: iced::widget::text_editor::Content::new(),
             scroll: 0.0,
             lang,
+            highlight_cache: Vec::new(),
             search: String::new(),
             replace: String::new(),
             matches: Vec::new(),

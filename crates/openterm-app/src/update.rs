@@ -1686,6 +1686,8 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
             if let Some(fv) = &mut session.file_viewer {
                 if fv.path == path {
                     let text = String::from_utf8_lossy(&data).into_owned();
+                    // Compute once here; view() reads the cache, never calls highlight().
+                    fv.highlight_cache = crate::highlight::highlight(&text, &fv.lang);
                     if total <= crate::session::FileViewerState::SMALL_FILE_LIMIT {
                         fv.content = crate::session::ViewerContent::Loaded(text);
                     } else {
