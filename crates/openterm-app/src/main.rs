@@ -32,6 +32,13 @@ use std::collections::HashMap;
 use crate::message::Message;
 use crate::session::{AuthMode, Session, SessionConfig};
 
+/// Built-in key used to encrypt saved secrets while the credential vault is
+/// disabled (the default). It keeps stored passwords from being plain text
+/// without requiring a master password; it is not a security boundary against
+/// someone with local file access. Enabling the vault re-encrypts everything
+/// under the user's master password instead.
+const VAULT_DEFAULT_KEY: &[u8] = b"openterm-local-default-vault-v1";
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn main() -> iced::Result {
@@ -145,6 +152,12 @@ pub struct App {
     sidebar_anim: Animation<bool>,
     /// History panel slide animation (false = hidden / 0 px).
     history_anim: Animation<bool>,
+    /// Resource rail slide animation (false = hidden / 0 px). Driven by
+    /// `sync_rail()` whenever connection/tab state changes.
+    rail_anim: Animation<bool>,
+    /// Last-applied rail visibility target (so `sync_rail` only re-triggers the
+    /// animation on an actual change).
+    rail_shown: bool,
     /// Settings overlay slide-in (false = hidden, true = fully shown).
     settings_anim: Animation<bool>,
     /// Toggled every ~700 ms while any session is connecting, drives the pulse.
@@ -158,6 +171,9 @@ pub struct App {
     pub terminal_search_idx: usize,
 
     // --- Vault master password ---
+    /// Whether the credential vault is enabled. When false, secrets use the
+    /// built-in default key and no master password is required.
+    pub vault_enabled: bool,
     /// In-memory master password. None while locked.
     pub vault_master: Option<String>,
     /// Whether a canary exists in storage (i.e. password was set up before).
@@ -172,22 +188,65 @@ pub struct App {
     pub vault_last_use: Instant,
     /// Time of the last VaultCheckLock tick. Large gaps imply the system slept.
     pub vault_last_check: Instant,
-    /// When set, force the first-time master-password setup dialog even though
-    /// no canary exists yet (triggered by saving a credential on a fresh vault).
+    /// When set, show the create-master-password dialog (triggered by enabling
+    /// the vault from settings).
     pub vault_setup_prompt: bool,
-    /// A `SaveHost` was deferred until the vault is set up/unlocked; re-run it after.
-    pub vault_resume_save: bool,
+    /// Set while a vault enable/disable re-encryption is in flight, to disable
+    /// the toggle and show progress.
+    pub vault_busy: bool,
+
+    // --- Sprint 1 UI polish ---
+    /// Sidebar group names the user has collapsed.
+    pub collapsed_groups: std::collections::HashSet<String>,
+    /// Terminal line-height multiplier (persisted).
+    pub line_height: f32,
+    /// Extra per-cell horizontal spacing in pixels (persisted).
+    pub letter_spacing: f32,
+    /// Terminal cursor shape (persisted).
+    pub cursor_shape: crate::theme::CursorShape,
+    /// Accent color override as "#rrggbb" (empty = scheme default).
+    pub accent_hex: String,
+    /// Per-tab close animations, keyed by stable `session.id` (not index).
+    pub closing_tabs: HashMap<u64, Animation<bool>>,
+    /// Recent TCP-ping samples per saved host, for the footer latency sparkline.
+    pub ping_history: HashMap<HostId, std::collections::VecDeque<u16>>,
+    /// Active toast notifications (top-right), newest last.
+    pub toasts: Vec<crate::ui::toasts::Toast>,
+    /// Monotonic id for toasts.
+    pub next_toast_id: u64,
+    /// History rows whose output preview is expanded (keyed by entry ts_ms).
+    pub expanded_history: std::collections::HashSet<u64>,
+    /// While set and in the future, the terminal selection flashes to confirm a
+    /// copy. Drives a brief burst of frames via `any_animating`.
+    pub copy_flash_until: Option<Instant>,
+
+    // --- Sprint 3: command completion & smart input ---
+    /// Saved input snippets (abbr → expansion), loaded at startup.
+    pub snippets: Vec<openterm_storage::Snippet>,
+    /// Draft abbreviation in the Snippets settings panel.
+    pub snippet_draft_abbr: String,
+    /// Draft expansion in the Snippets settings panel.
+    pub snippet_draft_expansion: String,
+    /// Whether the Ctrl+R history-search overlay is open.
+    pub history_search_open: bool,
+    /// Live query in the history-search overlay.
+    pub history_search_query: String,
+    /// Selected row in the history-search overlay (index into filtered list).
+    pub history_search_idx: usize,
+    /// Whether the connect card reveals the password/passphrase in plain text.
+    pub reveal_password: bool,
 }
 
 impl App {
     fn new() -> (Self, Task<Message>) {
         let db_path = openterm_ui::default_db_path();
-        let (hosts, settings, all_history) = WorkspaceStore::open(&db_path)
+        let (hosts, settings, all_history, snippets) = WorkspaceStore::open(&db_path)
             .map(|store| {
                 (
                     store.list_hosts().unwrap_or_default(),
                     store.get_ui_settings().ok().flatten().unwrap_or_default(),
                     store.load_history().unwrap_or_default().into(),
+                    store.list_snippets().unwrap_or_default(),
                 )
             })
             .unwrap_or_default();
@@ -197,6 +256,23 @@ impl App {
             .clamp(theme::MIN_FONT_SIZE, theme::MAX_FONT_SIZE);
         let color_scheme = crate::theme::ColorScheme::from_str(&settings.color_scheme);
         crate::theme::set_scheme(color_scheme);
+        crate::theme::set_accent_override(&settings.accent_hex);
+        let cursor_shape = crate::theme::CursorShape::from_str(&settings.cursor_shape);
+        let line_height = if settings.line_height.is_finite() {
+            settings.line_height.clamp(1.0, 2.0)
+        } else {
+            1.32
+        };
+        crate::terminal_render::set_line_height(line_height);
+        let letter_spacing = if settings.letter_spacing.is_finite() {
+            settings.letter_spacing.clamp(0.0, 6.0)
+        } else {
+            0.0
+        };
+        crate::terminal_render::set_letter_spacing(letter_spacing);
+        let collapsed_groups: std::collections::HashSet<String> =
+            settings.collapsed_groups.iter().cloned().collect();
+        let accent_hex = settings.accent_hex.clone();
         let window_size = Size::new(1200.0, 780.0);
         let (cols, rows) = terminal_render::grid_for_viewport(
             terminal_area(window_size, theme::SIDEBAR_WIDTH, 0.0, 0.0).width,
@@ -256,11 +332,14 @@ impl App {
             card_anim: Animation::new(false).quick(),
             sidebar_anim: Animation::new(true).quick(),
             history_anim: Animation::new(false).quick(),
+            rail_anim: Animation::new(false).quick(),
+            rail_shown: false,
             settings_anim: Animation::new(false).quick(),
             connecting_pulse: false,
             now: Instant::now(),
             terminal_search: None,
             terminal_search_idx: 0,
+            vault_enabled: settings.vault_enabled,
             vault_master: None,
             vault_has_canary: false, // will be set below
             vault_pw: String::new(),
@@ -269,7 +348,25 @@ impl App {
             vault_last_use: Instant::now(),
             vault_last_check: Instant::now(),
             vault_setup_prompt: false,
-            vault_resume_save: false,
+            vault_busy: false,
+            collapsed_groups,
+            line_height,
+            letter_spacing,
+            cursor_shape,
+            accent_hex,
+            closing_tabs: HashMap::new(),
+            ping_history: HashMap::new(),
+            toasts: Vec::new(),
+            next_toast_id: 1,
+            expanded_history: std::collections::HashSet::new(),
+            copy_flash_until: None,
+            snippets,
+            snippet_draft_abbr: String::new(),
+            snippet_draft_expansion: String::new(),
+            history_search_open: false,
+            history_search_query: String::new(),
+            history_search_idx: 0,
+            reveal_password: false,
         };
         // Check whether a master-password canary already exists.
         app.vault_has_canary = WorkspaceStore::open(&app.db_path)
@@ -390,6 +487,15 @@ impl App {
 
     pub fn color_scheme(&self) -> crate::theme::ColorScheme { self.color_scheme }
 
+    pub fn cursor_shape(&self) -> crate::theme::CursorShape { self.cursor_shape }
+
+    pub fn letter_spacing(&self) -> f32 { self.letter_spacing }
+
+    /// The latest animation-frame instant (drives interpolation in views).
+    pub fn now(&self) -> Instant {
+        self.now
+    }
+
     pub fn sidebar_width_value(&self) -> f32 {
         self.sidebar_width
     }
@@ -465,8 +571,10 @@ impl App {
         } else {
             0.0
         };
-        let rail = if self.rail_visible() {
-            self.rail_width
+        // Use the animated width so the terminal grid grows/shrinks smoothly as
+        // the rail slides, rather than snapping when it appears.
+        let rail = if self.rail_rendered() {
+            self.rail_visual_width()
         } else {
             0.0
         };
@@ -525,6 +633,38 @@ impl App {
         self.history_anim.is_animating(self.now)
     }
 
+    /// Visually-rendered rail width (0 → full during open/close). The rail's
+    /// fixed content width stays constant; the container clips it as this
+    /// shrinks, so the rail appears to slide in/out from the right.
+    pub fn rail_visual_width(&self) -> f32 {
+        self.rail_anim.interpolate(0.0_f32, self.rail_width, self.now)
+    }
+
+    /// True while the rail slide is in progress (frames still needed).
+    pub fn rail_animating(&self) -> bool {
+        self.rail_anim.is_animating(self.now)
+    }
+
+    /// Whether the rail should be painted at all this frame: either logically
+    /// visible, or still animating out.
+    pub fn rail_rendered(&self) -> bool {
+        self.rail_visible() || self.rail_animating()
+    }
+
+    /// Re-point the rail animation at the current logical visibility. Called
+    /// after any state change that can flip `rail_visible()` (connect, close,
+    /// tab switch, monitor toggle). A no-op when the target is unchanged, so it
+    /// never restarts an in-flight slide.
+    pub fn sync_rail(&mut self) {
+        let target = self.rail_visible();
+        if target != self.rail_shown {
+            self.rail_shown = target;
+            let now = std::time::Instant::now();
+            self.now = now;
+            self.rail_anim.go_mut(target, now);
+        }
+    }
+
     /// Settings overlay entrance progress 0.0→1.0.
     pub fn settings_progress(&self) -> f32 {
         self.settings_anim.interpolate(0.0_f32, 1.0_f32, self.now)
@@ -535,26 +675,48 @@ impl App {
         self.card_anim.is_animating(self.now)
             || self.sidebar_anim.is_animating(self.now)
             || self.history_anim.is_animating(self.now)
+            || self.rail_anim.is_animating(self.now)
             || self.settings_anim.is_animating(self.now)
+            || self.closing_tabs.values().any(|a| a.is_animating(self.now))
+            || !self.toasts.is_empty()
+            || self.copy_flash_until.is_some_and(|t| self.now < t)
+    }
+
+    /// Copy-flash intensity in 0.0..=1.0 (1.0 right after copy, fading to 0).
+    pub fn copy_flash(&self) -> f32 {
+        const DUR: f32 = 0.45;
+        match self.copy_flash_until {
+            Some(until) if self.now < until => {
+                let remaining = until.duration_since(self.now).as_secs_f32();
+                (remaining / DUR).clamp(0.0, 1.0)
+            }
+            _ => 0.0,
+        }
     }
 
     // --- vault: encrypt/decrypt saved passwords ---
 
-    /// Bytes of the in-memory master password. Empty slice when locked.
-    fn vault_master_bytes(&self) -> &[u8] {
-        self.vault_master.as_deref().unwrap_or("").as_bytes()
+    /// Key bytes used for encrypting/decrypting saved secrets: the master
+    /// password when the vault is enabled, else the built-in default key.
+    pub fn vault_key_bytes(&self) -> &[u8] {
+        if self.vault_enabled {
+            self.vault_master.as_deref().unwrap_or("").as_bytes()
+        } else {
+            VAULT_DEFAULT_KEY
+        }
     }
 
-    /// True when the vault is locked (no master password in memory).
+    /// True when the vault is enabled but no master password is in memory, so
+    /// saved secrets can't be decrypted until the user unlocks.
     pub fn vault_locked(&self) -> bool {
-        self.vault_master.is_none()
+        self.vault_enabled && self.vault_master.is_none()
     }
 
-    /// Whether the blocking vault overlay should be shown: either a master
-    /// password exists and we're locked (must unlock to use saved creds), or a
-    /// credential save triggered first-time setup on a fresh vault.
+    /// Whether the blocking vault overlay should be shown: the vault is enabled
+    /// and locked (must unlock), or the create-master-password dialog is up.
     pub fn vault_overlay_active(&self) -> bool {
-        (self.vault_has_canary && self.vault_locked()) || self.vault_setup_prompt
+        (self.vault_enabled && self.vault_has_canary && self.vault_master.is_none())
+            || self.vault_setup_prompt
     }
 
     /// Reset the 15-minute inactivity timer.
@@ -562,8 +724,28 @@ impl App {
         self.vault_last_use = Instant::now();
     }
 
+    /// Queue a toast notification (caps the visible stack at 4, dropping oldest).
+    pub fn push_toast(&mut self, kind: crate::ui::toasts::ToastKind, msg: impl Into<String>) {
+        let id = self.next_toast_id;
+        self.next_toast_id += 1;
+        self.toasts
+            .push(crate::ui::toasts::Toast::new(id, kind, msg));
+        // Keep the stack bounded: drop the oldest non-dismissed extras.
+        while self.toasts.len() > 4 {
+            self.toasts.remove(0);
+        }
+    }
+
     fn vault(&self) -> LocalVault {
         LocalVault::new(VaultConfig::default())
+    }
+
+    /// Look up a snippet expansion by its exact abbreviation.
+    pub fn snippet_for(&self, abbr: &str) -> Option<&str> {
+        self.snippets
+            .iter()
+            .find(|s| s.abbr == abbr)
+            .map(|s| s.expansion.as_str())
     }
 
     fn decrypt_secret(&self, id: openterm_core::SecretId) -> Option<String> {
@@ -572,7 +754,7 @@ impl App {
         let secret = store.get_secret(id).ok().flatten()?;
         let bytes = self
             .vault()
-            .decrypt_secret(self.vault_master_bytes(), &secret)
+            .decrypt_secret(self.vault_key_bytes(), &secret)
             .ok()?;
         String::from_utf8(bytes).ok()
     }
@@ -686,7 +868,12 @@ impl App {
 
     // update / subscription / view live in the modules below.
     fn update(&mut self, message: Message) -> Task<Message> {
-        crate::update::update(self, message)
+        let task = crate::update::update(self, message);
+        // Keep the rail slide animation pointed at the current logical
+        // visibility after every message (connect/close/tab-switch/toggle can
+        // all flip it). No-op when nothing changed.
+        self.sync_rail();
+        task
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -706,6 +893,12 @@ impl App {
                 default_user: self.default_user.trim().to_string(),
                 default_port: self.default_port.trim().parse().unwrap_or(22),
                 color_scheme: self.color_scheme.to_str().to_string(),
+                vault_enabled: self.vault_enabled,
+                collapsed_groups: self.collapsed_groups.iter().cloned().collect(),
+                line_height: self.line_height,
+                letter_spacing: self.letter_spacing,
+                cursor_shape: self.cursor_shape.to_str().to_string(),
+                accent_hex: self.accent_hex.clone(),
             });
         }
     }
@@ -758,7 +951,7 @@ fn persist_host(app: &App, config: &SessionConfig) -> Result<HostId, String> {
         AuthMode::Agent => AuthRef::AgentOrDefault,
         AuthMode::Password => {
             let secret = vault
-                .encrypt_secret(app.vault_master_bytes(), config.password.as_bytes())
+                .encrypt_secret(app.vault_key_bytes(), config.password.as_bytes())
                 .map_err(|e| e.to_string())?;
             let id = secret.id;
             store.save_secret(&secret).map_err(|e| e.to_string())?;
@@ -769,7 +962,7 @@ fn persist_host(app: &App, config: &SessionConfig) -> Result<HostId, String> {
                 None
             } else {
                 let secret = vault
-                    .encrypt_secret(app.vault_master_bytes(), config.passphrase.as_bytes())
+                    .encrypt_secret(app.vault_key_bytes(), config.passphrase.as_bytes())
                     .map_err(|e| e.to_string())?;
                 let id = secret.id;
                 store.save_secret(&secret).map_err(|e| e.to_string())?;

@@ -10,6 +10,7 @@ use crate::ui::widgets::{self, Tone};
 use crate::App;
 
 pub fn view(app: &App) -> Element<'_, Message> {
+    let reveal = app.reveal_password;
     let Some(session) = app.active_session() else {
         return container(Space::new()).into();
     };
@@ -96,10 +97,12 @@ pub fn view(app: &App) -> Element<'_, Message> {
     let auth_extra: Element<'_, Message> = match config.auth {
         AuthMode::Password => labeled(
             "Password",
-            widgets::secure_field(
+            widgets::secure_field_toggle(
                 "Your server password",
                 &config.password,
+                reveal,
                 Message::PasswordChanged,
+                Message::ToggleRevealPassword,
             ),
         ),
         AuthMode::Key => column![
@@ -115,10 +118,12 @@ pub fn view(app: &App) -> Element<'_, Message> {
             ),
             labeled(
                 "Key passphrase (leave empty if none)",
-                widgets::secure_field(
+                widgets::secure_field_toggle(
                     "Passphrase",
                     &config.passphrase,
+                    reveal,
                     Message::PassphraseChanged,
+                    Message::ToggleRevealPassword,
                 ),
             ),
         ]

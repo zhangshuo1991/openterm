@@ -96,10 +96,14 @@ pub fn view(app: &App) -> Element<'_, Message> {
         }
     };
 
-    let rail_w = app.rail_width_value();
+    let rail_w = app.rail_visual_width();
+    // Keep the content at its full width and let the outer row clip it, so the
+    // rail slides in/out cleanly instead of reflowing (squishing) its charts.
+    let content_w = (app.rail_width_value() - 6.0).max(1.0);
     let content = container(body)
-        .width(Length::Fill)
+        .width(Length::Fixed(content_w))
         .height(Length::Fill)
+        .clip(true)
         .style(|_| container::Style {
             background: Some(theme::surface_1().into()),
             border: Border { color: theme::border_subtle(), width: 1.0, radius: 0.0.into() },
@@ -121,8 +125,9 @@ pub fn view(app: &App) -> Element<'_, Message> {
     .on_release(Message::RailDragEnd);
 
     row![divider, content]
-        .width(Length::Fixed(rail_w))
+        .width(Length::Fixed(rail_w.max(0.0)))
         .height(Length::Fill)
+        .clip(true)
         .into()
 }
 
@@ -191,7 +196,7 @@ fn pct_metric<'a>(
     column![
         head,
         meter(pct, available, color),
-        chart(history, color, 100.0, 44.0, ChartUnit::Percent),
+        chart(history, color, 100.0, 60.0, ChartUnit::Percent),
     ]
     .spacing(6)
     .into()
@@ -218,7 +223,7 @@ fn rate_metric<'a>(
     ]
     .spacing(4);
 
-    column![head, rates, chart(history, color, 0.0, 44.0, ChartUnit::Rate)]
+    column![head, rates, chart(history, color, 0.0, 60.0, ChartUnit::Rate)]
         .spacing(6)
         .into()
 }
@@ -493,11 +498,40 @@ enum ChartUnit {
 }
 
 impl ChartUnit {
+    /// Full label (used elsewhere if needed).
+    #[allow(dead_code)]
     fn fmt(self, v: f32) -> String {
         match self {
             ChartUnit::Percent => format!("{v:.0}%"),
             ChartUnit::Rate => format!("{}/s", fmt_bytes(v as f64)),
         }
+    }
+
+    /// Compact axis-tick label that fits the narrow rail gutter:
+    /// `18%`, `274K`, `1.2M`.
+    fn fmt_tick(self, v: f32) -> String {
+        match self {
+            ChartUnit::Percent => format!("{v:.0}%"),
+            ChartUnit::Rate => fmt_rate_tick(v as f64),
+        }
+    }
+}
+
+/// Bytes/s → short tick like `0`, `936`, `274K`, `1.2M`, `3G`.
+fn fmt_rate_tick(bps: f64) -> String {
+    const UNITS: [&str; 5] = ["", "K", "M", "G", "T"];
+    let mut v = bps.max(0.0);
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{v:.0}")
+    } else if v < 10.0 {
+        format!("{v:.1}{}", UNITS[i])
+    } else {
+        format!("{v:.0}{}", UNITS[i])
     }
 }
 
@@ -539,37 +573,83 @@ impl canvas::Program<Message> for Sparkline {
         if self.points.len() < 2 {
             return vec![frame.into_geometry()];
         }
+
+        // Coordinate-system gutters: a left column for Y-axis ticks and a
+        // bottom strip for X-axis time labels. The data plots inside the
+        // remaining rectangle.
+        const PAD_L: f32 = 34.0; // y-tick label column
+        const PAD_B: f32 = 11.0; // x-time label strip
+        let plot_x0 = PAD_L;
+        let plot_x1 = w;
+        let plot_y0 = 1.0;
+        let plot_y1 = h - PAD_B;
+        let plot_w = (plot_x1 - plot_x0).max(1.0);
+        let plot_h = (plot_y1 - plot_y0).max(1.0);
+
         // Adaptive min–max scaling: map the data's own range (with 10% padding)
-        // to the chart height so even small fluctuations are visible. A fixed
-        // 0–100 scale would render a steady ~15% memory line dead flat. The big
-        // "%" label above already conveys the absolute value; the chart is for
-        // trend. `self.max`, when > 0, acts as a lower bound on the visible span
-        // so a near-constant series doesn't amplify pure noise into wild swings.
+        // to the plot height so even small fluctuations are visible. A fixed
+        // 0–100 scale would render a steady ~15% memory line dead flat.
+        // `self.max`, when > 0, acts as a lower bound on the visible span so a
+        // near-constant series doesn't amplify pure noise into wild swings.
         let (lo, hi) = self
             .points
             .iter()
             .copied()
             .fold((f32::MAX, f32::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)));
-        let (raw_lo, raw_hi) = (lo, hi);
         let noise_floor = if self.max > 0.0 { self.max * 0.02 } else { 1.0 };
         let span = (hi - lo).max(noise_floor);
         let pad = span * 0.1;
-        let lo = lo - pad;
+        let axis_lo = lo - pad;
         let range = span + pad * 2.0;
         let n = self.points.len();
-        let dx = w / (n as f32 - 1.0);
-        let y_for = |v: f32| h - ((v - lo) / range).clamp(0.0, 1.0) * (h - 2.0) - 1.0;
+        let dx = plot_w / (n as f32 - 1.0);
+        let y_for = |v: f32| plot_y1 - ((v - axis_lo) / range).clamp(0.0, 1.0) * plot_h;
+
+        let grid_color = theme::with_alpha(theme::text_high(), 0.08);
+        let axis_color = theme::with_alpha(theme::text_high(), 0.22);
+        let label_color = theme::with_alpha(theme::text_high(), 0.55);
+
+        // Horizontal gridlines + Y-axis value ticks at 0%, 50%, 100% of the
+        // visible range (i.e. axis_lo, midpoint, axis_lo+range).
+        for frac in [0.0_f32, 0.5, 1.0] {
+            let y = plot_y1 - frac * plot_h;
+            let gridline = Path::new(|b| {
+                b.move_to(Point::new(plot_x0, y));
+                b.line_to(Point::new(plot_x1, y));
+            });
+            frame.stroke(&gridline, Stroke::default().with_width(1.0).with_color(grid_color));
+
+            let value = axis_lo + range * frac;
+            let valign = if frac >= 0.99 {
+                alignment::Vertical::Top
+            } else if frac <= 0.01 {
+                alignment::Vertical::Bottom
+            } else {
+                alignment::Vertical::Center
+            };
+            frame.fill_text(Text {
+                content: self.unit.fmt_tick(value),
+                position: Point::new(plot_x0 - 4.0, y),
+                color: label_color,
+                size: 8.5.into(),
+                font: theme::TERMINAL_FONT,
+                align_x: alignment::Horizontal::Right.into(),
+                align_y: valign,
+                ..Default::default()
+            });
+        }
+
         let xy: Vec<Point> = self
             .points
             .iter()
             .enumerate()
-            .map(|(i, &v)| Point::new(i as f32 * dx, y_for(v)))
+            .map(|(i, &v)| Point::new(plot_x0 + i as f32 * dx, y_for(v)))
             .collect();
 
         let fill = Path::new(|b| {
-            b.move_to(Point::new(0.0, h));
+            b.move_to(Point::new(plot_x0, plot_y1));
             for p in &xy { b.line_to(*p); }
-            b.line_to(Point::new(w, h));
+            b.line_to(Point::new(plot_x1, plot_y1));
             b.close();
         });
         frame.fill(&fill, theme::with_alpha(self.color, 0.18));
@@ -584,25 +664,37 @@ impl canvas::Program<Message> for Sparkline {
             frame.fill(&Path::circle(*last, 2.5), self.color);
         }
 
-        // Y-axis reference labels: peak (top-left) and trough (bottom-left), so
-        // the trend line reads against concrete numbers. Skip the trough when it
-        // equals the peak (flat series) to avoid redundant clutter.
-        let label = |frame: &mut Frame, content: String, y: f32, valign: alignment::Vertical| {
-            frame.fill_text(Text {
-                content,
-                position: Point::new(2.0, y),
-                color: theme::with_alpha(theme::text_high(), 0.7),
-                size: 9.0.into(),
-                font: theme::TERMINAL_FONT,
-                align_x: alignment::Horizontal::Left.into(),
-                align_y: valign,
-                ..Default::default()
-            });
-        };
-        label(&mut frame, self.unit.fmt(raw_hi), 1.0, alignment::Vertical::Top);
-        if (raw_hi - raw_lo).abs() > f32::EPSILON {
-            label(&mut frame, self.unit.fmt(raw_lo), h - 1.0, alignment::Vertical::Bottom);
-        }
+        // Axes: Y on the left edge of the plot, X along the bottom.
+        let axes = Path::new(|b| {
+            b.move_to(Point::new(plot_x0, plot_y0));
+            b.line_to(Point::new(plot_x0, plot_y1));
+            b.line_to(Point::new(plot_x1, plot_y1));
+        });
+        frame.stroke(&axes, Stroke::default().with_width(1.0).with_color(axis_color));
+
+        // X-axis time labels. Samples arrive every ~2s, so the window spans
+        // (n-1)*2 seconds; left = oldest age, right = "now".
+        let span_secs = (n as f32 - 1.0) * 2.0;
+        frame.fill_text(Text {
+            content: format!("-{}", fmt_age(span_secs)),
+            position: Point::new(plot_x0 + 1.0, h),
+            color: label_color,
+            size: 8.5.into(),
+            font: theme::TERMINAL_FONT,
+            align_x: alignment::Horizontal::Left.into(),
+            align_y: alignment::Vertical::Bottom,
+            ..Default::default()
+        });
+        frame.fill_text(Text {
+            content: "now".to_string(),
+            position: Point::new(plot_x1 - 1.0, h),
+            color: label_color,
+            size: 8.5.into(),
+            font: theme::TERMINAL_FONT,
+            align_x: alignment::Horizontal::Right.into(),
+            align_y: alignment::Vertical::Bottom,
+            ..Default::default()
+        });
 
         vec![frame.into_geometry()]
     }
@@ -631,6 +723,18 @@ fn fmt_bytes(bytes: f64) -> String {
 }
 
 fn fmt_kb(kb: u64) -> String { fmt_bytes(kb as f64 * 1024.0) }
+
+/// Short elapsed-time label for the X axis: `40s`, `2m`, `1h`.
+fn fmt_age(secs: f32) -> String {
+    let s = secs.max(0.0) as u64;
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3_600 {
+        format!("{}m", s / 60)
+    } else {
+        format!("{}h", s / 3_600)
+    }
+}
 
 fn fmt_uptime(secs: f64) -> String {
     let s = secs as u64;

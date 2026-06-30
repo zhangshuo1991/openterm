@@ -87,8 +87,21 @@ pub fn view(app: &App) -> Element<'_, Message> {
             .padding([8, 6]),
         );
     } else {
+        // Group rows under Today / Yesterday / This Week / Older headers. Entries
+        // are newest-first, so buckets appear in chronological order already.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let mut last_bucket: Option<&'static str> = None;
         for entry in &filtered {
-            list = list.push(history_row(entry));
+            let bucket = time_bucket(entry.ts_ms, now_ms);
+            if last_bucket != Some(bucket) {
+                list = list.push(timeline_header(bucket));
+                last_bucket = Some(bucket);
+            }
+            let expanded = app.expanded_history.contains(&entry.ts_ms);
+            list = list.push(history_row(entry, expanded));
         }
     }
 
@@ -123,21 +136,29 @@ pub fn view(app: &App) -> Element<'_, Message> {
         .into()
 }
 
-fn history_row(entry: &openterm_storage::HistoryEntry) -> Element<'_, Message> {
+fn history_row(entry: &openterm_storage::HistoryEntry, expanded: bool) -> Element<'_, Message> {
     let ts = fmt_ts(entry.ts_ms);
     let cmd = entry.cmd.clone();
-    let cmd2 = cmd.clone();
+    let cmd_copy = cmd.clone();
+    let cmd_run = cmd.clone();
+    let has_output = !entry.output.is_empty();
 
-    let meta = row![
+    let mut meta = row![
         text(ts).size(10).color(theme::text_dim()),
         Space::new().width(Length::Fixed(6.0)),
         text(entry.host.clone())
             .size(10)
             .color(theme::accent())
             .width(Length::Fill),
-        action_btn("Copy", Message::HistoryCopyCmd(cmd2), false),
+        action_btn("Run", Message::HistoryRun(cmd_run), false),
+        action_btn("Copy", Message::HistoryCopyCmd(cmd_copy), false),
     ]
     .align_y(iced::Alignment::Center);
+    // Expand/collapse toggle only when there's captured output to show.
+    if has_output {
+        let glyph = if expanded { "⌄" } else { "›" };
+        meta = meta.push(action_btn(glyph, Message::HistoryToggleExpand(entry.ts_ms), false));
+    }
 
     let cmd_label = text(cmd.clone())
         .font(theme::TERMINAL_FONT)
@@ -147,20 +168,42 @@ fn history_row(entry: &openterm_storage::HistoryEntry) -> Element<'_, Message> {
 
     let mut inner = column![meta, cmd_label].spacing(2);
 
-    // Add 2-line output preview if output exists
-    if !entry.output.is_empty() {
-        let preview: String = entry
-            .output
-            .lines()
-            .take(2)
-            .collect::<Vec<_>>()
-            .join("\n");
-        let output_preview = text(preview)
-            .font(theme::TERMINAL_FONT)
-            .size(11)
-            .color(theme::text_dim())
-            .wrapping(iced::widget::text::Wrapping::None);
-        inner = inner.push(output_preview);
+    if has_output {
+        if expanded {
+            // Full (capped) output block, monospace, in a subtle panel.
+            let full: String = entry.output.chars().take(1500).collect();
+            let block = container(
+                text(full)
+                    .font(theme::TERMINAL_FONT)
+                    .size(11)
+                    .color(theme::text_muted()),
+            )
+            .width(Length::Fill)
+            .padding([5, 7])
+            .style(|_| container::Style {
+                background: Some(theme::surface_2().into()),
+                border: Border {
+                    radius: 5.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            inner = inner.push(block);
+        } else {
+            // Collapsed: 2-line preview.
+            let preview: String = entry
+                .output
+                .lines()
+                .take(2)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let output_preview = text(preview)
+                .font(theme::TERMINAL_FONT)
+                .size(11)
+                .color(theme::text_dim())
+                .wrapping(iced::widget::text::Wrapping::None);
+            inner = inner.push(output_preview);
+        }
     }
 
     button(inner)
@@ -179,6 +222,29 @@ fn history_row(entry: &openterm_storage::HistoryEntry) -> Element<'_, Message> {
             }
         })
         .into()
+}
+
+/// A timeline section header (Today / Yesterday / This Week / Older).
+fn timeline_header(label: &str) -> Element<'_, Message> {
+    container(text(label.to_string()).size(10).color(theme::text_dim()))
+        .padding(iced::Padding { top: 8.0, right: 4.0, bottom: 2.0, left: 2.0 })
+        .into()
+}
+
+/// Bucket a timestamp relative to now into a coarse timeline label.
+fn time_bucket(ts_ms: u64, now_ms: u64) -> &'static str {
+    let age_secs = now_ms.saturating_sub(ts_ms) / 1000;
+    let day = (ts_ms / 1000) / 86400;
+    let today = (now_ms / 1000) / 86400;
+    if day == today {
+        "Today"
+    } else if today.saturating_sub(day) == 1 {
+        "Yesterday"
+    } else if age_secs < 7 * 86400 {
+        "This Week"
+    } else {
+        "Older"
+    }
 }
 
 fn action_btn(label: &str, msg: Message, danger: bool) -> Element<'_, Message> {

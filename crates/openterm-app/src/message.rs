@@ -167,6 +167,44 @@ pub enum Message {
     SettingsServerAliveInterval(String),
     SettingsOnDisconnect(crate::session::OnDisconnect),
     SettingsColorScheme(crate::theme::ColorScheme),
+    /// Set the terminal cursor shape.
+    SettingsCursorShape(crate::theme::CursorShape),
+    /// Nudge the terminal line-height multiplier by a delta (e.g. ±0.04).
+    SettingsLineHeight(f32),
+    /// Nudge the terminal letter-spacing by a delta in pixels (e.g. ±0.5).
+    SettingsLetterSpacing(f32),
+    /// Set (or clear) the accent color override from a "#rrggbb" string.
+    SettingsAccent(String),
+    /// Collapse / expand a sidebar host group by name.
+    GroupToggle(String),
+    /// Re-run a history command immediately (append newline and send).
+    HistoryRun(String),
+    /// Toggle the expanded output preview for a history row (keyed by ts_ms).
+    HistoryToggleExpand(u64),
+    /// Dismiss a toast by id.
+    ToastDismiss(u64),
+
+    // --- Sprint 3: command completion & smart input ---
+    /// Draft abbreviation changed in the Snippets settings panel.
+    SnippetDraftAbbr(String),
+    /// Draft expansion changed in the Snippets settings panel.
+    SnippetDraftExpansion(String),
+    /// Save the drafted snippet.
+    SnippetAdd,
+    /// Delete the snippet with this abbreviation.
+    SnippetDelete(String),
+    /// Open the Ctrl+R history-search overlay.
+    HistorySearchOpen,
+    /// Close the history-search overlay without inserting.
+    HistorySearchClose,
+    /// Query changed in the history-search overlay.
+    HistorySearchQuery(String),
+    /// Move the selection in the history-search overlay (+1 / -1).
+    HistorySearchMove(i32),
+    /// Insert the selected history command onto the prompt and close.
+    HistorySearchAccept,
+    /// Toggle plain-text visibility of the password/passphrase field.
+    ToggleRevealPassword,
 
     // --- Command palette ---
     TogglePalette,
@@ -238,6 +276,14 @@ pub enum Message {
     VaultUnlockResult(Result<String, String>),
     /// Result of async vault setup: Ok(master_password) or Err(reason).
     VaultSetupResult(Result<String, String>),
+    /// Request to enable the vault (opens the create-master-password dialog).
+    VaultEnableRequest,
+    /// Request to disable the vault (re-encrypts secrets with the default key).
+    VaultDisableRequest,
+    /// Result of enabling the vault: Ok(()) after secrets re-encrypted, or Err.
+    VaultEnableResult(Result<(), String>),
+    /// Result of disabling the vault: Ok(()) after secrets re-encrypted, or Err.
+    VaultDisableResult(Result<(), String>),
 
     Noop,
 }

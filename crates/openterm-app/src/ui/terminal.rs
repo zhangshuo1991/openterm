@@ -34,6 +34,9 @@ pub fn view(app: &App) -> Element<'_, Message> {
         selection: session.selection,
         search_query: query.to_lowercase(),
         search_current: app.terminal_search_idx,
+        cursor_shape: app.cursor_shape(),
+        copy_flash: app.copy_flash(),
+        inline_suggestion: session.inline_suggestion.clone().unwrap_or_default(),
     };
 
     let surface = canvas(program).width(Length::Fill).height(Length::Fill);

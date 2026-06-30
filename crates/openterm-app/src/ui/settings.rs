@@ -58,6 +58,8 @@ pub fn view(app: &App) -> Element<'_, Message> {
             card,
             Space::new().height(Length::Fill),
         ]
+        .width(Length::Fill)
+        .height(Length::Fill)
         .align_x(iced::Alignment::Center),
     )
     .width(Length::Fill)
@@ -72,6 +74,7 @@ fn nav_panel(active: SettingsPanel) -> Element<'static, Message> {
         (SettingsPanel::Ssh, "SSH"),
         (SettingsPanel::Keys, "Keys"),
         (SettingsPanel::Appearance, "Appearance"),
+        (SettingsPanel::Snippets, "Snippets"),
         (SettingsPanel::Advanced, "Advanced"),
     ];
 
@@ -120,6 +123,7 @@ fn content_panel(app: &App) -> Element<'_, Message> {
         SettingsPanel::Ssh => ssh_panel(app),
         SettingsPanel::Keys => keys_panel(),
         SettingsPanel::Appearance => appearance_panel(app),
+        SettingsPanel::Snippets => snippets_panel(app),
         SettingsPanel::Advanced => advanced_panel(app),
     };
 
@@ -299,36 +303,251 @@ fn appearance_panel(app: &App) -> Element<'_, Message> {
             "Choose a color scheme for the app.",
             row(ColorScheme::ALL.iter().copied().map(dot).collect::<Vec<_>>()).spacing(10).into(),
         ),
+        group_label("Accent"),
+        setting_row(
+            "Accent color",
+            "Override the scheme's accent. Default keeps the theme's own.",
+            accent_picker(app),
+        ),
+        group_label("终端"),
+        setting_row(
+            "Cursor shape",
+            "How the terminal cursor is drawn.",
+            cursor_shape_picker(app),
+        ),
+        setting_row(
+            "Line height",
+            "Vertical spacing between terminal rows.",
+            row![
+                stepper_btn("−", Message::SettingsLineHeight(-0.04)),
+                container(
+                    text(format!("{:.2}×", app.line_height))
+                        .size(13)
+                        .color(theme::text_high()),
+                )
+                .width(Length::Fixed(58.0))
+                .center_x(Length::Fixed(58.0)),
+                stepper_btn("+", Message::SettingsLineHeight(0.04)),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center)
+            .into(),
+        ),
+        setting_row(
+            "Letter spacing",
+            "Extra horizontal space between characters.",
+            row![
+                stepper_btn("−", Message::SettingsLetterSpacing(-0.5)),
+                container(
+                    text(format!("{:.1} px", app.letter_spacing()))
+                        .size(13)
+                        .color(theme::text_high()),
+                )
+                .width(Length::Fixed(58.0))
+                .center_x(Length::Fixed(58.0)),
+                stepper_btn("+", Message::SettingsLetterSpacing(0.5)),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center)
+            .into(),
+        ),
     ]
     .spacing(0)
+    .into()
+}
+
+/// Row of accent presets plus a "Default" (clear-override) chip.
+fn accent_picker(app: &App) -> Element<'_, Message> {
+    let mut r = row![].spacing(8).align_y(iced::Alignment::Center);
+
+    // "Default" chip clears the override.
+    let is_default = app.accent_hex.trim().is_empty();
+    r = r.push(
+        button(text("Default").size(11).color(if is_default {
+            theme::accent()
+        } else {
+            theme::text_muted()
+        }))
+        .padding([4, 9])
+        .on_press(Message::SettingsAccent(String::new()))
+        .style(move |_, _| button::Style {
+            background: Some(theme::surface_2().into()),
+            text_color: theme::text_high(),
+            border: Border {
+                color: if is_default { theme::accent() } else { theme::border_subtle() },
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            ..Default::default()
+        }),
+    );
+
+    for (_, hex) in theme::ACCENT_PRESETS {
+        let color = theme::parse_hex(hex).unwrap_or(theme::accent());
+        let selected = app.accent_hex.eq_ignore_ascii_case(hex);
+        r = r.push(
+            button(Space::new().width(Length::Fixed(16.0)).height(Length::Fixed(16.0)))
+                .padding(2)
+                .on_press(Message::SettingsAccent(hex.to_string()))
+                .style(move |_, _| button::Style {
+                    background: Some(color.into()),
+                    border: Border {
+                        color: if selected { Color::WHITE } else { Color::TRANSPARENT },
+                        width: 2.0,
+                        radius: 10.0.into(),
+                    },
+                    ..Default::default()
+                }),
+        );
+    }
+    r.into()
+}
+
+/// Three-way cursor shape selector (Block / Underline / Beam).
+fn cursor_shape_picker(app: &App) -> Element<'_, Message> {
+    use crate::theme::CursorShape;
+    let current = app.cursor_shape();
+    row(CursorShape::ALL.iter().copied().map(|shape| {
+        let sel = current == shape;
+        button(text(shape.label()).size(12).color(if sel {
+            theme::text_high()
+        } else {
+            theme::text_muted()
+        }))
+        .padding([5, 10])
+        .on_press(Message::SettingsCursorShape(shape))
+        .style(move |_, _| button::Style {
+            background: Some(if sel { theme::surface_3() } else { theme::surface_2() }.into()),
+            text_color: theme::text_high(),
+            border: Border {
+                color: if sel { theme::accent() } else { theme::border_subtle() },
+                width: if sel { 1.5 } else { 1.0 },
+                radius: 6.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
+    }).collect::<Vec<_>>())
+    .spacing(6)
+    .into()
+}
+
+// ── Snippets ──────────────────────────────────────────────────────────────────
+
+fn snippets_panel(app: &App) -> Element<'_, Message> {
+    let mut col = column![
+        panel_title(
+            "Snippets",
+            "Type an abbreviation then Space or Tab to expand it (e.g. gp → git push).",
+        ),
+        group_label("新建"),
+        row![
+            text_input("abbr", &app.snippet_draft_abbr)
+                .on_input(Message::SnippetDraftAbbr)
+                .padding([6, 10])
+                .size(12)
+                .style(input_style)
+                .width(Length::Fixed(90.0)),
+            text_input("expands to…", &app.snippet_draft_expansion)
+                .on_input(Message::SnippetDraftExpansion)
+                .on_submit(Message::SnippetAdd)
+                .padding([6, 10])
+                .size(12)
+                .style(input_style)
+                .width(Length::Fill),
+            widgets::small_button("Add", widgets::Tone::Primary, Message::SnippetAdd),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center),
+        group_label("已保存"),
+    ]
+    .spacing(0);
+
+    if app.snippets.is_empty() {
+        col = col.push(
+            container(text("No snippets yet.").size(12).color(theme::text_dim()))
+                .padding([8, 0]),
+        );
+    } else {
+        for snip in &app.snippets {
+            col = col.push(snippet_row(&snip.abbr, &snip.expansion));
+        }
+    }
+
+    col.into()
+}
+
+fn snippet_row<'a>(abbr: &'a str, expansion: &'a str) -> Element<'a, Message> {
+    column![
+        row![
+            container(
+                text(abbr)
+                    .size(13)
+                    .font(theme::TERMINAL_FONT)
+                    .color(theme::accent_strong()),
+            )
+            .width(Length::Fixed(90.0)),
+            text(expansion)
+                .size(12)
+                .font(theme::TERMINAL_FONT)
+                .color(theme::text_high())
+                .width(Length::Fill),
+            widgets::small_button(
+                "Delete",
+                widgets::Tone::Danger,
+                Message::SnippetDelete(abbr.to_string()),
+            ),
+        ]
+        .spacing(12)
+        .align_y(iced::Alignment::Center),
+        container(Space::new().width(Length::Fill).height(Length::Fixed(1.0))).style(|_| {
+            container::Style {
+                background: Some(theme::border_subtle().into()),
+                ..Default::default()
+            }
+        }),
+    ]
+    .spacing(0)
+    .padding(iced::Padding { top: 8.0, right: 0.0, bottom: 0.0, left: 0.0 })
     .into()
 }
 
 // ── Advanced ────────────────────────────────────────────────────────────────
 
 fn advanced_panel(app: &App) -> Element<'_, Message> {
-    let vault_control: Element<'_, Message> = if app.vault_has_canary {
-        if app.vault_locked() {
+    let vault_control: Element<'_, Message> = if app.vault_busy {
+        container(text("Migrating…").size(12).color(theme::text_muted()))
+            .padding([4, 10])
+            .into()
+    } else if app.vault_enabled {
+        use iced::widget::row as irow;
+        let lock_btn = if app.vault_locked() {
             container(text("Locked").size(12).color(theme::text_muted()))
                 .padding([4, 10])
                 .into()
         } else {
-            widgets::small_button("Lock now", widgets::Tone::Neutral, Message::VaultLock)
-        }
+            widgets::small_button("Lock", widgets::Tone::Neutral, Message::VaultLock)
+        };
+        irow![
+            lock_btn,
+            widgets::small_button("Disable", widgets::Tone::Danger, Message::VaultDisableRequest),
+        ]
+        .spacing(6)
+        .into()
     } else {
-        container(text("Not set up").size(12).color(theme::text_dim()))
-            .padding([4, 10])
-            .into()
+        widgets::small_button("Enable", widgets::Tone::Primary, Message::VaultEnableRequest)
+    };
+
+    let vault_hint = if app.vault_enabled {
+        "Master-password encryption is ON. Saved SSH passwords auto-lock after 15 min."
+    } else {
+        "Disabled (default). Passwords use a built-in key. Enable to require a master password."
     };
 
     column![
         panel_title("Advanced", "Power-user options."),
         group_label("安全"),
-        setting_row(
-            "Credential vault",
-            "Saved SSH passwords are encrypted with your master password. The vault auto-locks after 15 minutes of inactivity or when the system sleeps.",
-            vault_control,
-        ),
+        setting_row("Credential vault", vault_hint, vault_control),
         group_label("历史记录"),
         danger_row(
             "Clear command history",

@@ -1,7 +1,7 @@
 //! Horizontal session tabs across the top of the workspace, Termius-style.
 //! Each tab shows a status dot, the session title, and a close affordance.
 
-use iced::widget::{button, container, mouse_area, row, text, Space};
+use iced::widget::{button, container, mouse_area, row, text, tooltip, Space};
 use iced::{Border, Color, Element, Length};
 
 use crate::message::Message;
@@ -24,7 +24,12 @@ pub fn view(app: &App) -> Element<'_, Message> {
     let pulse = app.connecting_pulse;
     for (index, session) in app.sessions.iter().enumerate() {
         let active = index == app.active;
-        tabs = tabs.push(tab(index, session, active, pulse));
+        // A tab mid-close animates its width down to 0 (interpolated each frame).
+        let closing = app
+            .closing_tabs
+            .get(&session.id)
+            .map(|a| a.interpolate(0.0_f32, 1.0_f32, app.now()));
+        tabs = tabs.push(tab(index, session, active, pulse, closing));
     }
 
     // New-tab button.
@@ -87,13 +92,36 @@ fn tab<'a>(
     session: &'a crate::session::Session,
     active: bool,
     pulse: bool,
+    closing: Option<f32>,
 ) -> Element<'a, Message> {
-    let title = session.title();
-    let title = if title.chars().count() > 22 {
-        format!("{}…", title.chars().take(21).collect::<String>())
+    let full_title = session.title();
+    let truncated = full_title.chars().count() > 22;
+    let title = if truncated {
+        format!("{}…", full_title.chars().take(21).collect::<String>())
     } else {
-        title
+        full_title.clone()
     };
+
+    // Stable per-tab hue derived from the host (falls back to the title for
+    // local shells / unsaved sessions so each tab still gets a distinct color).
+    let accent_key = if session.config.host.trim().is_empty() {
+        full_title.as_str()
+    } else {
+        session.config.host.trim()
+    };
+    let accent = theme::tab_accent(accent_key);
+
+    // Amber dot when the session's open file has unsaved edits.
+    let dirty = session
+        .file_viewer
+        .as_ref()
+        .map(|fv| fv.dirty)
+        .unwrap_or(false);
+
+    // While closing, render a non-interactive pill that collapses horizontally.
+    if let Some(factor) = closing {
+        return closing_tab(&title, accent, dirty, factor);
+    }
 
     let close = button(text("✕").size(11).color(theme::text_dim()))
         .padding([2, 5])
@@ -122,25 +150,29 @@ fn tab<'a>(
             }
         });
 
-    let body = row![
-        widgets::status_dot(&session.phase, pulse),
-        text(title).size(13).color(if active {
+    let mut body = row![widgets::status_dot(&session.phase, pulse)]
+        .spacing(7)
+        .align_y(iced::Alignment::Center);
+    if dirty {
+        body = body.push(unsaved_dot());
+    }
+    body = body
+        .push(text(title).size(13).color(if active {
             theme::text_high()
         } else {
             theme::text_muted()
-        }),
-        close,
-    ]
-    .spacing(7)
-    .align_y(iced::Alignment::Center);
+        }))
+        .push(close);
 
-    button(body)
+    let tab_button = button(body)
         .padding([7, 10])
         .on_press(Message::SelectTab(index))
         .style(move |_, status| {
             let hovered = matches!(status, button::Status::Hovered);
+            // Tint the active/hovered tab with its own accent at low alpha so
+            // the bar reads as a row of colored pills without shouting.
             let bg = if active {
-                theme::surface_0()
+                theme::with_alpha(accent, 0.16)
             } else if hovered {
                 theme::surface_2()
             } else {
@@ -151,7 +183,7 @@ fn tab<'a>(
                 text_color: theme::text_high(),
                 border: Border {
                     color: if active {
-                        theme::border_subtle()
+                        theme::with_alpha(accent, 0.6)
                     } else {
                         Color::TRANSPARENT
                     },
@@ -160,6 +192,84 @@ fn tab<'a>(
                 },
                 ..Default::default()
             }
+        });
+
+    // Only attach a tooltip when the title was actually truncated, so it shows
+    // the full host name on hover.
+    if truncated {
+        tooltip(
+            tab_button,
+            container(text(full_title).size(12).color(theme::text_high()))
+                .padding([4, 8])
+                .style(|_| container::Style {
+                    background: Some(theme::surface_3().into()),
+                    border: Border {
+                        color: theme::border_subtle(),
+                        width: 1.0,
+                        radius: 6.0.into(),
+                    },
+                    ..Default::default()
+                }),
+            tooltip::Position::Bottom,
+        )
+        .gap(4)
+        .into()
+    } else {
+        tab_button.into()
+    }
+}
+
+/// A non-interactive pill that mirrors a tab's look but collapses its width to
+/// zero as `factor` runs 1.0 → 0.0. The content is clipped, so the pill appears
+/// to slide shut. Width is estimated from the title length (iced gives no
+/// layout query), which is fine for a brief 120 ms collapse.
+fn closing_tab<'a>(title: &str, accent: Color, dirty: bool, factor: f32) -> Element<'a, Message> {
+    let chars = title.chars().count().min(22) as f32;
+    let full = 68.0 + chars * 7.0 + if dirty { 14.0 } else { 0.0 };
+    let width = (full * factor.clamp(0.0, 1.0)).max(0.0);
+
+    let mut body = row![widgets_phase_idle_dot()]
+        .spacing(7)
+        .align_y(iced::Alignment::Center);
+    if dirty {
+        body = body.push(unsaved_dot());
+    }
+    body = body.push(text(title.to_string()).size(13).color(theme::text_muted()));
+
+    container(body)
+        .padding([7, 10])
+        .width(Length::Fixed(width))
+        .height(Length::Fixed(theme::TAB_BAR_HEIGHT - 8.0))
+        .clip(true)
+        .style(move |_| container::Style {
+            background: Some(theme::with_alpha(accent, 0.16 * factor).into()),
+            border: Border {
+                color: theme::with_alpha(accent, 0.6 * factor),
+                width: 1.0,
+                radius: 8.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
+/// A dim status dot used by the closing pill (the live phase no longer matters).
+fn widgets_phase_idle_dot() -> Element<'static, Message> {
+    container(text("●").size(11).color(theme::text_dim())).into()
+}
+
+/// A small amber dot indicating the session's open file has unsaved edits.
+fn unsaved_dot() -> Element<'static, Message> {
+    container(Space::new())
+        .width(Length::Fixed(7.0))
+        .height(Length::Fixed(7.0))
+        .style(|_| container::Style {
+            background: Some(theme::status_warn().into()),
+            border: Border {
+                radius: 4.0.into(),
+                ..Default::default()
+            },
+            ..Default::default()
         })
         .into()
 }

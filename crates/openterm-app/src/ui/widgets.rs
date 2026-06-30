@@ -1,7 +1,22 @@
 //! Small reusable styled widgets so the whole UI shares one visual language.
 
-use iced::widget::{button, container, text, text_input};
+use iced::widget::{button, container, svg, text, text_input};
 use iced::{Border, Color, Element, Length, Shadow};
+
+// ── Eye icons (Feather-style line art, stroke="currentColor") ─────────────
+
+/// Eye-open SVG: lens outline + iris circle.
+static EYE_OPEN_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M1 10s3.5-6.5 9-6.5S19 10 19 10s-3.5 6.5-9 6.5S1 10 1 10z"/>
+  <circle cx="10" cy="10" r="2.5"/>
+</svg>"#;
+
+/// Eye-off SVG: partial arcs + diagonal slash, same weight.
+static EYE_OFF_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M14.12 14.12A7.84 7.84 0 0110 15.5C4.5 15.5 1 10 1 10a17.4 17.4 0 014.42-4.88"/>
+  <path d="M8.24 4.63A7.3 7.3 0 0110 4.5c5.5 0 9 5.5 9 5.5a17.4 17.4 0 01-2.1 2.97"/>
+  <line x1="2" y1="2" x2="18" y2="18"/>
+</svg>"#;
 
 use crate::message::Message;
 use crate::session::Phase;
@@ -109,6 +124,7 @@ pub fn field<'a>(
         .into()
 }
 
+#[allow(dead_code)]
 pub fn secure_field<'a>(
     placeholder: &str,
     value: &str,
@@ -120,6 +136,77 @@ pub fn secure_field<'a>(
         .padding([9, 12])
         .size(14)
         .style(input_style)
+        .into()
+}
+
+/// A secure text field with a trailing eye-icon button that toggles plain-text
+/// visibility. `revealed` = true means the text is currently visible.
+/// Pressing the eye emits `on_toggle`.
+pub fn secure_field_toggle<'a>(
+    placeholder: &str,
+    value: &str,
+    revealed: bool,
+    on_input: impl Fn(String) -> Message + 'a,
+    on_toggle: Message,
+) -> Element<'a, Message> {
+    use iced::widget::row;
+
+    let input = text_input(placeholder, value)
+        .on_input(on_input)
+        .secure(!revealed)
+        .padding([9, 12])
+        .size(14)
+        .style(input_style)
+        .width(Length::Fill);
+
+    // Eye-open = password is currently visible (click to hide).
+    // Eye-off  = password is currently hidden (click to show).
+    let icon_bytes: &'static [u8] = if revealed { EYE_OPEN_SVG } else { EYE_OFF_SVG };
+    let icon = svg(svg::Handle::from_memory(icon_bytes))
+        .width(Length::Fixed(16.0))
+        .height(Length::Fixed(16.0))
+        .style(|_, status| {
+            // Brighten the icon on hover so the interaction is obvious even
+            // though iced doesn't let us change nested widget color via button
+            // hover state directly — we rely on the SVG's own hover status.
+            let active = matches!(status, svg::Status::Hovered);
+            svg::Style {
+                color: Some(if active {
+                    theme::text_high()
+                } else {
+                    theme::text_muted()
+                }),
+            }
+        });
+
+    // Wrap in a square button that highlights on hover.
+    let eye = button(
+        container(icon)
+            .width(Length::Fixed(34.0))
+            .height(Length::Fixed(34.0))
+            .center_x(Length::Fixed(34.0))
+            .center_y(Length::Fixed(34.0)),
+    )
+    .padding(0)
+    .on_press(on_toggle)
+    .style(|_, status| {
+        let hovered = matches!(status, button::Status::Hovered);
+        button::Style {
+            background: Some(
+                if hovered { theme::surface_3() } else { theme::surface_2() }.into(),
+            ),
+            border: Border {
+                color: theme::border_subtle(),
+                width: 1.0,
+                radius: 7.0.into(),
+            },
+            ..Default::default()
+        }
+    });
+
+    row![input, eye]
+        .spacing(8)
+        .align_y(iced::Alignment::Center)
         .into()
 }
 

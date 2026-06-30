@@ -8,6 +8,7 @@ const SECRETS: TableDefinition<&str, &[u8]> = TableDefinition::new("encrypted_se
 const SETTINGS: TableDefinition<&str, &[u8]> = TableDefinition::new("app_settings");
 const HISTORY: TableDefinition<u64, &[u8]> = TableDefinition::new("command_history");
 const VAULT: TableDefinition<&str, &[u8]> = TableDefinition::new("vault_meta");
+const SNIPPETS: TableDefinition<&str, &[u8]> = TableDefinition::new("input_snippets");
 const UI_SETTINGS_KEY: &str = "ui";
 const VAULT_CANARY_KEY: &str = "canary";
 const MAX_HISTORY_ROWS: u64 = 5000;
@@ -25,7 +26,17 @@ pub struct HistoryEntry {
     pub output: String,
 }
 
+/// A typed-input snippet: an abbreviation that expands to a longer command
+/// when the user types it followed by Space or Tab (e.g. "gp" → "git push").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Snippet {
+    /// The short trigger (matched against the current input line, verbatim).
+    pub abbr: String,
+    /// What the abbreviation expands to.
+    pub expansion: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UiSettings {
     pub theme_mode: String,
     pub terminal_font_size: u16,
@@ -37,6 +48,33 @@ pub struct UiSettings {
     /// Default SSH port pre-filled for new sessions.
     #[serde(default = "default_port")]
     pub default_port: u16,
+    /// Whether the credential vault (master-password encryption) is enabled.
+    /// When false, saved secrets use a built-in default key (no prompt).
+    #[serde(default)]
+    pub vault_enabled: bool,
+    /// Sidebar group names the user has collapsed (persisted across restarts).
+    #[serde(default)]
+    pub collapsed_groups: Vec<String>,
+    /// Terminal line-height multiplier (1.0 = tight, 1.4 = roomy).
+    #[serde(default = "default_line_height")]
+    pub line_height: f32,
+    /// Extra horizontal spacing added per terminal cell, in pixels.
+    #[serde(default)]
+    pub letter_spacing: f32,
+    /// Terminal cursor shape: "block" | "underline" | "beam".
+    #[serde(default = "default_cursor_shape")]
+    pub cursor_shape: String,
+    /// Optional accent color override as "#rrggbb". Empty = use scheme default.
+    #[serde(default)]
+    pub accent_hex: String,
+}
+
+fn default_line_height() -> f32 {
+    1.32
+}
+
+fn default_cursor_shape() -> String {
+    "block".to_string()
 }
 
 fn default_port() -> u16 {
@@ -51,6 +89,12 @@ impl Default for UiSettings {
             color_scheme: "DarkTeal".to_string(),
             default_user: String::new(),
             default_port: 22,
+            vault_enabled: false,
+            collapsed_groups: Vec::new(),
+            line_height: default_line_height(),
+            letter_spacing: 0.0,
+            cursor_shape: default_cursor_shape(),
+            accent_hex: String::new(),
         }
     }
 }
@@ -156,6 +200,36 @@ impl WorkspaceStore {
         Ok(Some(serde_json::from_slice(value.value())?))
     }
 
+    /// Every stored secret. Used to re-encrypt the vault when toggling the
+    /// master password on or off.
+    pub fn list_secrets(&self) -> Result<Vec<EncryptedSecret>, StorageError> {
+        let txn = self.db.begin_read()?;
+        let Ok(table) = txn.open_table(SECRETS) else {
+            return Ok(Vec::new());
+        };
+        let mut secrets = Vec::new();
+        for row in table.iter()? {
+            let (_, value) = row?;
+            secrets.push(serde_json::from_slice(value.value())?);
+        }
+        Ok(secrets)
+    }
+
+    /// Overwrite a batch of secrets in a single transaction, so a vault
+    /// re-encryption migration can't leave the store half-converted.
+    pub fn put_secrets_batch(&self, secrets: &[EncryptedSecret]) -> Result<(), StorageError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(SECRETS)?;
+            for secret in secrets {
+                let bytes = serde_json::to_vec(secret)?;
+                table.insert(secret.id.to_string().as_str(), bytes.as_slice())?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     pub fn save_ui_settings(&self, settings: &UiSettings) -> Result<(), StorageError> {
         let bytes = serde_json::to_vec(settings)?;
         let txn = self.db.begin_write()?;
@@ -196,6 +270,17 @@ impl WorkspaceStore {
         let Ok(table) = txn.open_table(VAULT) else { return Ok(None); };
         let Some(value) = table.get(VAULT_CANARY_KEY)? else { return Ok(None); };
         Ok(Some(serde_json::from_slice(value.value())?))
+    }
+
+    /// Remove the master-password canary (when the vault is disabled).
+    pub fn delete_master_canary(&self) -> Result<(), StorageError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(VAULT)?;
+            table.remove(VAULT_CANARY_KEY)?;
+        }
+        txn.commit()?;
+        Ok(())
     }
 
     /// Append one command to persistent history, pruning oldest if over the cap.
@@ -288,6 +373,46 @@ impl WorkspaceStore {
         txn.commit()?;
         Ok(())
     }
+
+    /// Save (or overwrite) a snippet, keyed by its abbreviation.
+    pub fn save_snippet(&self, snippet: &Snippet) -> Result<(), StorageError> {
+        let bytes = serde_json::to_vec(snippet)?;
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(SNIPPETS)?;
+            table.insert(snippet.abbr.as_str(), bytes.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Remove the snippet with the given abbreviation.
+    pub fn delete_snippet(&self, abbr: &str) -> Result<(), StorageError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(SNIPPETS)?;
+            table.remove(abbr)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// All saved snippets, ordered by abbreviation.
+    pub fn list_snippets(&self) -> Result<Vec<Snippet>, StorageError> {
+        let txn = self.db.begin_read()?;
+        let Ok(table) = txn.open_table(SNIPPETS) else {
+            return Ok(Vec::new());
+        };
+        let mut snippets: Vec<Snippet> = table
+            .iter()?
+            .filter_map(|r| {
+                let (_, v) = r.ok()?;
+                serde_json::from_slice(v.value()).ok()
+            })
+            .collect();
+        snippets.sort_by(|a: &Snippet, b| a.abbr.cmp(&b.abbr));
+        Ok(snippets)
+    }
 }
 
 #[cfg(test)]
@@ -321,12 +446,40 @@ mod tests {
             default_user: "me".to_string(),
             default_port: 2222,
             color_scheme: "DarkTeal".to_string(),
+            ..UiSettings::default()
         };
 
         assert_eq!(store.get_ui_settings().unwrap(), None);
         store.save_ui_settings(&settings).unwrap();
 
         assert_eq!(store.get_ui_settings().unwrap(), Some(settings));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn snippets_round_trip_and_delete() {
+        let path = std::env::temp_dir().join(format!("openterm-snip-{}.redb", uuid_like()));
+        let store = WorkspaceStore::open(&path).unwrap();
+
+        assert!(store.list_snippets().unwrap().is_empty());
+        store
+            .save_snippet(&Snippet { abbr: "gp".into(), expansion: "git push origin HEAD".into() })
+            .unwrap();
+        store
+            .save_snippet(&Snippet { abbr: "ll".into(), expansion: "ls -la".into() })
+            .unwrap();
+
+        let all = store.list_snippets().unwrap();
+        assert_eq!(all.len(), 2);
+        // Ordered by abbreviation.
+        assert_eq!(all[0].abbr, "gp");
+        assert_eq!(all[1].abbr, "ll");
+
+        store.delete_snippet("gp").unwrap();
+        let all = store.list_snippets().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].abbr, "ll");
 
         let _ = fs::remove_file(path);
     }

@@ -75,6 +75,12 @@ pub fn actions_for(app: &App, query: &str) -> Vec<PaletteAction> {
             message: Message::ToggleHistory,
         });
         all.push(PaletteAction {
+            title: "Search history",
+            hint: "Fuzzy-search past commands (Ctrl+R)",
+            keywords: "search history reverse ctrl-r find command",
+            message: Message::HistorySearchOpen,
+        });
+        all.push(PaletteAction {
             title: "Clear terminal",
             hint: "Wipe the current screen",
             keywords: "clear cls wipe terminal",

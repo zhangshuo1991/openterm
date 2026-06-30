@@ -39,11 +39,13 @@ pub fn subscription(app: &App) -> Subscription<Message> {
         .unwrap_or(false);
     let palette_open = app.palette_open;
 
-    // Vault auto-lock heartbeat: a 60s tick drives both the 15-minute idle
-    // timeout and sleep detection (a large gap between ticks implies the
-    // machine slept). Always on so the vault locks even while idle.
-    let vault_tick = iced::time::every(std::time::Duration::from_secs(60))
-        .map(|_| Message::VaultCheckLock);
+    // Vault auto-lock heartbeat: only needed while the vault is enabled.
+    let vault_tick = if app.vault_enabled {
+        iced::time::every(std::time::Duration::from_secs(60))
+            .map(|_| Message::VaultCheckLock)
+    } else {
+        Subscription::none()
+    };
 
     // While the vault overlay is up it gates everything: only Enter (submit)
     // and Esc (manual lock when already unlockable) reach the app, and no
@@ -127,6 +129,29 @@ pub fn subscription(app: &App) -> Subscription<Message> {
     return Subscription::batch([connections, modifiers, palette_keys, frames, vault_tick]);
     }
 
+    // The Ctrl+R history-search overlay owns the keyboard while open: nav + run
+    // + close. Typing flows to its focused search box via on_input.
+    if app.history_search_open {
+        let keys = keyboard::listen().filter_map(|event| {
+            let keyboard::Event::KeyPressed { key, .. } = event else {
+                return None;
+            };
+            match key.as_ref() {
+                Key::Named(key::Named::ArrowDown) => Some(Message::HistorySearchMove(1)),
+                Key::Named(key::Named::ArrowUp) => Some(Message::HistorySearchMove(-1)),
+                Key::Named(key::Named::Enter) => Some(Message::HistorySearchAccept),
+                Key::Named(key::Named::Escape) => Some(Message::HistorySearchClose),
+                _ => None,
+            }
+        });
+        let frames = if app.any_animating() {
+            window::frames().map(Message::Tick)
+        } else {
+            Subscription::none()
+        };
+        return Subscription::batch([connections, modifiers, keys, frames, vault_tick]);
+    }
+
     // `with` carries the connected flag into the (non-capturing) filter_map.
     let typing = keyboard::listen()
         .with(active_connected)
@@ -146,6 +171,16 @@ pub fn subscription(app: &App) -> Subscription<Message> {
                 return Some(message);
             }
             if connected {
+                // Ctrl+R opens the history-search overlay instead of the shell's
+                // own reverse-search (Sprint 3). Intercepted before encode_key
+                // would turn it into 0x12.
+                if modifiers.control() && !modifiers.shift() && !modifiers.alt() {
+                    if let Key::Character(v) = key.as_ref() {
+                        if v.eq_ignore_ascii_case("r") {
+                            return Some(Message::HistorySearchOpen);
+                        }
+                    }
+                }
                 crate::keys::encode_key(key, modifiers, text.as_deref()).map(Message::TerminalInput)
             } else {
                 None
@@ -221,6 +256,13 @@ fn app_shortcut(key: &Key, modifiers: Modifiers) -> Option<Message> {
         Key::Character(v) if v.eq_ignore_ascii_case("f") => Some(Message::TerminalSearchOpen),
         Key::Character(v) if v.eq_ignore_ascii_case("c") => Some(Message::TerminalCopy),
         Key::Character(v) if v.eq_ignore_ascii_case("v") => Some(Message::PasteRequested),
+        Key::Character(v) if v.eq_ignore_ascii_case("b") => Some(Message::ToggleSidebar),
+        Key::Character(v) if v == "," => Some(Message::OpenSettings),
+        // Cmd+1..=9 jumps to that tab (1-based → 0-based index).
+        Key::Character(v) if matches!(v.as_ref(), "1"|"2"|"3"|"4"|"5"|"6"|"7"|"8"|"9") => {
+            let n = v.parse::<usize>().unwrap_or(1).saturating_sub(1);
+            Some(Message::SelectTab(n))
+        }
         Key::Character(v) if v == "+" || v == "=" => Some(Message::FontSizeDelta(1)),
         Key::Character(v) if v == "-" => Some(Message::FontSizeDelta(-1)),
         Key::Named(key::Named::Enter) => None,

@@ -188,24 +188,6 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::SaveHost => {
-            let needs_secret = app
-                .active_session()
-                .map(|s| {
-                    matches!(s.config.auth, crate::session::AuthMode::Password)
-                        || (matches!(s.config.auth, crate::session::AuthMode::Key)
-                            && !s.config.passphrase.is_empty())
-                })
-                .unwrap_or(false);
-            // Encrypting a credential needs the vault unlocked. Defer the save
-            // and open the setup (fresh) or unlock (existing) dialog.
-            if needs_secret && app.vault_locked() {
-                app.vault_resume_save = true;
-                if !app.vault_has_canary {
-                    app.vault_setup_prompt = true;
-                }
-                app.status = "Set up your master password to save credentials.".to_string();
-                return iced::widget::operation::focus(crate::ui::vault::PW_INPUT_ID.clone());
-            }
             match app.active_session().map(|s| s.config.clone()) {
                 Some(config) => match persist_host(app, &config) {
                     Ok(host_id) => {
@@ -216,9 +198,27 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                             app.hosts = store.list_hosts().unwrap_or_default();
                         }
                         app.touch_vault();
-                        app.status = "Host saved.".to_string();
+                        let label = {
+                            let name = config.name.trim();
+                            if name.is_empty() {
+                                config.host.trim().to_string()
+                            } else {
+                                name.to_string()
+                            }
+                        };
+                        app.status = format!("Host \"{label}\" saved to the sidebar.");
+                        app.push_toast(
+                            crate::ui::toasts::ToastKind::Success,
+                            format!("Saved \"{label}\" to the sidebar"),
+                        );
                     }
-                    Err(error) => app.status = format!("Save failed: {error}"),
+                    Err(error) => {
+                        app.status = format!("Save failed: {error}");
+                        app.push_toast(
+                            crate::ui::toasts::ToastKind::Error,
+                            format!("Couldn't save host: {error}"),
+                        );
+                    }
                 },
                 None => {}
             }
@@ -239,18 +239,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         }
 
         // --- Terminal ---
-        Message::TerminalInput(bytes) => {
-            if let Some(session) = app.active_session_mut() {
-                session.terminal.scroll_to_bottom();
-                session.track_input(&bytes);
-            }
-            if let Some(session) = app.active_session() {
-                if let Some(tx) = &session.cmd_tx {
-                    let _ = tx.try_send(Command::Write(bytes));
-                }
-            }
-            Task::none()
-        }
+        Message::TerminalInput(bytes) => terminal_input(app, bytes),
         Message::TerminalScroll(lines) => {
             if let Some(session) = app.active_session_mut() {
                 // Wheel up (positive) scrolls toward older output.
@@ -280,7 +269,20 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 let t = crate::terminal_render::selected_text(&snap, (c1, r1), (c2, r2));
                 if t.is_empty() { None } else { Some(t) }
             });
-            if let Some(t) = text { clipboard::write(t) } else { Task::none() }
+            if let Some(t) = text {
+                let chars = t.chars().count();
+                app.push_toast(
+                    crate::ui::toasts::ToastKind::Success,
+                    format!("Copied {chars} chars"),
+                );
+                // Brief selection flash for visual confirmation.
+                app.now = std::time::Instant::now();
+                app.copy_flash_until =
+                    Some(app.now + std::time::Duration::from_millis(450));
+                clipboard::write(t)
+            } else {
+                Task::none()
+            }
         }
         Message::PasteReady(Some(text)) => {
             if let Some(session) = app.active_session() {
@@ -793,12 +795,158 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::SettingsColorScheme(scheme) => {
             app.color_scheme = scheme;
             crate::theme::set_scheme(scheme);
-            if let Ok(store) = openterm_storage::WorkspaceStore::open(&app.db_path) {
-                let mut settings = openterm_storage::UiSettings::default();
-                settings.terminal_font_size = app.font_size;
-                settings.color_scheme = scheme.to_str().to_string();
-                let _ = store.save_ui_settings(&settings);
+            app.persist_settings();
+            Task::none()
+        }
+        Message::SettingsCursorShape(shape) => {
+            app.cursor_shape = shape;
+            app.persist_settings();
+            Task::none()
+        }
+        Message::SettingsLineHeight(delta) => {
+            let next = (app.line_height + delta).clamp(1.0, 2.0);
+            // Round to 2 decimals so repeated nudges don't drift.
+            let next = (next * 100.0).round() / 100.0;
+            if (next - app.line_height).abs() > f32::EPSILON {
+                app.line_height = next;
+                crate::terminal_render::set_line_height(next);
+                app.persist_settings();
+                return apply_grid(app);
             }
+            Task::none()
+        }
+        Message::SettingsLetterSpacing(delta) => {
+            let next = (app.letter_spacing + delta).clamp(0.0, 6.0);
+            let next = (next * 10.0).round() / 10.0;
+            if (next - app.letter_spacing).abs() > f32::EPSILON {
+                app.letter_spacing = next;
+                crate::terminal_render::set_letter_spacing(next);
+                app.persist_settings();
+                return apply_grid(app);
+            }
+            Task::none()
+        }
+        Message::SettingsAccent(hex) => {
+            crate::theme::set_accent_override(&hex);
+            app.accent_hex = hex;
+            app.persist_settings();
+            Task::none()
+        }
+        Message::GroupToggle(name) => {
+            if !app.collapsed_groups.remove(&name) {
+                app.collapsed_groups.insert(name);
+            }
+            app.persist_settings();
+            Task::none()
+        }
+        Message::HistoryRun(cmd) => {
+            let bytes = format!("{cmd}\n").into_bytes();
+            if let Some(s) = app.active_session() {
+                if let Some(tx) = &s.cmd_tx {
+                    let _ = tx.try_send(Command::Write(bytes));
+                }
+            }
+            Task::none()
+        }
+        Message::HistoryToggleExpand(ts) => {
+            if !app.expanded_history.remove(&ts) {
+                app.expanded_history.insert(ts);
+            }
+            Task::none()
+        }
+        Message::ToastDismiss(id) => {
+            if let Some(t) = app.toasts.iter_mut().find(|t| t.id == id) {
+                t.dismissed = true;
+            }
+            Task::none()
+        }
+
+        // --- Sprint 3: snippets + history search ---
+        Message::SnippetDraftAbbr(v) => {
+            app.snippet_draft_abbr = v;
+            Task::none()
+        }
+        Message::SnippetDraftExpansion(v) => {
+            app.snippet_draft_expansion = v;
+            Task::none()
+        }
+        Message::SnippetAdd => {
+            let abbr = app.snippet_draft_abbr.trim().to_string();
+            let expansion = app.snippet_draft_expansion.trim().to_string();
+            // Both halves are required; the abbr can't contain whitespace since
+            // it's matched against a single typed token before Space/Tab.
+            if abbr.is_empty() || expansion.is_empty() || abbr.contains(char::is_whitespace) {
+                app.push_toast(
+                    crate::ui::toasts::ToastKind::Warning,
+                    "Snippet needs a whitespace-free abbreviation and an expansion",
+                );
+                return Task::none();
+            }
+            let snippet = openterm_storage::Snippet { abbr, expansion };
+            if let Ok(store) = openterm_storage::WorkspaceStore::open(&app.db_path) {
+                let _ = store.save_snippet(&snippet);
+                app.snippets = store.list_snippets().unwrap_or_default();
+            }
+            app.snippet_draft_abbr.clear();
+            app.snippet_draft_expansion.clear();
+            Task::none()
+        }
+        Message::SnippetDelete(abbr) => {
+            if let Ok(store) = openterm_storage::WorkspaceStore::open(&app.db_path) {
+                let _ = store.delete_snippet(&abbr);
+                app.snippets = store.list_snippets().unwrap_or_default();
+            }
+            Task::none()
+        }
+        Message::HistorySearchOpen => {
+            app.history_search_open = true;
+            app.history_search_query.clear();
+            app.history_search_idx = 0;
+            iced::widget::operation::focus(crate::ui::history_search::INPUT_ID.clone())
+        }
+        Message::HistorySearchClose => {
+            app.history_search_open = false;
+            app.history_search_query.clear();
+            app.history_search_idx = 0;
+            Task::none()
+        }
+        Message::HistorySearchQuery(v) => {
+            app.history_search_query = v;
+            app.history_search_idx = 0;
+            Task::none()
+        }
+        Message::HistorySearchMove(delta) => {
+            let count = crate::ui::history_search::matches(app).len();
+            if count > 0 {
+                let cur = app.history_search_idx as i32;
+                app.history_search_idx = (cur + delta).rem_euclid(count as i32) as usize;
+            }
+            Task::none()
+        }
+        Message::HistorySearchAccept => {
+            let cmd = crate::ui::history_search::matches(app)
+                .get(app.history_search_idx)
+                .map(|s| s.to_string());
+            app.history_search_open = false;
+            app.history_search_query.clear();
+            app.history_search_idx = 0;
+            if let Some(cmd) = cmd {
+                // Insert onto the prompt without a trailing newline, mirroring
+                // the shell's own Ctrl+R (the user reviews, then presses Enter).
+                if let Some(session) = app.active_session_mut() {
+                    session.track_input(cmd.as_bytes());
+                    session.inline_suggestion = None;
+                }
+                if let Some(session) = app.active_session() {
+                    if let Some(tx) = &session.cmd_tx {
+                        let _ = tx.try_send(Command::Write(cmd.into_bytes()));
+                    }
+                }
+            }
+            Task::none()
+        }
+        Message::ToggleRevealPassword => {
+            app.reveal_password = !app.reveal_password;
             Task::none()
         }
 
@@ -876,10 +1024,46 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::PingResult { host_id, latency_ms } => {
             app.ping_results.insert(host_id, latency_ms);
+            // Keep a short rolling history per host for the footer sparkline.
+            // Unreachable samples record as 0 so gaps still show on the chart.
+            let hist = app.ping_history.entry(host_id).or_default();
+            hist.push_back(latency_ms.unwrap_or(0).min(u16::MAX as u32) as u16);
+            while hist.len() > 30 {
+                hist.pop_front();
+            }
             Task::none()
         }
         Message::Tick(now) => {
+            // Real delta since the last frame, clamped so a stale `now` (e.g. the
+            // first frame after idle) can't jolt time-based animations.
+            let dt = now
+                .saturating_duration_since(app.now)
+                .as_secs_f32()
+                .min(0.1);
             app.now = now;
+
+            // Advance toasts and retire finished / dismissed ones.
+            if !app.toasts.is_empty() {
+                for t in &mut app.toasts {
+                    t.progress += dt / 3.0;
+                }
+                app.toasts.retain(|t| !t.dismissed && t.progress < 1.3);
+            }
+
+            // Finalize tab-close animations: once a tab has fully collapsed,
+            // drop the session. Keyed by stable id, so concurrent closes are safe.
+            if !app.closing_tabs.is_empty() {
+                let done: Vec<u64> = app
+                    .closing_tabs
+                    .iter()
+                    .filter(|(_, anim)| !anim.is_animating(now))
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in done {
+                    app.closing_tabs.remove(&id);
+                    finalize_tab_close(app, id);
+                }
+            }
             Task::none()
         }
         Message::PulseTick => {
@@ -1087,13 +1271,9 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                     app.vault_pw.clear();
                     app.vault_confirm.clear();
                     app.vault_err = None;
-                    app.vault_setup_prompt = false;
                     app.touch_vault();
                     app.vault_last_check = std::time::Instant::now();
                     app.status = "Vault unlocked.".to_string();
-                    if std::mem::take(&mut app.vault_resume_save) {
-                        return update(app, Message::SaveHost);
-                    }
                     // Refresh hosts now that secrets can be decrypted.
                     if let Ok(store) = openterm_storage::WorkspaceStore::open(&app.db_path) {
                         app.hosts = store.list_hosts().unwrap_or_default();
@@ -1109,21 +1289,112 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::VaultSetupResult(result) => {
             match result {
                 Ok(master) => {
-                    app.vault_master = Some(master);
-                    app.vault_has_canary = true;
+                    // Canary stored under the new master password. Now migrate
+                    // every saved secret from the default key to the master
+                    // password before flipping the vault on.
+                    app.vault_master = Some(master.clone());
                     app.vault_pw.clear();
                     app.vault_confirm.clear();
                     app.vault_err = None;
-                    app.vault_setup_prompt = false;
-                    app.touch_vault();
-                    app.vault_last_check = std::time::Instant::now();
-                    app.status = "Master password created. Vault unlocked.".to_string();
-                    if std::mem::take(&mut app.vault_resume_save) {
-                        return update(app, Message::SaveHost);
-                    }
+                    app.vault_busy = true;
+                    app.status = "Encrypting saved credentials…".to_string();
+                    let db_path = app.db_path.clone();
+                    return Task::perform(
+                        async move {
+                            tokio::task::spawn_blocking(move || {
+                                reencrypt_all_secrets(&db_path, crate::VAULT_DEFAULT_KEY, master.as_bytes())
+                            })
+                            .await
+                            .unwrap_or_else(|e| Err(e.to_string()))
+                        },
+                        Message::VaultEnableResult,
+                    );
                 }
                 Err(reason) => {
                     app.vault_err = Some(reason);
+                }
+            }
+            Task::none()
+        }
+        Message::VaultEnableRequest => {
+            if app.vault_enabled || app.vault_busy {
+                return Task::none();
+            }
+            // Open the create-master-password dialog.
+            app.vault_setup_prompt = true;
+            app.vault_pw.clear();
+            app.vault_confirm.clear();
+            app.vault_err = None;
+            iced::widget::operation::focus(crate::ui::vault::PW_INPUT_ID.clone())
+        }
+        Message::VaultEnableResult(result) => {
+            app.vault_busy = false;
+            match result {
+                Ok(()) => {
+                    app.vault_enabled = true;
+                    app.vault_has_canary = true;
+                    app.vault_setup_prompt = false;
+                    app.touch_vault();
+                    app.vault_last_check = std::time::Instant::now();
+                    app.persist_settings();
+                    if let Ok(store) = openterm_storage::WorkspaceStore::open(&app.db_path) {
+                        app.hosts = store.list_hosts().unwrap_or_default();
+                    }
+                    app.status = "Credential vault enabled.".to_string();
+                }
+                Err(reason) => {
+                    // Migration failed: roll back so we don't strand secrets
+                    // encrypted under a master password the vault won't use.
+                    app.vault_master = None;
+                    app.vault_setup_prompt = false;
+                    if let Ok(store) = openterm_storage::WorkspaceStore::open(&app.db_path) {
+                        let _ = store.delete_master_canary();
+                    }
+                    app.vault_has_canary = false;
+                    app.vault_err = Some(reason.clone());
+                    app.status = format!("Could not enable vault: {reason}");
+                }
+            }
+            Task::none()
+        }
+        Message::VaultDisableRequest => {
+            if !app.vault_enabled || app.vault_busy {
+                return Task::none();
+            }
+            // Need the master password in memory to re-encrypt back to default.
+            let Some(master) = app.vault_master.clone() else {
+                app.status = "Unlock the vault before disabling it.".to_string();
+                return Task::none();
+            };
+            app.vault_busy = true;
+            app.status = "Decrypting saved credentials…".to_string();
+            let db_path = app.db_path.clone();
+            Task::perform(
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        reencrypt_all_secrets(&db_path, master.as_bytes(), crate::VAULT_DEFAULT_KEY)
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()))
+                },
+                Message::VaultDisableResult,
+            )
+        }
+        Message::VaultDisableResult(result) => {
+            app.vault_busy = false;
+            match result {
+                Ok(()) => {
+                    app.vault_enabled = false;
+                    app.vault_master = None;
+                    app.vault_has_canary = false;
+                    if let Ok(store) = openterm_storage::WorkspaceStore::open(&app.db_path) {
+                        let _ = store.delete_master_canary();
+                    }
+                    app.persist_settings();
+                    app.status = "Credential vault disabled.".to_string();
+                }
+                Err(reason) => {
+                    app.status = format!("Could not disable vault: {reason}");
                 }
             }
             Task::none()
@@ -1197,6 +1468,144 @@ fn vault_submit(app: &mut App) -> Task<Message> {
             Message::VaultSetupResult,
         )
     }
+}
+
+/// Re-encrypt every saved secret from `old_key` to `new_key`, used when the
+/// vault is enabled (default→master) or disabled (master→default). All secrets
+/// are decrypted and re-encrypted in memory first; only if every one succeeds
+/// are they written back in a single transaction, so a wrong key or a mid-way
+/// failure never leaves the store half-converted. Each secret keeps its `id`
+/// so host references stay valid.
+fn reencrypt_all_secrets(
+    db_path: &std::path::Path,
+    old_key: &[u8],
+    new_key: &[u8],
+) -> Result<(), String> {
+    let store = openterm_storage::WorkspaceStore::open(db_path).map_err(|e| e.to_string())?;
+    let vault = openterm_crypto::LocalVault::new(openterm_crypto::VaultConfig::default());
+    let secrets = store.list_secrets().map_err(|e| e.to_string())?;
+    let mut migrated = Vec::with_capacity(secrets.len());
+    for secret in &secrets {
+        let plain = vault
+            .decrypt_secret(old_key, secret)
+            .map_err(|_| "Could not decrypt an existing credential.".to_string())?;
+        let mut re = vault
+            .encrypt_secret(new_key, &plain)
+            .map_err(|e| e.to_string())?;
+        // Preserve the original id so AuthRef references in hosts stay valid.
+        re.id = secret.id;
+        migrated.push(re);
+    }
+    store.put_secrets_batch(&migrated).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Handle a chunk of bytes the user typed into the terminal. Beyond forwarding
+/// to the PTY, this is where Sprint 3 smart-input lives: accepting an inline
+/// ghost suggestion (Right/Tab), expanding a snippet abbreviation (Space/Tab),
+/// and recomputing the next suggestion from history.
+fn terminal_input(app: &mut App, bytes: Vec<u8>) -> Task<Message> {
+    // 1) Snippet expansion: when the user presses Space or Tab and the whole
+    //    typed line equals a known abbreviation, erase the abbr and send the
+    //    expansion followed by the original trigger byte.
+    let is_space = bytes == b" ";
+    let is_tab = bytes == [0x09];
+    if is_space || is_tab {
+        let line = app
+            .active_session()
+            .map(|s| s.input_line())
+            .unwrap_or_default();
+        if let Some(expansion) = app
+            .snippets
+            .iter()
+            .find(|s| s.abbr == line && !line.is_empty())
+            .map(|s| s.expansion.clone())
+        {
+            let abbr_chars = line.chars().count();
+            let mut out: Vec<u8> = vec![0x7f; abbr_chars]; // backspace ×N
+            out.extend_from_slice(expansion.as_bytes());
+            out.extend_from_slice(&bytes); // original Space/Tab
+            if let Some(session) = app.active_session_mut() {
+                session.terminal.scroll_to_bottom();
+                // Resync the shadow: abbr erased, expansion typed. A trailing
+                // Space is part of the line; a Tab is a completion trigger we
+                // don't keep in the shadow.
+                session.clear_input_line();
+                session.extend_input(expansion.as_bytes());
+                if is_space {
+                    session.extend_input(b" ");
+                }
+                session.inline_suggestion = None;
+            }
+            if let Some(session) = app.active_session() {
+                if let Some(tx) = &session.cmd_tx {
+                    let _ = tx.try_send(Command::Write(out));
+                }
+            }
+            recompute_active_suggestion(app);
+            return Task::none();
+        }
+    }
+
+    // 2) Accept the inline ghost suggestion: Right-arrow or Tab when one exists.
+    let is_right = bytes == b"\x1b[C";
+    if (is_right || is_tab) && app.active_session().is_some_and(|s| s.inline_suggestion.is_some()) {
+        let suffix = app
+            .active_session_mut()
+            .and_then(|s| s.inline_suggestion.take());
+        if let Some(suffix) = suffix {
+            if let Some(session) = app.active_session_mut() {
+                session.terminal.scroll_to_bottom();
+                session.extend_input(suffix.as_bytes());
+            }
+            if let Some(session) = app.active_session() {
+                if let Some(tx) = &session.cmd_tx {
+                    let _ = tx.try_send(Command::Write(suffix.into_bytes()));
+                }
+            }
+            recompute_active_suggestion(app);
+            return Task::none();
+        }
+    }
+
+    // 3) Normal path: track the bytes and forward them to the PTY.
+    if let Some(session) = app.active_session_mut() {
+        session.terminal.scroll_to_bottom();
+        session.track_input(&bytes);
+        // Enter clears the line; drop any stale suggestion immediately so it
+        // doesn't flash on the next prompt.
+        if bytes.iter().any(|&b| b == b'\r' || b == b'\n') {
+            session.inline_suggestion = None;
+        }
+    }
+    if let Some(session) = app.active_session() {
+        if let Some(tx) = &session.cmd_tx {
+            let _ = tx.try_send(Command::Write(bytes));
+        }
+    }
+    recompute_active_suggestion(app);
+    Task::none()
+}
+
+/// Recompute the active session's ghost suggestion from history (this session's
+/// own commands first, newest-first, then the global persisted history).
+fn recompute_active_suggestion(app: &mut App) {
+    let Some(index) = app.sessions.get(app.active).map(|_| app.active) else {
+        return;
+    };
+    // Compute the suffix while only reading, then assign — avoids overlapping
+    // borrows of `app.sessions` and `app.all_history`.
+    let line = app.sessions[index].input_line();
+    let suffix = {
+        let session_hist = app.sessions[index]
+            .command_history
+            .iter()
+            .rev()
+            .map(String::as_str);
+        let global_hist = app.all_history.iter().map(|e| e.cmd.as_str());
+        crate::session::suggestion_suffix(&line, session_hist.chain(global_hist))
+    };
+    app.sessions[index].inline_suggestion = suffix;
 }
 
 fn with_config<F: FnOnce(&mut SessionConfig)>(app: &mut App, f: F) -> Task<Message> {
@@ -1325,23 +1734,61 @@ fn close_tab(app: &mut App, index: usize) -> Task<Message> {
             }
         }
         app.sessions.clear();
+        app.closing_tabs.clear();
         app.spawn_session(config, cols, rows);
         return Task::none();
     }
     if index >= app.sessions.len() {
         return Task::none();
     }
-    // Tell the worker to disconnect; dropping the session ends its subscription.
+    let id = app.sessions[index].id;
+    // Already animating out — ignore repeat close requests.
+    if app.closing_tabs.contains_key(&id) {
+        return Task::none();
+    }
+    // Tell the worker to disconnect now; the session is dropped once the
+    // collapse animation finishes (see `finalize_tab_close`).
     if let Some(tx) = &app.sessions[index].cmd_tx {
         let _ = tx.try_send(Command::Disconnect);
     }
+    // If the active tab is the one closing, move focus to a neighbor that is
+    // not itself animating out, so the workspace immediately shows a live tab.
+    if app.active == index {
+        app.active = if index > 0 {
+            index - 1
+        } else {
+            (index + 1..app.sessions.len())
+                .find(|i| !app.closing_tabs.contains_key(&app.sessions[*i].id))
+                .unwrap_or(index)
+        };
+    }
+    // Start the collapse animation (width 1.0 → 0.0), keyed by stable id.
+    let now = std::time::Instant::now();
+    app.now = now;
+    let mut anim = Animation::new(true).quick();
+    anim.go_mut(false, now);
+    app.closing_tabs.insert(id, anim);
+    Task::none()
+}
+
+/// Remove a session whose tab-close animation has finished, fixing up `active`.
+fn finalize_tab_close(app: &mut App, id: u64) {
+    let Some(index) = app.session_index_by_id(id) else {
+        return;
+    };
     app.sessions.remove(index);
+    if app.sessions.is_empty() {
+        // Never leave the workspace empty (shouldn't happen — we keep ≥1).
+        let config = app.blank_config();
+        let (cols, rows) = app.current_grid();
+        app.spawn_session(config, cols, rows);
+        return;
+    }
     if app.active >= app.sessions.len() {
         app.active = app.sessions.len() - 1;
     } else if index < app.active {
         app.active -= 1;
     }
-    Task::none()
 }
 
 /// Re-derive the grid from the current window and push a resize to every
@@ -1701,6 +2148,8 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
     let mut open_menu_after = false;
     let mut download_after: Option<usize> = None;
     let mut touch_host_id = None;
+    // Toast to surface after the `session` borrow ends (kind, message).
+    let mut toast: Option<(crate::ui::toasts::ToastKind, String)> = None;
     let session = &mut app.sessions[index];
 
     match event {
@@ -1718,8 +2167,13 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
             session.phase = Phase::Connected;
             session.status = "Connected".to_string();
             session.host_key = None;
+            session.connected_at = Some(std::time::Instant::now());
             crate::smoke::record(&smoke, "connected");
             touch_host_id = session.config.host_id;
+            toast = Some((
+                crate::ui::toasts::ToastKind::Success,
+                format!("Connected to {}", session.config.target_label()),
+            ));
         }
         ConnEvent::Output { bytes, .. } => {
             let prev_len = session.command_history.len();
@@ -1932,14 +2386,24 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
             session.status = "Disconnected".to_string();
             session.monitor_panel = None;
             session.processes.clear();
+            session.connected_at = None;
+            toast = Some((
+                crate::ui::toasts::ToastKind::Info,
+                format!("Disconnected from {}", session.config.target_label()),
+            ));
         }
         ConnEvent::Failed { error, .. } => {
             crate::smoke::record(&smoke, "failed");
             session.phase = Phase::Failed(error.clone());
-            session.status = error;
+            session.status = error.clone();
+            session.connected_at = None;
+            toast = Some((crate::ui::toasts::ToastKind::Error, error));
         }
     }
     // Borrow of `session` ends here; safe to touch `app` again.
+    if let Some((kind, msg)) = toast {
+        app.push_toast(kind, msg);
+    }
     if let Some(host_id) = touch_host_id {
         app.touch_host(host_id);
     }

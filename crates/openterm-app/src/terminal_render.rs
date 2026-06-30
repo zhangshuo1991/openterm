@@ -8,6 +8,27 @@ use openterm_terminal::{TerminalCell, TerminalColor, TerminalSnapshot};
 use crate::message::Message;
 use crate::theme;
 
+// Runtime line-height multiplier (font_size × this = row height) and extra
+// letter spacing. Kept in thread-locals so `metrics()` — called from many
+// places, including grid sizing — reads current values without threading them
+// through every signature.
+thread_local! {
+    static LINE_HEIGHT_MULT: std::cell::Cell<f32> = const { std::cell::Cell::new(1.32) };
+    static LETTER_SPACING: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
+}
+
+/// Install the line-height multiplier (clamped to a sane range).
+pub fn set_line_height(mult: f32) {
+    let m = if mult.is_finite() { mult.clamp(1.0, 2.0) } else { 1.32 };
+    LINE_HEIGHT_MULT.with(|c| c.set(m));
+}
+
+/// Install extra per-cell horizontal spacing in pixels (clamped).
+pub fn set_letter_spacing(px: f32) {
+    let v = if px.is_finite() { px.clamp(0.0, 6.0) } else { 0.0 };
+    LETTER_SPACING.with(|c| c.set(v));
+}
+
 /// Fixed per-cell metrics for a given font size.
 #[derive(Debug, Clone, Copy)]
 pub struct Metrics {
@@ -17,9 +38,11 @@ pub struct Metrics {
 
 pub fn metrics(font_size: u16) -> Metrics {
     let font_size = f32::from(font_size);
+    let mult = LINE_HEIGHT_MULT.with(|c| c.get());
+    let spacing = LETTER_SPACING.with(|c| c.get());
     Metrics {
-        cell_width: (font_size * 0.62).max(6.0),
-        line_height: (font_size * 1.32).max(14.0),
+        cell_width: (font_size * 0.62).max(6.0) + spacing,
+        line_height: (font_size * mult).max(14.0),
     }
 }
 
@@ -32,6 +55,33 @@ pub fn grid_for_viewport(width: f32, height: f32, font_size: u16) -> (u16, u16) 
 
 fn cell_draw_width(cell: &TerminalCell, m: Metrics) -> f32 {
     m.cell_width * if cell.wide { 2.0 } else { 1.0 }
+}
+
+/// Paint an Underline or Beam cursor bar in accent color. Block is handled
+/// inline (full-cell inverse), so this only covers the thin variants.
+fn draw_cursor_bar(
+    frame: &mut Frame,
+    shape: crate::theme::CursorShape,
+    x: f32,
+    y: f32,
+    width: f32,
+    line_height: f32,
+) {
+    use crate::theme::CursorShape;
+    let color = theme::accent_strong();
+    match shape {
+        CursorShape::Underline => {
+            frame.fill_rectangle(
+                Point::new(x, y + line_height - 2.0),
+                Size::new(width, 2.0),
+                color,
+            );
+        }
+        CursorShape::Beam => {
+            frame.fill_rectangle(Point::new(x, y), Size::new(2.0, line_height), color);
+        }
+        CursorShape::Block => {}
+    }
 }
 
 fn font_for(ch: char, bold: bool) -> Font {
@@ -114,6 +164,12 @@ pub struct TerminalCanvas {
     pub search_query: String,
     /// Index of the "current" match to emphasize (wraps modulo match count).
     pub search_current: usize,
+    /// Shape used to paint the cursor cell.
+    pub cursor_shape: crate::theme::CursorShape,
+    /// Copy-confirmation flash intensity (0 = none, 1 = just copied).
+    pub copy_flash: f32,
+    /// Inline ghost-text suggestion drawn at the cursor (Sprint 3). Empty = none.
+    pub inline_suggestion: String,
 }
 
 impl canvas::Program<Message> for TerminalCanvas {
@@ -239,7 +295,11 @@ impl canvas::Program<Message> for TerminalCanvas {
                     && self.snapshot.cursor.row == row_index
                     && self.snapshot.cursor.col == cell.col;
                 let selected = sel.is_some_and(|(s, e)| in_selection(cell.col, row_index, s, e));
-                let inverse = cell.inverse || cursor_here;
+                // Only a Block cursor inverts the whole cell; Underline/Beam
+                // leave the glyph untouched and add a thin bar instead.
+                let block_cursor =
+                    cursor_here && self.cursor_shape == crate::theme::CursorShape::Block;
+                let inverse = cell.inverse || block_cursor;
                 let is_match = match_cells.contains(&(row_index, cell.col));
                 let is_current = current_cells.contains(&(row_index, cell.col));
 
@@ -256,10 +316,12 @@ impl canvas::Program<Message> for TerminalCanvas {
                         hl,
                     );
                 } else if selected {
+                    // Flash brighter right after a copy, then settle back.
+                    let alpha = 0.4 + 0.45 * self.copy_flash;
                     frame.fill_rectangle(
                         Point::new(x, y),
                         Size::new(cell_draw_width(cell, m), m.line_height),
-                        theme::with_alpha(theme::accent(), 0.4),
+                        theme::with_alpha(theme::accent(), alpha),
                     );
                 } else if inverse || cell.background.is_some() {
                     let bg = if inverse {
@@ -274,8 +336,15 @@ impl canvas::Program<Message> for TerminalCanvas {
                     );
                 }
 
-                if cursor_here && cell.ch == ' ' {
-                    if !selected {
+                // Underline / Beam cursor bars (drawn whether or not the cell is
+                // blank, so the cursor is visible on an empty line).
+                if cursor_here && !block_cursor && !selected {
+                    draw_cursor_bar(&mut frame, self.cursor_shape, x, y, cell_draw_width(cell, m), m.line_height);
+                }
+
+                if cell.ch == ' ' {
+                    // A space under a Block cursor still needs the inverse fill.
+                    if block_cursor && !selected {
                         frame.fill_rectangle(
                             Point::new(x, y),
                             Size::new(cell_draw_width(cell, m), m.line_height),
@@ -284,7 +353,6 @@ impl canvas::Program<Message> for TerminalCanvas {
                     }
                     continue;
                 }
-                if cell.ch == ' ' { continue; }
 
                 let fg = if is_match {
                     Color::from_rgb(0.05, 0.05, 0.05)
@@ -316,6 +384,39 @@ impl canvas::Program<Message> for TerminalCanvas {
                     );
                     frame.fill(&underline, fg);
                 }
+            }
+        }
+
+        // Inline ghost suggestion: draw the suffix starting at the cursor, in a
+        // dimmed accent so it reads as "not yet typed". Painted after the grid
+        // so it overlays the (blank) cells to the right of the cursor, and never
+        // injected into the PTY. Clipped to the grid width.
+        if !self.inline_suggestion.is_empty() && self.snapshot.cursor.visible {
+            let cols = self.snapshot.size.cols as usize;
+            let row = self.snapshot.cursor.row;
+            let mut col = self.snapshot.cursor.col;
+            let y = row as f32 * m.line_height;
+            let ghost = theme::with_alpha(theme::text_muted(), 0.55);
+            for ch in self.inline_suggestion.chars() {
+                if col >= cols {
+                    break;
+                }
+                let x = col as f32 * m.cell_width;
+                if ch != ' ' {
+                    frame.fill_text(Text {
+                        content: ch.to_string(),
+                        position: Point::new(x, y),
+                        max_width: m.cell_width,
+                        color: ghost,
+                        size: f32::from(self.font_size).into(),
+                        line_height: LineHeight::Absolute(m.line_height.into()),
+                        font: font_for(ch, false),
+                        align_x: alignment::Horizontal::Left.into(),
+                        align_y: alignment::Vertical::Top,
+                        shaping: iced::widget::text::Shaping::Advanced,
+                    });
+                }
+                col += 1;
             }
         }
 

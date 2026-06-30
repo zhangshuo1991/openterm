@@ -50,6 +50,7 @@ pub enum SettingsPanel {
     Ssh,
     Keys,
     Appearance,
+    Snippets,
     Advanced,
 }
 
@@ -224,6 +225,13 @@ pub struct Session {
     pub local_error: Option<String>,
     /// File viewer panel (shown in the SFTP workspace right column).
     pub file_viewer: Option<FileViewerState>,
+    /// When the session most recently reached `Phase::Connected`, for the
+    /// footer's live connection-duration clock. Cleared on disconnect.
+    pub connected_at: Option<std::time::Instant>,
+    /// Sprint 3: inline ghost-text suggestion (the *suffix* after the current
+    /// input line) computed from history. Drawn at the cursor at 40% alpha;
+    /// Right/Tab accepts it. Never injected into the PTY until accepted.
+    pub inline_suggestion: Option<String>,
 }
 
 /// A local filesystem entry shown in the SFTP local pane.
@@ -464,6 +472,8 @@ impl Session {
             sftp_chmod: None,
             local_error: None,
             file_viewer: None,
+            connected_at: None,
+            inline_suggestion: None,
         }
     }
 
@@ -554,6 +564,29 @@ impl Session {
                 _ => {}
             }
         }
+    }
+
+    /// The line the user is currently typing, reconstructed from tracked input
+    /// bytes (best-effort; see `track_input`). Used to compute ghost-text
+    /// suggestions and match snippet abbreviations.
+    pub fn input_line(&self) -> String {
+        String::from_utf8_lossy(&self.input_buf).into_owned()
+    }
+
+    /// Append already-accepted bytes (a ghost suggestion or snippet expansion)
+    /// to the tracked input line, so the shadow stays in sync with what the
+    /// remote shell now shows. ANSI control bytes are ignored.
+    pub fn extend_input(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            if b >= 0x20 {
+                self.input_buf.push(b);
+            }
+        }
+    }
+
+    /// Reset the tracked input line (used after a snippet erases its abbr).
+    pub fn clear_input_line(&mut self) {
+        self.input_buf.clear();
     }
 
     fn commit_input_line(&mut self, terminal_line: Option<&str>) {
@@ -700,6 +733,26 @@ fn strip_ansi_truncated(bytes: &[u8], max_bytes: usize) -> String {
         }
     }
     result.trim_end().to_string()
+}
+
+/// Find the suffix to suggest after `line`: the first candidate (iterated
+/// newest-first) that strictly extends `line` as a prefix. Returns `None` when
+/// the line is too short, empty/whitespace, or nothing matches. The returned
+/// string is only the part *after* what's already typed.
+pub fn suggestion_suffix<'a>(
+    line: &str,
+    candidates: impl Iterator<Item = &'a str>,
+) -> Option<String> {
+    // Avoid noise: don't suggest until at least 2 non-space chars are typed.
+    if line.trim().len() < 2 {
+        return None;
+    }
+    for cand in candidates {
+        if cand.len() > line.len() && cand.starts_with(line) {
+            return Some(cand[line.len()..].to_string());
+        }
+    }
+    None
 }
 
 /// Strip a shell prompt from `line` and return the command portion.
@@ -854,5 +907,45 @@ mod tests {
         s.track_input(b"ls\r");
         s.write_output(b"\r\n");
         assert_eq!(s.command_history, vec!["ls"]);
+    }
+
+    #[test]
+    fn suggestion_extends_prefix_newest_first() {
+        // Candidates iterated newest-first: the first match that extends wins.
+        let cands = ["git push origin main", "git pull", "git status"];
+        assert_eq!(
+            suggestion_suffix("git p", cands.iter().copied()),
+            Some("ush origin main".to_string())
+        );
+    }
+
+    #[test]
+    fn suggestion_requires_two_chars() {
+        let cands = ["ls -la"];
+        assert_eq!(suggestion_suffix("l", cands.iter().copied()), None);
+        assert_eq!(
+            suggestion_suffix("ls", cands.iter().copied()),
+            Some(" -la".to_string())
+        );
+    }
+
+    #[test]
+    fn suggestion_none_when_exact_or_no_match() {
+        let cands = ["ls -la", "cd /tmp"];
+        // Exact match (no remaining suffix) → no suggestion.
+        assert_eq!(suggestion_suffix("ls -la", cands.iter().copied()), None);
+        // No candidate starts with the line.
+        assert_eq!(suggestion_suffix("xyz", cands.iter().copied()), None);
+    }
+
+    #[test]
+    fn input_line_tracks_typing() {
+        let mut s = session();
+        s.track_input(b"git p");
+        assert_eq!(s.input_line(), "git p");
+        // Enter commits the line; the shadow resets for the next command.
+        s.track_input(b"\r");
+        s.write_output(b"\r\n");
+        assert_eq!(s.input_line(), "");
     }
 }

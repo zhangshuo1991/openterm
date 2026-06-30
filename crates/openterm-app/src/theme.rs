@@ -185,10 +185,77 @@ impl ColorScheme {
 
 thread_local! {
     static ACTIVE: Cell<ColorScheme> = const { Cell::new(ColorScheme::DarkTeal) };
+    /// Optional runtime accent override (set from a user-chosen hex color).
+    static ACCENT_OVERRIDE: Cell<Option<Color>> = const { Cell::new(None) };
 }
 
 pub fn set_scheme(s: ColorScheme) {
     ACTIVE.with(|c| c.set(s));
+}
+
+/// Parse a "#rrggbb" string and install it as the active accent override.
+/// An empty / invalid string clears the override (back to the scheme accent).
+pub fn set_accent_override(hex: &str) {
+    ACCENT_OVERRIDE.with(|c| c.set(parse_hex(hex)));
+}
+
+/// Parse "#rrggbb" (or "rrggbb") into a Color. Returns None when malformed.
+pub fn parse_hex(hex: &str) -> Option<Color> {
+    let h = hex.trim().trim_start_matches('#');
+    if h.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&h[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&h[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&h[4..6], 16).ok()?;
+    Some(Color::from_rgb8(r, g, b))
+}
+
+/// The six built-in accent presets offered in the Appearance panel.
+pub const ACCENT_PRESETS: [(&str, &str); 6] = [
+    ("Teal", "#3c9e8f"),
+    ("Blue", "#3887f0"),
+    ("Purple", "#bd93f6"),
+    ("Orange", "#e07b3d"),
+    ("Green", "#5cb863"),
+    ("Rose", "#e0518a"),
+];
+
+/// Terminal cursor shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CursorShape {
+    #[default]
+    Block,
+    Underline,
+    Beam,
+}
+
+impl CursorShape {
+    pub const ALL: [CursorShape; 3] = [CursorShape::Block, CursorShape::Underline, CursorShape::Beam];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CursorShape::Block => "Block",
+            CursorShape::Underline => "Underline",
+            CursorShape::Beam => "Beam",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "underline" => Self::Underline,
+            "beam" => Self::Beam,
+            _ => Self::Block,
+        }
+    }
+
+    pub fn to_str(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::Underline => "underline",
+            Self::Beam => "beam",
+        }
+    }
 }
 
 pub fn current_scheme() -> ColorScheme {
@@ -208,9 +275,14 @@ pub fn surface_3()      -> Color { p().surface_3 }
 pub fn text_high()      -> Color { p().text_high }
 pub fn text_muted()     -> Color { p().text_muted }
 pub fn text_dim()       -> Color { p().text_dim }
-pub fn accent()         -> Color { p().accent }
-pub fn accent_strong()  -> Color { p().accent_strong }
-pub fn accent_soft()    -> Color { Color { a: p().accent_alpha, ..p().accent } }
+pub fn accent()         -> Color { ACCENT_OVERRIDE.with(|c| c.get()).unwrap_or(p().accent) }
+pub fn accent_strong()  -> Color {
+    ACCENT_OVERRIDE
+        .with(|c| c.get())
+        .map(|c| lighten(c, 0.25))
+        .unwrap_or(p().accent_strong)
+}
+pub fn accent_soft()    -> Color { Color { a: p().accent_alpha, ..accent() } }
 pub fn status_ok()      -> Color { p().status_ok }
 pub fn status_warn()    -> Color { p().status_warn }
 pub fn status_error()   -> Color { p().status_error }
@@ -252,6 +324,24 @@ pub fn darken(color: Color, amount: f32) -> Color {
 }
 pub fn with_alpha(color: Color, alpha: f32) -> Color {
     Color { a: alpha, ..color }
+}
+
+/// Deterministic accent color for a tab, derived from its host/title string so
+/// each saved host keeps a stable hue across sessions. Six well-spaced hues.
+pub fn tab_accent(host: &str) -> Color {
+    const PALETTE: [(f32, f32, f32); 6] = [
+        (0.235, 0.620, 0.560), // teal
+        (0.220, 0.530, 0.940), // blue
+        (0.741, 0.576, 0.976), // purple
+        (0.880, 0.480, 0.240), // orange
+        (0.360, 0.720, 0.380), // green
+        (0.860, 0.660, 0.260), // amber
+    ];
+    let h = host
+        .bytes()
+        .fold(0u32, |a, b| a.wrapping_mul(31).wrapping_add(u32::from(b)));
+    let (r, g, b) = PALETTE[h as usize % PALETTE.len()];
+    Color::from_rgb(r, g, b)
 }
 
 // Keep old uppercase constants as aliases for any remaining direct references.

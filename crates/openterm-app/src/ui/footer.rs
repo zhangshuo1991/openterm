@@ -1,7 +1,8 @@
 //! Footer status bar: connection status, target, and quick actions.
 
-use iced::widget::{button, container, row, text, Space};
-use iced::{Border, Color, Element, Length};
+use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke};
+use iced::widget::{button, canvas as canvas_widget, container, row, text, Space};
+use iced::{mouse, Border, Color, Element, Length, Point, Rectangle, Renderer, Theme};
 
 use crate::message::Message;
 use crate::session::Phase;
@@ -50,6 +51,49 @@ pub fn view(app: &App) -> Element<'_, Message> {
     if !target.is_empty() {
         left = left.push(text(target).size(12).color(theme::text_high()));
     }
+
+    // Live telemetry shown only while connected: throughput, uptime, latency.
+    if connected {
+        if let Some(session) = app.active_session() {
+            if let Some(m) = &session.metrics {
+                if m.has_rates {
+                    left = left.push(throughput_label(m.net_rx_bps, m.net_tx_bps));
+                }
+            }
+            if let Some(since) = session.connected_at {
+                let secs = std::time::Instant::now()
+                    .saturating_duration_since(since)
+                    .as_secs();
+                left = left.push(
+                    text(fmt_duration(secs))
+                        .size(12)
+                        .color(theme::text_muted()),
+                );
+            }
+            // Latency sparkline for the connected host (when we have samples).
+            if let Some(hist) = session
+                .config
+                .host_id
+                .and_then(|id| app.ping_history.get(&id))
+            {
+                let pts: Vec<f32> = hist.iter().map(|&v| v as f32).collect();
+                if pts.len() >= 2 {
+                    let last = hist.back().copied().unwrap_or(0);
+                    left = left.push(
+                        row![
+                            canvas_widget(LatencySparkline { points: pts })
+                                .width(Length::Fixed(54.0))
+                                .height(Length::Fixed(14.0)),
+                            text(format!("{last}ms")).size(11).color(theme::text_dim()),
+                        ]
+                        .spacing(5)
+                        .align_y(iced::Alignment::Center),
+                    );
+                }
+            }
+        }
+    }
+
     if !status.is_empty() {
         left = left.push(text(status).size(12).color(theme::text_muted()));
     }
@@ -135,4 +179,96 @@ fn accent_button<'a>(label: &str, on_press: Message) -> Element<'a, Message> {
             }
         })
         .into()
+}
+
+/// "↓2.4K/s ↑0.1K/s" throughput chip from the latest network rates.
+fn throughput_label<'a>(rx_bps: f64, tx_bps: f64) -> Element<'a, Message> {
+    text(format!("↓{} ↑{}", fmt_rate(rx_bps), fmt_rate(tx_bps)))
+        .size(11)
+        .color(theme::text_muted())
+        .into()
+}
+
+/// Bytes/s → compact "2.4K/s", "12M/s".
+fn fmt_rate(bps: f64) -> String {
+    const UNITS: [&str; 4] = ["B", "K", "M", "G"];
+    let mut v = bps.max(0.0);
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{v:.0}{}/s", UNITS[i])
+    } else if v < 10.0 {
+        format!("{v:.1}{}/s", UNITS[i])
+    } else {
+        format!("{v:.0}{}/s", UNITS[i])
+    }
+}
+
+/// Seconds → "MM:SS" or "H:MM:SS".
+fn fmt_duration(secs: u64) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m:02}:{s:02}")
+    }
+}
+
+/// A tiny line chart of recent ping samples, drawn in the footer.
+struct LatencySparkline {
+    points: Vec<f32>,
+}
+
+impl canvas::Program<Message> for LatencySparkline {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &Self::State,
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<Geometry> {
+        let mut frame = Frame::new(renderer, bounds.size());
+        let w = bounds.width;
+        let h = bounds.height;
+        if self.points.len() < 2 {
+            return vec![frame.into_geometry()];
+        }
+        // Adaptive scale across the window's own range (small floor so a flat
+        // line doesn't amplify noise).
+        let (lo, hi) = self
+            .points
+            .iter()
+            .copied()
+            .fold((f32::MAX, f32::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)));
+        let span = (hi - lo).max(5.0);
+        let n = self.points.len();
+        let dx = w / (n as f32 - 1.0);
+        let y_for = |v: f32| h - ((v - lo) / span).clamp(0.0, 1.0) * (h - 2.0) - 1.0;
+
+        let mut points = Vec::with_capacity(n);
+        for (i, &v) in self.points.iter().enumerate() {
+            points.push(Point::new(i as f32 * dx, y_for(v)));
+        }
+        let line = Path::new(|b| {
+            b.move_to(points[0]);
+            for p in &points[1..] {
+                b.line_to(*p);
+            }
+        });
+        frame.stroke(
+            &line,
+            Stroke::default()
+                .with_color(theme::accent())
+                .with_width(1.0),
+        );
+        vec![frame.into_geometry()]
+    }
 }

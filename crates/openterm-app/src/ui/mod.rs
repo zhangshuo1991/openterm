@@ -7,6 +7,7 @@ mod connect_card;
 mod file_viewer;
 mod footer;
 mod history;
+pub mod history_search;
 mod hostkey;
 mod ime;
 mod monitor;
@@ -16,6 +17,7 @@ mod sftp;
 mod sidebar;
 mod tabs;
 pub mod terminal;
+pub mod toasts;
 pub mod vault;
 mod widgets;
 
@@ -52,7 +54,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
     } else {
         row![sidebar::view(app), sidebar::divider(), workspace]
     };
-    if app.rail_visible() {
+    if app.rail_rendered() {
         main = main.push(monitor::view(app));
     }
     let base = main.width(Length::Fill).height(Length::Fill);
@@ -75,6 +77,9 @@ pub fn view(app: &App) -> Element<'_, Message> {
     }
     if app.palette_open {
         layers = layers.push(palette::view(app));
+    }
+    if app.history_search_open {
+        layers = layers.push(history_search::view(app));
     }
     if app.settings_open {
         layers = layers.push(settings::view(app));
@@ -136,6 +141,12 @@ pub fn view(app: &App) -> Element<'_, Message> {
         .on_release(Message::RailDragEnd)
         .into();
         layers = layers.push(overlay);
+    }
+
+    // Toast notifications float above everything (but below the modal vault
+    // gate, which is pushed last). Only present when there are active toasts.
+    if !app.toasts.is_empty() {
+        layers = layers.push(toasts::view(&app.toasts));
     }
 
     layers.width(Length::Fill).height(Length::Fill).into()

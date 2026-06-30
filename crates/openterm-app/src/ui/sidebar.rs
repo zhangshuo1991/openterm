@@ -123,13 +123,18 @@ pub fn view(app: &App) -> Element<'_, Message> {
 
         let mut list = column![].spacing(2);
         for (group_name, indices) in &groups {
+            let collapsed = app.collapsed_groups.contains(group_name);
             if multi_group {
                 let label = if group_name.is_empty() {
                     format!("UNGROUPED ({})", indices.len())
                 } else {
                     format!("{} ({})", group_name.to_uppercase(), indices.len())
                 };
-                list = list.push(section_label(label));
+                list = list.push(group_header(label, group_name.clone(), collapsed));
+            }
+            // A collapsed group hides its rows (the header stays as the toggle).
+            if multi_group && collapsed {
+                continue;
             }
             let color = group_color(group_name);
             for &idx in indices {
@@ -235,15 +240,41 @@ fn collapse_button(glyph: &str, on_press: Message) -> Element<'_, Message> {
         .into()
 }
 
-fn section_label(label: String) -> Element<'static, Message> {
-    container(text(label).size(10).color(theme::text_dim()))
-        .padding(iced::Padding {
-            top: 10.0,
-            right: 4.0,
-            bottom: 3.0,
-            left: 4.0,
-        })
-        .into()
+/// A clickable group header: a disclosure chevron + the section label. Clicking
+/// toggles the group collapsed/expanded (persisted).
+fn group_header(label: String, group_name: String, collapsed: bool) -> Element<'static, Message> {
+    let chevron = if collapsed { "›" } else { "⌄" };
+    button(
+        row![
+            text(chevron).size(11).color(theme::text_dim()),
+            text(label).size(10).color(theme::text_dim()),
+        ]
+        .spacing(6)
+        .align_y(iced::Alignment::Center),
+    )
+    .width(Length::Fill)
+    .padding(iced::Padding {
+        top: 10.0,
+        right: 4.0,
+        bottom: 3.0,
+        left: 4.0,
+    })
+    .on_press(Message::GroupToggle(group_name))
+    .style(|_, status| {
+        let hovered = matches!(status, button::Status::Hovered);
+        button::Style {
+            background: Some(
+                if hovered { theme::surface_2() } else { Color::TRANSPARENT }.into(),
+            ),
+            text_color: theme::text_dim(),
+            border: Border {
+                radius: 5.0.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    })
+    .into()
 }
 
 /// Deterministic color for a group name.
@@ -279,6 +310,86 @@ fn tag_chip(tag: &str) -> Element<'_, Message> {
         .into()
 }
 
+/// A circular monogram avatar: the host name's first letter on a hue derived
+/// from the name, with a small status dot baked into the bottom-right.
+fn host_avatar<'a>(host: &openterm_core::HostProfile, reachable: bool) -> Element<'a, Message> {
+    let initial = host
+        .name
+        .chars()
+        .find(|c| c.is_alphanumeric())
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_else(|| "·".to_string());
+    let hue = theme::tab_accent(if host.host.trim().is_empty() {
+        host.name.as_str()
+    } else {
+        host.host.as_str()
+    });
+    let dot_color = if reachable {
+        theme::status_ok()
+    } else {
+        theme::status_idle()
+    };
+
+    let circle = container(
+        text(initial)
+            .size(13)
+            .color(Color::WHITE)
+            .align_x(iced::alignment::Horizontal::Center)
+            .align_y(iced::alignment::Vertical::Center),
+    )
+    .width(Length::Fixed(30.0))
+    .height(Length::Fixed(30.0))
+    .center_x(Length::Fixed(30.0))
+    .center_y(Length::Fixed(30.0))
+    .style(move |_| container::Style {
+        background: Some(theme::with_alpha(hue, 0.85).into()),
+        border: Border {
+            radius: 15.0.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+
+    // Overlay a status pip in the bottom-right corner.
+    let pip = container(
+        container(Space::new())
+            .width(Length::Fixed(9.0))
+            .height(Length::Fixed(9.0))
+            .style(move |_| container::Style {
+                background: Some(dot_color.into()),
+                border: Border {
+                    color: theme::surface_1(),
+                    width: 1.5,
+                    radius: 5.0.into(),
+                },
+                ..Default::default()
+            }),
+    )
+    .width(Length::Fixed(30.0))
+    .height(Length::Fixed(30.0))
+    .align_x(iced::alignment::Horizontal::Right)
+    .align_y(iced::alignment::Vertical::Bottom);
+
+    iced::widget::stack![circle, pip].into()
+}
+
+/// Human-friendly "time since" from a stored `unix:<secs>` timestamp.
+fn relative_time(ts: &str) -> Option<String> {
+    let secs: u64 = ts.strip_prefix("unix:").and_then(|s| s.parse().ok())?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let age = now.saturating_sub(secs);
+    Some(match age {
+        0..=59 => "just now".to_string(),
+        60..=3599 => format!("{}m ago", age / 60),
+        3600..=86399 => format!("{}h ago", age / 3600),
+        86400..=2591999 => format!("{}d ago", age / 86400),
+        _ => format!("{}w ago", age / 604800),
+    })
+}
+
 fn host_row<'a>(
     index: usize,
     host: &'a openterm_core::HostProfile,
@@ -298,7 +409,21 @@ fn host_row<'a>(
             ..Default::default()
         });
 
+    let avatar = host_avatar(host, ping_ms.is_some());
+
     let meta = host.display_target();
+    // Append a relative "last connected" hint when we have one.
+    let meta_line: Element<'_, Message> =
+        match host.last_connected_at.as_deref().and_then(relative_time) {
+            Some(rel) => row![
+                text(meta).size(11).color(theme::text_muted()),
+                text("·").size(11).color(theme::text_dim()),
+                text(rel).size(11).color(theme::text_dim()),
+            ]
+            .spacing(5)
+            .into(),
+            None => text(meta).size(11).color(theme::text_muted()).into(),
+        };
     let name_row = {
         let mut r = row![text(host.name.clone()).size(13).color(theme::text_high())].spacing(6).align_y(iced::Alignment::Center);
         if let Some(tag) = host.tags.first() {
@@ -335,13 +460,13 @@ fn host_row<'a>(
 
     let info_col = column![
         name_row,
-        text(meta).size(11).color(theme::text_muted()),
+        meta_line,
     ]
     .spacing(2)
     .width(Length::Fill);
 
     let info = button(
-        row![color_bar, info_col, status_col]
+        row![color_bar, avatar, info_col, status_col]
             .spacing(8)
             .align_y(iced::Alignment::Center),
     )
