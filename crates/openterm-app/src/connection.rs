@@ -95,6 +95,10 @@ pub enum Command {
     WriteFile { path: String, data: Vec<u8> },
     /// Close the shell and disconnect.
     Disconnect,
+    /// Execute a one-shot command on the remote (non-interactive) and return
+    /// its stdout for the smart-suggestion engine. `tag` identifies which
+    /// strategy the result belongs to (e.g. "kill", "cd", "__files__").
+    ExecQuery { command: String, tag: String },
 }
 
 /// Events the worker streams back to the UI. Every variant carries the
@@ -191,6 +195,12 @@ pub enum Event {
         session_id: u64,
         error: String,
     },
+    /// Result of a smart-suggestion query (stdout parsed into candidates).
+    SuggestionData {
+        session_id: u64,
+        tag: String,
+        candidates: Vec<String>,
+    },
 }
 
 impl Event {
@@ -213,7 +223,8 @@ impl Event {
             | Event::FileSaved { session_id, .. }
             | Event::Exit { session_id, .. }
             | Event::Closed { session_id }
-            | Event::Failed { session_id, .. } => *session_id,
+            | Event::Failed { session_id, .. }
+            | Event::SuggestionData { session_id, .. } => *session_id,
         }
     }
 }
@@ -385,6 +396,11 @@ async fn run_connection(
                     bg_tasks.push(spawn_write_file(session_id, session.clone(), out.clone(), path, data));
                 }
                 Some(Command::Disconnect) => break ShellOutcome::Disconnected,
+                Some(Command::ExecQuery { command, tag }) => {
+                    bg_tasks.push(spawn_suggestion_query(
+                        session_id, session.clone(), out.clone(), command, tag,
+                    ));
+                }
                 None => break ShellOutcome::WorkerDropped,
             },
             ev = pty_ev_rx.recv() => match ev {
@@ -811,6 +827,34 @@ fn spawn_ports(session_id: u64, session: Arc<RusshSession>, mut out: OutSink) ->
     });
 }
 
+/// Execute a one-shot command for the smart-suggestion engine and stream the
+/// parsed candidates back. Errors are swallowed (empty candidate list sent back
+/// so the UI can clear its pending state and fallback to history).
+fn spawn_suggestion_query(
+    session_id: u64,
+    session: Arc<RusshSession>,
+    mut out: OutSink,
+    command: String,
+    tag: String,
+) -> tokio::task::JoinHandle<()> {
+    return tokio::spawn(async move {
+        let candidates = match session.exec_capture(&command).await {
+            Ok(output) => {
+                let raw = String::from_utf8_lossy(&output.stdout).into_owned();
+                crate::session::parse_query_output(&tag, &raw)
+            }
+            Err(_) => Vec::new(),
+        };
+        let _ = out
+            .send(Event::SuggestionData {
+                session_id,
+                tag,
+                candidates,
+            })
+            .await;
+    });
+}
+
 /// Subscription worker for a local PTY shell (macOS/Linux).
 /// Speaks the same `Event` protocol as the SSH `worker` so the rest of the
 /// app needs no special-casing beyond picking which worker to run.
@@ -866,6 +910,26 @@ pub fn local_worker(session_id: u64) -> impl iced::futures::Stream<Item = Event>
                         unsafe { libc::ioctl(master_fd, libc::TIOCSWINSZ, &ws); }
                     }
                     Some(Command::Disconnect) | None => break,
+                    Some(Command::ExecQuery { command, tag }) => {
+                        let mut out = out.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let candidates = std::process::Command::new("sh")
+                                .arg("-c")
+                                .arg(&command)
+                                .output()
+                                .ok()
+                                .map(|o| {
+                                    let raw = String::from_utf8_lossy(&o.stdout).into_owned();
+                                    crate::session::parse_query_output(&tag, &raw)
+                                })
+                                .unwrap_or_default();
+                            let _ = out.try_send(Event::SuggestionData {
+                                session_id,
+                                tag,
+                                candidates,
+                            });
+                        });
+                    }
                     _ => {}
                 },
                 bytes = pty_rx.recv() => match bytes {

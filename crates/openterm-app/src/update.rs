@@ -1587,25 +1587,282 @@ fn terminal_input(app: &mut App, bytes: Vec<u8>) -> Task<Message> {
     Task::none()
 }
 
-/// Recompute the active session's ghost suggestion from history (this session's
-/// own commands first, newest-first, then the global persisted history).
+/// Recompute the active session's ghost suggestion.
+///
+/// Two-phase logic:
+/// 1. **Command-name phase** (no space yet): suggest from this session's own
+///    command history (e.g. "gi" → "t push origin main"). Never uses global
+///    history — that would pollute across servers.
+/// 2. **Argument phase** (space after command): use the smart-suggestion engine.
+///    Picks a [`SuggestStrategy`] for the command, checks the session's cache,
+///    and either produces a suggestion from cached data or triggers an async
+///    remote query (which will call us back via `ConnEvent::SuggestionData`).
+///
+/// Anti-flicker: if the user's last keystroke extends the existing suggestion,
+/// we trim instead of recomputing from scratch.
 fn recompute_active_suggestion(app: &mut App) {
     let Some(index) = app.sessions.get(app.active).map(|_| app.active) else {
         return;
     };
-    // Compute the suffix while only reading, then assign — avoids overlapping
-    // borrows of `app.sessions` and `app.all_history`.
     let line = app.sessions[index].input_line();
-    let suffix = {
-        let session_hist = app.sessions[index]
-            .command_history
-            .iter()
-            .rev()
-            .map(String::as_str);
-        let global_hist = app.all_history.iter().map(|e| e.cmd.as_str());
-        crate::session::suggestion_suffix(&line, session_hist.chain(global_hist))
+
+    // Stabilization: if we already have a suggestion and the user just typed
+    // along its path, trim instead of full recompute.
+    if let Some(existing) = &app.sessions[index].inline_suggestion {
+        if !existing.is_empty() && line.len() > 0 {
+            let typed_char = &line[line.len() - 1..];
+            let first_char_len = existing
+                .char_indices()
+                .nth(1)
+                .map(|(i, _)| i)
+                .unwrap_or(existing.len());
+            let suggest_first = &existing[..first_char_len];
+            if typed_char == suggest_first {
+                let trimmed = &existing[typed_char.len()..];
+                app.sessions[index].inline_suggestion =
+                    if trimmed.is_empty() { None } else { Some(trimmed.to_string()) };
+                return;
+            }
+        }
+    }
+
+    // Only complete the command actually being typed right now: the tail
+    // segment after any `|`/`;`/`&` (so `ps -ef | gr` completes `grep`, not
+    // garbage appended to `ps`).
+    let segment = crate::session::last_segment(&line);
+    if segment.is_empty() {
+        app.sessions[index].inline_suggestion = None;
+        return;
+    }
+    let (cmd, arg) = crate::session::split_command_and_arg(segment);
+
+    // Phase 1: command name (no space yet). History (full remembered command)
+    // wins, then learned command names ranked by frecency, then a static list
+    // of common command names for cold start.
+    if arg.is_empty() {
+        let suffix = {
+            let session_hist = app.sessions[index]
+                .command_history
+                .iter()
+                .rev()
+                .map(String::as_str);
+            crate::session::suggestion_suffix(segment, session_hist).or_else(|| {
+                let learned = app.sessions[index].token_model.command_candidates(segment);
+                crate::session::match_suffix(segment, learned.iter().map(String::as_str))
+                    .or_else(|| {
+                        let empty: [&str; 0] = [];
+                        crate::session::command_name_suggestion(segment, empty.iter().copied())
+                    })
+            })
+        };
+        app.sessions[index].inline_suggestion = suffix;
+        return;
+    }
+
+    // The token currently being typed (after the last space in `arg`) is what
+    // completion should match against, not the whole argument string — this
+    // is what makes multi-flag/multi-arg commands like `ps -ef`, `java -jar
+    // app`, or `kill -9 123` complete correctly instead of never matching.
+    let cur_token = crate::session::last_token(arg);
+
+    // Flags: any token starting with `-`. Merge, in priority order:
+    //   1. learned flags for this command (frecency-ranked, personalized),
+    //   2. the static curated flag table,
+    //   3. flags scraped from a cached `<cmd> --help`.
+    // First extending match wins. On a total miss for an unknown command,
+    // fire a one-shot `--help` scrape so future keystrokes have data.
+    if cur_token.starts_with('-') {
+        let mut candidates: Vec<String> =
+            app.sessions[index].token_model.token_candidates(&cmd, cur_token);
+        for f in crate::session::flags_for(&cmd) {
+            if !candidates.iter().any(|c| c == f) {
+                candidates.push((*f).to_string());
+            }
+        }
+        let help_key = format!("help:{cmd}");
+        if let Some((cached, fetched_at)) =
+            app.sessions[index].suggestion_state.remote_caches.get(&help_key)
+        {
+            if fetched_at.elapsed().as_millis() < 1_800_000 {
+                for f in cached {
+                    if !candidates.iter().any(|c| c == f) {
+                        candidates.push(f.clone());
+                    }
+                }
+            }
+        }
+        let suffix = crate::session::match_suffix(cur_token, candidates.iter().map(String::as_str));
+        if suffix.is_some() {
+            app.sessions[index].inline_suggestion = suffix;
+            return;
+        }
+        // Nothing matched. If this command isn't in the static table, has been
+        // run before (safe to probe), and we haven't scraped it yet, kick off
+        // a `<cmd> --help` scrape. Otherwise just clear.
+        maybe_scrape_help(app, index, &cmd);
+        app.sessions[index].inline_suggestion = None;
+        return;
+    }
+
+    // Phase 2: argument phase → smart suggestion engine.
+    let strategy = crate::session::strategy_for(&cmd);
+
+    // Subcommands: zero-network, instant.
+    if let crate::session::SuggestStrategy::Subcommands(subs) = &strategy {
+        let suffix = crate::session::match_suffix(cur_token, subs.iter().copied());
+        app.sessions[index].inline_suggestion = suffix;
+        return;
+    }
+
+    // Strategies that need cached data or a remote query.
+    let tag = crate::session::strategy_tag(&strategy);
+    let (query_cmd, ttl_ms) = crate::session::strategy_query(&strategy)
+        .unwrap_or(("", 10_000));
+
+    // Check cache freshness and produce a suggestion if data is available.
+    let cached_suffix = match &strategy {
+        crate::session::SuggestStrategy::Files => {
+            if let Some(cache) = &app.sessions[index].suggestion_state.dir_cache {
+                if cache.is_fresh(ttl_ms) {
+                    crate::session::match_suffix(cur_token, cache.all_entries.iter().map(String::as_str))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        crate::session::SuggestStrategy::FilesWithExt(exts) => {
+            if let Some(cache) = &app.sessions[index].suggestion_state.dir_cache {
+                if cache.is_fresh(ttl_ms) {
+                    let filtered = crate::session::filter_by_ext(&cache.all_entries, exts);
+                    crate::session::match_suffix(cur_token, filtered.into_iter())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        crate::session::SuggestStrategy::Directories => {
+            if let Some(cache) = &app.sessions[index].suggestion_state.dir_cache {
+                if cache.is_fresh(ttl_ms) {
+                    crate::session::match_suffix(cur_token, cache.dirs.iter().map(String::as_str))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        crate::session::SuggestStrategy::ProcessList => {
+            if let Some((pids, fetched_at)) = &app.sessions[index].suggestion_state.pid_cache {
+                if fetched_at.elapsed().as_millis() < ttl_ms as u128 {
+                    crate::session::match_suffix(cur_token, pids.iter().map(String::as_str))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        crate::session::SuggestStrategy::Remote { .. } => {
+            let key = cmd.clone();
+            if let Some((cands, fetched_at)) =
+                app.sessions[index].suggestion_state.remote_caches.get(&key)
+            {
+                if fetched_at.elapsed().as_millis() < ttl_ms as u128 {
+                    crate::session::match_suffix(cur_token, cands.iter().map(String::as_str))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        crate::session::SuggestStrategy::Subcommands(_) => unreachable!(),
     };
-    app.sessions[index].inline_suggestion = suffix;
+
+    if let Some(suffix) = cached_suffix {
+        app.sessions[index].inline_suggestion = Some(suffix);
+        return;
+    }
+
+    // Live data missed. Fall back to the learned model: what value usually
+    // follows the previous token (e.g. `prod` after `--deploy-env`), then any
+    // learned token for this command. This is the main win for third-party
+    // commands whose values the static strategies know nothing about.
+    let prev = crate::session::prev_token(arg);
+    let learned = {
+        let model = &app.sessions[index].token_model;
+        let mut c = model.bigram_candidates(&cmd, prev, cur_token);
+        for t in model.token_candidates(&cmd, cur_token) {
+            if !c.iter().any(|x| *x == t) {
+                c.push(t);
+            }
+        }
+        c
+    };
+    if let Some(suffix) =
+        crate::session::match_suffix(cur_token, learned.iter().map(String::as_str))
+    {
+        app.sessions[index].inline_suggestion = Some(suffix);
+        return;
+    }
+
+    // Cache miss: trigger a remote query (unless one is already in flight).
+    let tag_string = if tag.is_empty() { cmd.clone() } else { tag.to_string() };
+    if !app.sessions[index].suggestion_state.is_pending(&tag_string) {
+        app.sessions[index].suggestion_state.mark_pending(&tag_string);
+        if let Some(tx) = &app.sessions[index].cmd_tx {
+            let _ = tx.try_send(Command::ExecQuery {
+                command: query_cmd.to_string(),
+                tag: tag_string,
+            });
+        }
+    }
+    // While the query is in flight, clear the suggestion (no flicker — the
+    // result will arrive and fill it in ~200ms).
+    app.sessions[index].inline_suggestion = None;
+}
+
+/// Fire a one-shot `<cmd> --help` scrape to discover flags for a command not
+/// covered by the static table. Gated hard for safety: the command must be a
+/// plain word-like name, must NOT be in the static flag table (those are
+/// already covered), must have actually been run before in this session's
+/// history (so we never execute an unknown/typo'd binary speculatively), and
+/// must not already be cached or in flight. Results land in `remote_caches`
+/// under `help:<cmd>` via the normal `SuggestionData` path.
+fn maybe_scrape_help(app: &mut App, index: usize, cmd: &str) {
+    if !crate::session::is_help_probe_safe(cmd) {
+        return;
+    }
+    if !crate::session::flags_for(cmd).is_empty() {
+        return; // static table already covers it
+    }
+    let help_key = format!("help:{cmd}");
+    let state = &app.sessions[index].suggestion_state;
+    if state.remote_caches.contains_key(&help_key) || state.is_pending(&help_key) {
+        return;
+    }
+    // Only probe commands the user has actually run (avoid executing arbitrary
+    // typed-but-never-run strings).
+    let ran_before = app.sessions[index]
+        .command_history
+        .iter()
+        .any(|c| c.split_whitespace().next() == Some(cmd));
+    if !ran_before {
+        return;
+    }
+    app.sessions[index].suggestion_state.mark_pending(&help_key);
+    if let Some(tx) = &app.sessions[index].cmd_tx {
+        // `2>&1` so tools that print help to stderr are still captured; keep it
+        // bounded so a misbehaving command can't flood us.
+        let _ = tx.try_send(Command::ExecQuery {
+            command: format!("{cmd} --help 2>&1 | head -200"),
+            tag: help_key,
+        });
+    }
 }
 
 fn with_config<F: FnOnce(&mut SessionConfig)>(app: &mut App, f: F) -> Task<Message> {
@@ -2150,6 +2407,10 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
     let mut touch_host_id = None;
     // Toast to surface after the `session` borrow ends (kind, message).
     let mut toast: Option<(crate::ui::toasts::ToastKind, String)> = None;
+    let mut recompute_after = false;
+    // Host label whose persisted history should seed the learned token model
+    // once the `session` borrow below is released (set on Connected).
+    let mut seed_model_host: Option<String> = None;
     let session = &mut app.sessions[index];
 
     match event {
@@ -2170,6 +2431,9 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
             session.connected_at = Some(std::time::Instant::now());
             crate::smoke::record(&smoke, "connected");
             touch_host_id = session.config.host_id;
+            // Seed the learned token model from this host's persisted history
+            // (deferred until the `session` borrow ends, below).
+            seed_model_host = Some(session.config.target_label());
             toast = Some((
                 crate::ui::toasts::ToastKind::Success,
                 format!("Connected to {}", session.config.target_label()),
@@ -2198,14 +2462,18 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
                         |_| Message::Noop,
                     ));
                 }
-                session.command_history.last().map(|cmd: &String| openterm_storage::HistoryEntry {
-                    ts_ms: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64,
-                    host: session.config.target_label(),
-                    cmd: cmd.clone(),
-                    output: String::new(),
+                session.command_history.last().map(|cmd: &String| {
+                    // Live-learn the just-committed command into the token model.
+                    session.token_model.learn(cmd);
+                    openterm_storage::HistoryEntry {
+                        ts_ms: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64,
+                        host: session.config.target_label(),
+                        cmd: cmd.clone(),
+                        output: String::new(),
+                    }
                 })
             } else {
                 None
@@ -2387,6 +2655,8 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
             session.monitor_panel = None;
             session.processes.clear();
             session.connected_at = None;
+            session.suggestion_state.clear_all();
+            session.inline_suggestion = None;
             toast = Some((
                 crate::ui::toasts::ToastKind::Info,
                 format!("Disconnected from {}", session.config.target_label()),
@@ -2397,10 +2667,75 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
             session.phase = Phase::Failed(error.clone());
             session.status = error.clone();
             session.connected_at = None;
+            session.suggestion_state.clear_all();
+            session.inline_suggestion = None;
             toast = Some((crate::ui::toasts::ToastKind::Error, error));
+        }
+        ConnEvent::SuggestionData { tag, candidates, .. } => {
+            // Store the query result into the session's suggestion cache.
+            session.suggestion_state.clear_pending(&tag);
+            match tag.as_str() {
+                "__files__" => {
+                    let dirs: Vec<String> = candidates
+                        .iter()
+                        .filter(|c| c.ends_with('/'))
+                        .cloned()
+                        .collect();
+                    session.suggestion_state.dir_cache = Some(
+                        crate::session::DirCache {
+                            all_entries: candidates,
+                            dirs,
+                            fetched_at: std::time::Instant::now(),
+                        },
+                    );
+                }
+                "kill" | "pkill" | "killall" => {
+                    session.suggestion_state.pid_cache =
+                        Some((candidates, std::time::Instant::now()));
+                }
+                "cd" | "pushd" => {
+                    // Directories-only query result → store in dir_cache as well
+                    // (only the dirs field is populated for cd-strategy).
+                    let dirs = candidates.clone();
+                    let all = dirs.clone();
+                    session.suggestion_state.dir_cache = Some(
+                        crate::session::DirCache {
+                            all_entries: all,
+                            dirs,
+                            fetched_at: std::time::Instant::now(),
+                        },
+                    );
+                }
+                _ => {
+                    // Custom Remote-strategy cache.
+                    session.suggestion_state.remote_caches.insert(
+                        tag,
+                        (candidates, std::time::Instant::now()),
+                    );
+                }
+            }
+            // Mark that we need to recompute the suggestion after the borrow.
+            recompute_after = true;
         }
     }
     // Borrow of `session` ends here; safe to touch `app` again.
+    if let Some(host) = seed_model_host {
+        // Feed this host's persisted history (oldest-first) into the freshly
+        // connected session's token model, so learning carries across runs.
+        let commands: Vec<String> = app
+            .all_history
+            .iter()
+            .rev() // all_history is newest-first; reverse → oldest-first
+            .filter(|e| e.host == host)
+            .map(|e| e.cmd.clone())
+            .collect();
+        if let Some(session) = app.sessions.get_mut(index) {
+            session.seed_token_model(commands.iter().map(String::as_str));
+        }
+    }
+    if recompute_after {
+        recompute_active_suggestion(app);
+    }
     if let Some((kind, msg)) = toast {
         app.push_toast(kind, msg);
     }

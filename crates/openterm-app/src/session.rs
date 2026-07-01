@@ -144,6 +144,613 @@ pub enum SessionKind {
     Local,
 }
 
+// ---------------------------------------------------------------------------
+// Smart suggestion engine
+// ---------------------------------------------------------------------------
+
+/// Strategy for how to source argument candidates for a given command.
+#[derive(Debug, Clone)]
+pub enum SuggestStrategy {
+    /// List files in the current remote/local directory (universal default).
+    Files,
+    /// List files, then keep only those whose name ends with one of the given
+    /// extensions. Used for `python3 *.py`, `node *.js`, `java -jar *.jar`.
+    FilesWithExt(&'static [&'static str]),
+    /// List only subdirectories of the current directory (`cd`, `pushd`).
+    Directories,
+    /// Query the remote process list and suggest PIDs.
+    ProcessList,
+    /// Run an arbitrary command on the remote and parse each line as a candidate.
+    Remote { cmd: &'static str, ttl_ms: u64 },
+    /// Built-in subcommand list — no network needed, zero latency.
+    Subcommands(&'static [&'static str]),
+}
+
+/// Pick a suggestion strategy for a given command name.
+pub fn strategy_for(cmd: &str) -> SuggestStrategy {
+    match cmd {
+        "kill" | "pkill" | "killall" => SuggestStrategy::ProcessList,
+        "cd" | "pushd" => SuggestStrategy::Directories,
+        "git" => SuggestStrategy::Subcommands(&[
+            "push", "pull", "commit", "add", "checkout", "merge", "rebase",
+            "clone", "fetch", "log", "diff", "status", "branch", "stash", "reset",
+            "tag", "config", "remote", "init", "mv", "rm", "show", "cherry-pick",
+            "rev-parse", "blame", "bisect", "reflog",
+        ]),
+        "docker" => SuggestStrategy::Subcommands(&[
+            "ps", "images", "exec", "run", "stop", "start", "rm", "logs", "build",
+            "pull", "push", "compose", "volume", "network", "kill", "restart",
+            "cp", "inspect", "stats", "top", "attach", "tag",
+        ]),
+        "npm" | "pnpm" | "yarn" => SuggestStrategy::Subcommands(&[
+            "install", "run", "start", "test", "build", "dev", "add", "remove",
+            "init", "publish", "update", "audit", "link", "exec", "create",
+        ]),
+        "pm2" => SuggestStrategy::Subcommands(&[
+            "start", "stop", "restart", "delete", "list", "logs", "monit",
+            "jlist", "describe", "reload", "save", "resurrect", "kill",
+        ]),
+        "kubectl" => SuggestStrategy::Subcommands(&[
+            "get", "apply", "delete", "describe", "logs", "exec", "port-forward",
+            "create", "edit", "scale", "rollout", "config", "namespace", "top",
+        ]),
+        "systemctl" => SuggestStrategy::Remote {
+            cmd: "systemctl list-units --type=service --all --no-legend --plain 2>/dev/null | awk '{print $1}' | head -40",
+            ttl_ms: 10_000,
+        },
+        "python" | "python3" => SuggestStrategy::FilesWithExt(&[".py"]),
+        "node" | "nodejs" | "deno" | "bun" => SuggestStrategy::FilesWithExt(&[".js", ".mjs", ".ts", ".cjs"]),
+        "java" => SuggestStrategy::FilesWithExt(&[".jar", ".class"]),
+        "gcc" | "g++" | "cc" | "clang" | "clang++" => SuggestStrategy::FilesWithExt(&[".c", ".cpp", ".cc", ".cxx"]),
+        "rustc" | "cargo" => SuggestStrategy::FilesWithExt(&[".rs"]),
+        "go" => SuggestStrategy::FilesWithExt(&[".go"]),
+        "ruby" | "ruby3" | "irb" => SuggestStrategy::FilesWithExt(&[".rb"]),
+        "lua" => SuggestStrategy::FilesWithExt(&[".lua"]),
+        "php" => SuggestStrategy::FilesWithExt(&[".php"]),
+        "perl" => SuggestStrategy::FilesWithExt(&[".pl", ".pm"]),
+        "awk" | "gawk" => SuggestStrategy::FilesWithExt(&[".awk"]),
+        _ => SuggestStrategy::Files,
+    }
+}
+
+/// Common flags/options for frequently-used system and third-party commands.
+/// Consulted when the token currently being typed starts with `-`. Zero
+/// network cost — this is a static, hand-curated list of the flags people
+/// actually reach for interactively, not full man-page coverage.
+pub fn flags_for(cmd: &str) -> &'static [&'static str] {
+    match cmd {
+        "ps" => &["-ef", "-e", "-eo", "-aux", "-A", "-u", "-fade", "-o", "-p", "--sort"],
+        "kill" | "pkill" | "killall" => &[
+            "-9", "-15", "-SIGKILL", "-SIGTERM", "-SIGHUP", "-SIGINT", "-KILL",
+            "-TERM", "-HUP", "-l", "-signal", "-f",
+        ],
+        "top" | "htop" => &["-u", "-p", "-n", "-b", "-d", "-c"],
+        "grep" | "egrep" | "fgrep" => &[
+            "-r", "-rn", "-i", "-v", "-c", "-l", "-n", "-w", "-E", "-o",
+            "--color", "-A", "-B", "-C", "--include", "--exclude",
+        ],
+        "find" => &[
+            "-name", "-iname", "-type", "-mtime", "-size", "-exec", "-maxdepth",
+            "-newer", "-delete", "-perm",
+        ],
+        "tar" => &[
+            "-xzvf", "-czvf", "-xvf", "-cvf", "-tvf", "-xz", "-cz", "-C",
+            "--extract", "--create", "--list",
+        ],
+        "curl" => &[
+            "-X", "-H", "-d", "-o", "-O", "-L", "-I", "-s", "-v", "-k",
+            "--data", "--header", "-u", "-F",
+        ],
+        "wget" => &["-O", "-r", "-c", "-q", "--no-check-certificate", "-P", "-b"],
+        "ssh" => &["-i", "-p", "-L", "-R", "-D", "-N", "-v", "-A", "-o"],
+        "scp" | "rsync" => &["-r", "-a", "-v", "-z", "-P", "-i", "--delete", "-avz", "-p"],
+        "docker" => &[
+            "-d", "-it", "--rm", "-p", "-v", "-e", "--name", "--network",
+            "--restart", "--entrypoint", "-a", "--all", "-f",
+        ],
+        "kubectl" => &[
+            "-n", "--namespace", "-f", "-o", "-l", "--selector", "-w",
+            "--watch", "--all-namespaces",
+        ],
+        "systemctl" | "service" => &["--now", "--type", "--state", "-l", "--user"],
+        "journalctl" => &["-u", "-f", "-n", "-p", "--since", "--until", "-e", "-r"],
+        "netstat" => &["-tulpn", "-anp", "-r", "-i", "-s"],
+        "ss" => &["-tulpn", "-anp", "-l", "-a", "-s"],
+        "lsof" => &["-i", "-p", "-u", "-c", "-n"],
+        "df" => &["-h", "-k", "-T", "-i"],
+        "du" => &["-h", "-s", "-sh", "-a", "--max-depth"],
+        "chmod" => &["-R", "755", "644", "700", "600", "+x", "-x"],
+        "chown" => &["-R", "-v"],
+        "awk" | "gawk" => &["-F", "-v", "-f"],
+        "sed" => &["-i", "-e", "-n", "-r", "-E"],
+        "sort" => &["-n", "-r", "-k", "-u", "-t"],
+        "uniq" => &["-c", "-d", "-u", "-i"],
+        "xargs" => &["-I", "-n", "-P", "-0", "-r"],
+        "diff" => &["-u", "-r", "-N", "-q", "-y"],
+        "git" => &[
+            "-m", "-a", "-am", "--force", "-f", "--all", "-v", "-b", "-d",
+            "--global", "-u", "--set-upstream",
+        ],
+        "java" => &[
+            "-jar", "-cp", "-classpath", "-Xmx", "-Xms", "-version", "-D",
+            "-server", "-verbose", "-agentlib",
+        ],
+        "python" | "python3" => &["-m", "-c", "-u", "-i", "-v", "--version"],
+        "node" => &["-e", "-v", "--version", "--inspect", "--experimental-modules"],
+        "npm" | "pnpm" | "yarn" => &["-g", "--save", "--save-dev", "-D", "--force", "-v"],
+        "ls" => &["-la", "-l", "-a", "-lh", "-lah", "-t", "-r", "-S"],
+        "rm" => &["-rf", "-r", "-f", "-i", "-v"],
+        "cp" | "mv" => &["-r", "-v", "-i", "-f", "-a", "-p"],
+        "mkdir" => &["-p", "-v", "-m"],
+        "iptables" => &["-L", "-A", "-D", "-I", "-F", "-t", "-p", "-j", "-s", "-d"],
+        "crontab" => &["-e", "-l", "-r", "-u"],
+        "less" | "more" => &["-N", "-S", "+F"],
+        "head" | "tail" => &["-n", "-f", "-c"],
+        "wc" => &["-l", "-w", "-c"],
+        "ping" => &["-c", "-i", "-s", "-t", "-W"],
+        _ => &[],
+    }
+}
+
+/// Common command names across Linux distros and popular third-party tools.
+/// Used for command-name completion when session history has nothing to
+/// offer yet (cold start) — e.g. suggest "docker" after typing "doc" even
+/// before the user has ever run it in this session.
+const KNOWN_COMMANDS: &[&str] = &[
+    "ls", "cd", "pwd", "cat", "less", "more", "head", "tail", "grep", "egrep",
+    "fgrep", "find", "locate", "which", "whereis", "file", "stat", "du", "df",
+    "mount", "umount", "ps", "top", "htop", "kill", "pkill", "killall",
+    "nice", "renice", "nohup", "jobs", "bg", "fg", "screen", "tmux", "free",
+    "uptime", "uname", "hostname", "whoami", "id", "who", "w", "last",
+    "history", "chmod", "chown", "chgrp", "umask", "ln", "cp", "mv", "rm",
+    "rmdir", "mkdir", "touch", "tar", "gzip", "gunzip", "zip", "unzip",
+    "curl", "wget", "scp", "rsync", "ssh", "sftp", "ping", "traceroute",
+    "dig", "nslookup", "netstat", "ss", "ip", "ifconfig", "iptables",
+    "firewall-cmd", "ufw", "systemctl", "service", "journalctl", "dmesg",
+    "crontab", "at", "sed", "awk", "cut", "sort", "uniq", "wc", "tee",
+    "xargs", "diff", "patch", "tr", "echo", "printf", "export", "env",
+    "alias", "source", "bash", "sh", "zsh", "exit", "logout", "su", "sudo",
+    "passwd", "useradd", "userdel", "usermod", "groupadd", "git", "docker",
+    "docker-compose", "kubectl", "helm", "npm", "pnpm", "yarn", "node",
+    "python", "python3", "pip", "pip3", "java", "javac", "mvn", "gradle",
+    "go", "cargo", "rustc", "gcc", "g++", "make", "cmake", "php", "ruby",
+    "perl", "lua", "psql", "mysql", "redis-cli", "mongo", "nc", "telnet",
+    "vim", "vi", "nano", "emacs", "man", "apt", "apt-get", "yum", "dnf",
+    "pacman", "brew", "snap", "lsof", "strace", "ltrace", "gdb", "valgrind",
+    "iostat", "vmstat", "sar", "pm2", "supervisorctl", "nginx", "apache2",
+    "certbot",
+];
+
+/// SSH command string for strategies that need remote data.
+/// Returns `(command, ttl_ms)`. `None` for Subcommands (no network).
+pub fn strategy_query(strategy: &SuggestStrategy) -> Option<(&'static str, u64)> {
+    match strategy {
+        SuggestStrategy::Files => Some(("ls -1A 2>/dev/null | head -80", 10_000)),
+        SuggestStrategy::FilesWithExt(_) => Some(("ls -1A 2>/dev/null | head -80", 10_000)),
+        SuggestStrategy::Directories => Some(("ls -d */ 2>/dev/null", 10_000)),
+        SuggestStrategy::ProcessList => Some((
+            "ps -eo pid,comm --no-headers 2>/dev/null | sort -rn | head -40",
+            5_000,
+        )),
+        SuggestStrategy::Remote { cmd, ttl_ms } => Some((cmd, *ttl_ms)),
+        SuggestStrategy::Subcommands(_) => None,
+    }
+}
+
+/// Cached directory listing (files + dirs separated for different strategies).
+#[derive(Debug, Clone)]
+pub struct DirCache {
+    pub all_entries: Vec<String>,
+    pub dirs: Vec<String>,
+    pub fetched_at: std::time::Instant,
+}
+
+impl DirCache {
+    pub fn is_fresh(&self, ttl_ms: u64) -> bool {
+        self.fetched_at.elapsed().as_millis() < ttl_ms as u128
+    }
+}
+
+/// Per-session smart-suggestion state.
+#[derive(Debug, Default)]
+pub struct SessionSuggestionState {
+    /// Cache of `ls -1A` results (shared by Files / FilesWithExt / Directories).
+    pub dir_cache: Option<DirCache>,
+    /// Cache of PID list (for kill/pkill/killall).
+    pub pid_cache: Option<(Vec<String>, std::time::Instant)>,
+    /// Caches for Remote-strategy commands (keyed by command name).
+    pub remote_caches: std::collections::HashMap<String, (Vec<String>, std::time::Instant)>,
+    /// Tags currently being fetched with their start time (prevents duplicate
+    /// requests and allows expiry if the response never arrives).
+    pub pending: std::collections::HashMap<String, std::time::Instant>,
+}
+
+/// How long to wait before allowing a re-query for a pending tag.
+const PENDING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+impl SessionSuggestionState {
+    /// Invalidate directory cache (called after `cd` is committed).
+    pub fn invalidate_dir(&mut self) {
+        self.dir_cache = None;
+    }
+
+    /// Check if a tag is already being fetched (within the timeout window).
+    pub fn is_pending(&self, tag: &str) -> bool {
+        if let Some(&start) = self.pending.get(tag) {
+            if start.elapsed() < PENDING_TIMEOUT {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Mark a tag as being fetched.
+    pub fn mark_pending(&mut self, tag: &str) {
+        self.pending.insert(tag.to_string(), std::time::Instant::now());
+    }
+
+    /// Clear pending state (called when a query completes or fails).
+    pub fn clear_pending(&mut self, tag: &str) {
+        self.pending.remove(tag);
+    }
+
+    /// Clear all state (called on disconnect).
+    pub fn clear_all(&mut self) {
+        self.dir_cache = None;
+        self.pid_cache = None;
+        self.remote_caches.clear();
+        self.pending.clear();
+    }
+}
+
+/// Parse raw command output into a list of candidate strings.
+pub fn parse_query_output(tag: &str, output: &str) -> Vec<String> {
+    // Dynamic `--help` scrape: tag is "help:<cmd>". Extract flags from the
+    // help text so any third-party tool that prints a conventional --help gets
+    // flag completion without being in the static table.
+    if let Some(_cmd) = tag.strip_prefix("help:") {
+        return parse_help_flags(output);
+    }
+    match tag {
+        "kill" | "pkill" | "killall" => {
+            // ps output: "1234 nginx\n5678 python3" → ["1234", "5678"]
+            output
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .filter_map(|l| l.split_whitespace().next())
+                .map(String::from)
+                .collect()
+        }
+        "cd" | "pushd" => {
+            // ls -d */ output: "bin/\netc/\nhome/" → ["bin/", "etc/", "home/"]
+            output
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| l.trim().to_string())
+                .collect()
+        }
+        _ => {
+            // Generic: each non-empty line is a candidate.
+            output
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| l.trim().to_string())
+                .collect()
+        }
+    }
+}
+
+/// Extract option flags from a command's `--help` text. Handles the common
+/// conventions (GNU getopt, argparse, Go's flag pkg, clap): lines that begin
+/// (after whitespace) with `-x` or `--long`, possibly `-x, --long`. Returns
+/// each distinct flag token (`-x`, `--long`), stripped of any `=VALUE` /
+/// `<ARG>` suffix. Best-effort and defensive — junk lines just yield nothing.
+pub fn parse_help_flags(output: &str) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for line in output.lines() {
+        let trimmed = line.trim_start();
+        // Only consider lines whose first non-space char starts an option.
+        if !trimmed.starts_with('-') {
+            continue;
+        }
+        // Split off the description: two+ spaces or a tab usually separate the
+        // option column from its help text.
+        let opt_col = trimmed
+            .split("  ")
+            .next()
+            .unwrap_or(trimmed)
+            .split('\t')
+            .next()
+            .unwrap_or(trimmed);
+        for raw in opt_col.split([',', ' ', '[', ']']) {
+            let tok = raw.trim();
+            if !tok.starts_with('-') || tok.len() < 2 || tok == "--" {
+                continue;
+            }
+            // Strip an attached value: --foo=BAR → --foo, --foo<n> → --foo.
+            let flag: String = tok
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+                .collect();
+            if flag.len() < 2 || flag == "--" || !flag.starts_with('-') {
+                continue;
+            }
+            if seen.insert(flag.clone()) {
+                out.push(flag);
+                if out.len() >= 80 {
+                    return out;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Whether `cmd` is safe to probe with `<cmd> --help` for flag discovery. Only
+/// word-like command names (no paths, no shell metacharacters) that the user
+/// has actually run before should be probed — see the caller, which gates on
+/// history membership too.
+pub fn is_help_probe_safe(cmd: &str) -> bool {
+    !cmd.is_empty()
+        && cmd.len() <= 32
+        && cmd
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && cmd.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+}
+
+/// Filter file candidates by extension (for FilesWithExt strategy).
+pub fn filter_by_ext<'a>(files: &'a [String], exts: &'static [&'static str]) -> Vec<&'a str> {
+    files
+        .iter()
+        .filter(|f| {
+            let lower = f.to_lowercase();
+            exts.iter().any(|ext| lower.ends_with(ext))
+        })
+        .map(String::as_str)
+        .collect()
+}
+
+/// Split a typed line into (command_name, arg_prefix).
+/// Returns (cmd_lowercased, arg_part) where arg_part is everything after the
+/// first space. If no space, arg_part is empty (still in command-name phase).
+pub fn split_command_and_arg(line: &str) -> (String, &str) {
+    let trimmed = line.trim_start();
+    if let Some(space_pos) = trimmed.find(char::is_whitespace) {
+        let cmd = trimmed[..space_pos].to_lowercase();
+        let arg = trimmed[space_pos..].trim_start();
+        (cmd, arg)
+    } else {
+        (trimmed.to_lowercase(), "")
+    }
+}
+
+/// Return the last pipeline/list segment of a typed line, so completion
+/// tracks the command actually being typed right now rather than the whole
+/// line. `ps -ef | grep java` → `"grep java"`; `cd /tmp && ls -l` → `"ls -l"`.
+/// A trailing separator (still no command typed after it) yields `""`.
+pub fn last_segment(line: &str) -> &str {
+    line.rsplit(['|', ';', '&']).next().unwrap_or(line).trim_start()
+}
+
+/// Return the whitespace-delimited token currently being typed: the part of
+/// `arg` after its last space (or all of `arg` if it has none). This is the
+/// token completion should actually match against — `ps -ef` → arg="-ef",
+/// `java -Xmx512m -jar app` → arg last token = "app".
+pub fn last_token(arg: &str) -> &str {
+    match arg.rfind(char::is_whitespace) {
+        Some(pos) => &arg[pos + 1..],
+        None => arg,
+    }
+}
+
+/// The token immediately before the one currently being typed, within `arg`.
+/// `-Xmx512m -jar ` → "-jar"; used to look up "what usually follows this
+/// token" in the learned bigram model. Returns `""` when there is no prior
+/// token (still typing the first argument).
+pub fn prev_token(arg: &str) -> &str {
+    let cur = last_token(arg);
+    let head = arg[..arg.len() - cur.len()].trim_end();
+    match head.rfind(char::is_whitespace) {
+        Some(pos) => &head[pos + 1..],
+        None => head,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Self-learning token model
+//
+// Complements the static `flags_for` / `KNOWN_COMMANDS` tables with per-host
+// statistics learned from the user's own command history. This is what gives
+// completion coverage for THIRD-PARTY / custom commands the static tables
+// never heard of: if you run `mytool --deploy-env prod` a few times, the model
+// learns both that `--deploy-env` follows `mytool` and that `prod` follows
+// `--deploy-env`, so next time `mytool --dep` completes and `mytool
+// --deploy-env ` predicts `prod`. Ranking is frecency (frequency + recency),
+// like atuin / McFly, so your daily-driver commands beat one-off ones.
+// ---------------------------------------------------------------------------
+
+/// Frecency counter for one learned token: how often it's been seen and the
+/// most recent "tick" (a monotonically increasing counter, not wall-clock, so
+/// it's deterministic and needs no time source).
+#[derive(Debug, Clone, Default)]
+struct TokenStat {
+    count: u32,
+    last_seen: u64,
+}
+
+impl TokenStat {
+    /// Higher is better. Frequency dominates; recency breaks ties and gently
+    /// lifts things you've touched lately. Kept in f64 to avoid overflow.
+    fn score(&self, now: u64) -> f64 {
+        let recency = 1.0 / (1.0 + (now.saturating_sub(self.last_seen)) as f64);
+        self.count as f64 + recency
+    }
+}
+
+/// Per-command learned statistics: which tokens follow a command name, and
+/// which tokens follow a given previous token (bigrams).
+#[derive(Debug, Clone, Default)]
+pub struct TokenModel {
+    /// Monotonic tick, bumped once per learned command line.
+    tick: u64,
+    /// command → (token → stat). Tokens are flags and stable sub-tokens seen
+    /// anywhere in that command's arguments.
+    per_command: std::collections::HashMap<String, std::collections::HashMap<String, TokenStat>>,
+    /// (command, previous_token) → (next_token → stat). Captures "value that
+    /// usually follows this flag/word".
+    bigrams: std::collections::HashMap<(String, String), std::collections::HashMap<String, TokenStat>>,
+    /// command name → stat, for command-name-phase frecency ranking.
+    commands: std::collections::HashMap<String, TokenStat>,
+}
+
+/// Commands whose *argument values* must never be learned/suggested (stale
+/// PIDs, paths, and destructive targets are misleading). Flags for these are
+/// still fine to learn — only positional/value tokens are suppressed.
+const NO_VALUE_LEARN_COMMANDS: &[&str] = &[
+    "kill", "pkill", "killall", "rm", "rmdir", "shutdown", "reboot",
+];
+
+/// Whether a token is stable enough to learn as a value/subcommand. Flags
+/// (`-x`, `--long`) are always learnable. Otherwise we require a "word-like"
+/// token: no path separators, no leading digit (skip PIDs/ports), reasonable
+/// length, and only sane identifier characters. This keeps volatile junk
+/// (file paths, PIDs, quoted strings, URLs) out of the model.
+fn is_learnable_token(tok: &str) -> bool {
+    if tok.is_empty() || tok.len() > 40 {
+        return false;
+    }
+    if tok.starts_with('-') {
+        // A flag: learnable as long as it's not a bare "-" / "--".
+        return tok.len() > 1 && tok != "--";
+    }
+    if tok.contains('/') || tok.contains('\\') || tok.contains('$') || tok.contains('=') {
+        return false;
+    }
+    let mut chars = tok.chars();
+    let first = chars.next().unwrap();
+    if !first.is_ascii_alphabetic() {
+        return false; // skip numbers (PIDs/ports), globs, etc.
+    }
+    tok.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+}
+
+impl TokenModel {
+    /// Learn from one committed command line (may contain pipes — each segment
+    /// is learned independently so `ps -ef | grep java` teaches both `ps` and
+    /// `grep`).
+    pub fn learn(&mut self, line: &str) {
+        self.tick = self.tick.wrapping_add(1);
+        let tick = self.tick;
+        for segment in line.split(['|', ';', '&']) {
+            self.learn_segment(segment.trim(), tick);
+        }
+    }
+
+    fn learn_segment(&mut self, segment: &str, tick: u64) {
+        let mut it = segment.split_whitespace();
+        let Some(cmd_raw) = it.next() else { return };
+        let cmd = cmd_raw.to_lowercase();
+        if cmd.starts_with('-') || cmd.contains('/') {
+            return; // not a command name (a flag or a path invocation)
+        }
+        bump(&mut self.commands, cmd.clone(), tick);
+
+        let allow_values = !NO_VALUE_LEARN_COMMANDS.contains(&cmd.as_str());
+        let mut prev = String::new();
+        for tok in it {
+            let is_flag = tok.starts_with('-');
+            if is_learnable_token(tok) && (is_flag || allow_values) {
+                // Per-command token frequency.
+                let entry = self.per_command.entry(cmd.clone()).or_default();
+                bump(entry, tok.to_string(), tick);
+                // Bigram: this token follows `prev`.
+                if !prev.is_empty() {
+                    let key = (cmd.clone(), prev.clone());
+                    let entry = self.bigrams.entry(key).or_default();
+                    bump(entry, tok.to_string(), tick);
+                }
+            }
+            prev = tok.to_string();
+        }
+    }
+
+    /// Learned command names extending `prefix`, best-frecency first.
+    pub fn command_candidates(&self, prefix: &str) -> Vec<String> {
+        rank_matching(&self.commands, prefix, self.tick)
+    }
+
+    /// Learned tokens for `cmd` extending `prefix` (flags or values depending
+    /// on the prefix), best-frecency first.
+    pub fn token_candidates(&self, cmd: &str, prefix: &str) -> Vec<String> {
+        match self.per_command.get(cmd) {
+            Some(map) => rank_matching(map, prefix, self.tick),
+            None => Vec::new(),
+        }
+    }
+
+    /// Learned tokens that usually follow `prev` under `cmd`, extending
+    /// `prefix`, best-frecency first. Powers "value after a flag" prediction.
+    pub fn bigram_candidates(&self, cmd: &str, prev: &str, prefix: &str) -> Vec<String> {
+        match self.bigrams.get(&(cmd.to_string(), prev.to_string())) {
+            Some(map) => rank_matching(map, prefix, self.tick),
+            None => Vec::new(),
+        }
+    }
+}
+
+/// Bump a token's stat in a frecency map.
+fn bump(map: &mut std::collections::HashMap<String, TokenStat>, key: String, tick: u64) {
+    let stat = map.entry(key).or_default();
+    stat.count = stat.count.saturating_add(1);
+    stat.last_seen = tick;
+}
+
+/// Return every key that strictly extends `prefix`, sorted best-frecency
+/// first. An empty prefix matches everything (useful for "what comes next").
+fn rank_matching(
+    map: &std::collections::HashMap<String, TokenStat>,
+    prefix: &str,
+    now: u64,
+) -> Vec<String> {
+    let mut hits: Vec<(&String, f64)> = map
+        .iter()
+        .filter(|(k, _)| k.len() > prefix.len() && k.starts_with(prefix))
+        .map(|(k, s)| (k, s.score(now)))
+        .collect();
+    hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    hits.into_iter().map(|(k, _)| k.clone()).collect()
+}
+
+/// Cache tag for a given strategy (used to match query results back).
+pub fn strategy_tag(strategy: &SuggestStrategy) -> &'static str {
+    match strategy {
+        SuggestStrategy::Files => "__files__",
+        SuggestStrategy::FilesWithExt(_) => "__files__",
+        SuggestStrategy::Directories => "cd",
+        SuggestStrategy::ProcessList => "kill",
+        SuggestStrategy::Remote { .. } => "",
+        SuggestStrategy::Subcommands(_) => "",
+    }
+}
+
+/// Find the best suffix to suggest from candidates, given what's already typed.
+/// Returns only the part *after* the prefix.
+pub fn match_suffix<'a>(prefix: &str, candidates: impl Iterator<Item = &'a str>) -> Option<String> {
+    if prefix.is_empty() {
+        return None;
+    }
+    for cand in candidates {
+        if cand.len() > prefix.len() && cand.starts_with(prefix) {
+            return Some(cand[prefix.len()..].to_string());
+        }
+        // Also match if candidate equals prefix exactly → no suffix needed.
+    }
+    None
+}
+
 /// One terminal session = one tab.
 pub struct Session {
     pub id: u64,
@@ -232,6 +839,15 @@ pub struct Session {
     /// input line) computed from history. Drawn at the cursor at 40% alpha;
     /// Right/Tab accepts it. Never injected into the PTY until accepted.
     pub inline_suggestion: Option<String>,
+    /// Smart suggestion state: caches for remote directory listings, PID
+    /// lists, and custom query results. Drives context-aware suggestions.
+    pub suggestion_state: SessionSuggestionState,
+    /// Self-learning token model: per-host statistics (learned from command
+    /// history) of which flags/subcommands follow each command and which
+    /// values follow each flag. Powers completion for third-party/custom
+    /// commands the static tables don't know about. Seeded from persisted
+    /// history on connect, then updated live as commands are committed.
+    pub token_model: TokenModel,
 }
 
 /// A local filesystem entry shown in the SFTP local pane.
@@ -474,6 +1090,21 @@ impl Session {
             file_viewer: None,
             connected_at: None,
             inline_suggestion: None,
+            suggestion_state: SessionSuggestionState::default(),
+            token_model: TokenModel::default(),
+        }
+    }
+
+    /// Seed the learned token model from prior command lines for this host,
+    /// passed oldest-first so the frecency ticks line up with real recency.
+    /// Called each time a session reaches `Connected`; resets first so a
+    /// reconnect rebuilds cleanly instead of double-counting history (live
+    /// commands from the previous connection are already persisted and thus
+    /// included in the passed-in history).
+    pub fn seed_token_model<'a>(&mut self, commands: impl Iterator<Item = &'a str>) {
+        self.token_model = TokenModel::default();
+        for cmd in commands {
+            self.token_model.learn(cmd);
         }
     }
 
@@ -602,6 +1233,12 @@ impl Session {
             });
         self.input_buf.clear();
         let Some(line) = line else { return };
+        // Invalidate directory cache if the user ran cd/pushd/popd — the
+        // listing will be stale on the next prompt.
+        let first_word = line.split_whitespace().next().unwrap_or("");
+        if matches!(first_word, "cd" | "pushd" | "popd") {
+            self.suggestion_state.invalidate_dir();
+        }
         // Skip consecutive duplicates.
         if self.command_history.last().map(String::as_str) == Some(line.as_str()) {
             return;
@@ -735,10 +1372,40 @@ fn strip_ansi_truncated(bytes: &[u8], max_bytes: usize) -> String {
     result.trim_end().to_string()
 }
 
+/// Commands whose arguments are context-specific (PIDs, file paths, ports)
+/// and should not be suggested from history — the stale value is misleading
+/// rather than helpful.
+const NO_ARG_SUGGEST_COMMANDS: &[&str] = &[
+    "kill", "pkill", "killall", "rm", "rmdir", "del", "shutdown", "reboot",
+    "systemctl", "service", "docker", "kubectl",
+];
+
+/// Returns the first whitespace-delimited token of `s` (the command name),
+/// lowercased for comparison.
+fn first_token(s: &str) -> &str {
+    s.split_whitespace().next().unwrap_or("")
+}
+
+/// True if `line` has progressed past the command name into arguments,
+/// and the command is in the no-arg-suggest blocklist.
+fn is_no_arg_suggest_command(line: &str) -> bool {
+    let cmd = first_token(line).to_lowercase();
+    if cmd.is_empty() {
+        return false;
+    }
+    let has_space = line.chars().any(|c| c == ' ');
+    has_space && NO_ARG_SUGGEST_COMMANDS.contains(&cmd.as_str())
+}
+
 /// Find the suffix to suggest after `line`: the first candidate (iterated
 /// newest-first) that strictly extends `line` as a prefix. Returns `None` when
 /// the line is too short, empty/whitespace, or nothing matches. The returned
 /// string is only the part *after* what's already typed.
+///
+/// Context safety: if the user has typed past the command name (a space
+/// follows the first token) and the command is in the no-arg-suggest blocklist
+/// (e.g. `kill`, `rm`), no suggestion is produced — stale PIDs and file paths
+/// from history are misleading, not helpful.
 pub fn suggestion_suffix<'a>(
     line: &str,
     candidates: impl Iterator<Item = &'a str>,
@@ -747,9 +1414,38 @@ pub fn suggestion_suffix<'a>(
     if line.trim().len() < 2 {
         return None;
     }
+    // Don't suggest arguments for context-specific commands like `kill <pid>`.
+    if is_no_arg_suggest_command(line) {
+        return None;
+    }
     for cand in candidates {
         if cand.len() > line.len() && cand.starts_with(line) {
             return Some(cand[line.len()..].to_string());
+        }
+    }
+    None
+}
+
+/// Command-name-phase suggestion: try the session's own history first (it
+/// wins, since it's a full remembered command, not just a bare name), then
+/// fall back to the static [`KNOWN_COMMANDS`] list so completion works even
+/// on a command that has never been run in this session (e.g. typing "doc"
+/// for the first time still suggests "ker" to reach "docker").
+pub fn command_name_suggestion<'a>(
+    line: &str,
+    history: impl Iterator<Item = &'a str>,
+) -> Option<String> {
+    if let Some(s) = suggestion_suffix(line, history) {
+        return Some(s);
+    }
+    let trimmed = line.trim();
+    if trimmed.len() < 2 {
+        return None;
+    }
+    let lower = trimmed.to_lowercase();
+    for cand in KNOWN_COMMANDS {
+        if cand.len() > lower.len() && cand.starts_with(&lower) {
+            return Some(cand[lower.len()..].to_string());
         }
     }
     None
@@ -939,6 +1635,41 @@ mod tests {
     }
 
     #[test]
+    fn suggestion_blocked_for_kill_args() {
+        // kill with arguments: stale PIDs from history are misleading.
+        let cands = ["kill 12345", "kill -9 99876"];
+        assert_eq!(suggestion_suffix("kill 1", cands.iter().copied()), None);
+        assert_eq!(suggestion_suffix("kill ", cands.iter().copied()), None);
+        // But the command name itself can still be suggested.
+        let cands2 = ["killall", "kill"];
+        assert_eq!(
+            suggestion_suffix("ki", cands2.iter().copied()),
+            Some("llall".to_string())
+        );
+    }
+
+    #[test]
+    fn suggestion_blocked_for_rm_args() {
+        let cands = ["rm -rf /tmp/old", "rm /var/log/app.log"];
+        assert_eq!(suggestion_suffix("rm ", cands.iter().copied()), None);
+        assert_eq!(suggestion_suffix("rm /v", cands.iter().copied()), None);
+    }
+
+    #[test]
+    fn suggestion_allowed_for_safe_commands_with_args() {
+        // cd, git, ls — argument suggestions are useful for these.
+        let cands = ["cd /usr/local/bin", "git push origin main"];
+        assert_eq!(
+            suggestion_suffix("cd /us", cands.iter().copied()),
+            Some("r/local/bin".to_string())
+        );
+        assert_eq!(
+            suggestion_suffix("git p", cands.iter().copied()),
+            Some("ush origin main".to_string())
+        );
+    }
+
+    #[test]
     fn input_line_tracks_typing() {
         let mut s = session();
         s.track_input(b"git p");
@@ -947,5 +1678,400 @@ mod tests {
         s.track_input(b"\r");
         s.write_output(b"\r\n");
         assert_eq!(s.input_line(), "");
+    }
+
+    // --- Smart suggestion engine tests ---
+
+    #[test]
+    fn strategy_for_known_commands() {
+        assert!(matches!(
+            strategy_for("kill"),
+            SuggestStrategy::ProcessList
+        ));
+        assert!(matches!(
+            strategy_for("cd"),
+            SuggestStrategy::Directories
+        ));
+        assert!(matches!(
+            strategy_for("python3"),
+            SuggestStrategy::FilesWithExt(&[".py"])
+        ));
+        assert!(matches!(
+            strategy_for("git"),
+            SuggestStrategy::Subcommands(_)
+        ));
+        assert!(matches!(
+            strategy_for("foobar"),
+            SuggestStrategy::Files
+        ));
+    }
+
+    #[test]
+    fn split_command_and_arg_works() {
+        assert_eq!(
+            split_command_and_arg("kill 123"),
+            ("kill".to_string(), "123")
+        );
+        assert_eq!(
+            split_command_and_arg("cd /usr/"),
+            ("cd".to_string(), "/usr/")
+        );
+        assert_eq!(
+            split_command_and_arg("git"),
+            ("git".to_string(), "")
+        );
+        assert_eq!(
+            split_command_and_arg("  ls  -la"),
+            ("ls".to_string(), "-la")
+        );
+    }
+
+    #[test]
+    fn parse_kill_output_extracts_pids() {
+        let output = "1234 nginx\n5678 python3\n  9012 sshd\n";
+        let pids = parse_query_output("kill", output);
+        assert_eq!(pids, vec!["1234", "5678", "9012"]);
+    }
+
+    #[test]
+    fn parse_cd_output_preserves_slashes() {
+        let output = "bin/\netc/\nhome/\n";
+        let dirs = parse_query_output("cd", output);
+        assert_eq!(dirs, vec!["bin/", "etc/", "home/"]);
+    }
+
+    #[test]
+    fn parse_generic_output_splits_lines() {
+        let output = "nginx.service\nssh.service\n";
+        let units = parse_query_output("systemctl", output);
+        assert_eq!(units, vec!["nginx.service", "ssh.service"]);
+    }
+
+    #[test]
+    fn match_suffix_finds_extending_candidate() {
+        let cands = ["app.py", "test.py", "utils.py"];
+        assert_eq!(
+            match_suffix("ap", cands.iter().copied()),
+            Some("p.py".to_string())
+        );
+    }
+
+    #[test]
+    fn match_suffix_none_for_exact_match() {
+        let cands = ["app.py"];
+        assert_eq!(match_suffix("app.py", cands.iter().copied()), None);
+    }
+
+    #[test]
+    fn match_suffix_none_for_no_match() {
+        let cands = ["app.py"];
+        assert_eq!(match_suffix("zzz", cands.iter().copied()), None);
+    }
+
+    #[test]
+    fn match_suffix_empty_prefix_returns_none() {
+        let cands = ["app.py"];
+        assert_eq!(match_suffix("", cands.iter().copied()), None);
+    }
+
+    #[test]
+    fn filter_by_ext_keeps_matching_extensions() {
+        let files = vec![
+            "app.py".to_string(),
+            "server.js".to_string(),
+            "test.py".to_string(),
+            "README.md".to_string(),
+        ];
+        let py_files = filter_by_ext(&files, &[".py"]);
+        assert_eq!(py_files, vec!["app.py", "test.py"]);
+    }
+
+    #[test]
+    fn filter_by_ext_case_insensitive() {
+        let files = vec![
+            "app.PY".to_string(),
+            "test.py".to_string(),
+        ];
+        let py_files = filter_by_ext(&files, &[".py"]);
+        assert_eq!(py_files, vec!["app.PY", "test.py"]);
+    }
+
+    #[test]
+    fn dir_cache_freshness_check() {
+        let cache = DirCache {
+            all_entries: vec!["foo".to_string()],
+            dirs: vec![],
+            fetched_at: std::time::Instant::now(),
+        };
+        assert!(cache.is_fresh(10_000));
+    }
+
+    #[test]
+    fn dir_cache_expires_after_ttl() {
+        let cache = DirCache {
+            all_entries: vec!["foo".to_string()],
+            dirs: vec![],
+            fetched_at: std::time::Instant::now() - std::time::Duration::from_millis(15_000),
+        };
+        assert!(!cache.is_fresh(10_000));
+    }
+
+    #[test]
+    fn suggestion_state_invalidates_dir_cache() {
+        let mut state = SessionSuggestionState::default();
+        state.dir_cache = Some(DirCache {
+            all_entries: vec!["foo".to_string()],
+            dirs: vec![],
+            fetched_at: std::time::Instant::now(),
+        });
+        state.invalidate_dir();
+        assert!(state.dir_cache.is_none());
+    }
+
+    #[test]
+    fn suggestion_state_pending_tracking() {
+        let mut state = SessionSuggestionState::default();
+        assert!(!state.is_pending("kill"));
+        state.mark_pending("kill");
+        assert!(state.is_pending("kill"));
+        state.clear_pending("kill");
+        assert!(!state.is_pending("kill"));
+    }
+
+    #[test]
+    fn suggestion_state_pending_expires() {
+        let mut state = SessionSuggestionState::default();
+        // Manually insert an old pending timestamp.
+        state.pending.insert(
+            "kill".to_string(),
+            std::time::Instant::now() - std::time::Duration::from_secs(5),
+        );
+        // Should be expired (not pending) after PENDING_TIMEOUT.
+        assert!(!state.is_pending("kill"));
+    }
+
+    #[test]
+    fn suggestion_state_clear_all_resets_everything() {
+        let mut state = SessionSuggestionState::default();
+        state.dir_cache = Some(DirCache {
+            all_entries: vec!["foo".to_string()],
+            dirs: vec![],
+            fetched_at: std::time::Instant::now(),
+        });
+        state.pid_cache = Some((vec!["123".to_string()], std::time::Instant::now()));
+        state.mark_pending("kill");
+        state.clear_all();
+        assert!(state.dir_cache.is_none());
+        assert!(state.pid_cache.is_none());
+        assert!(!state.is_pending("kill"));
+    }
+
+    #[test]
+    fn cd_command_invalidates_dir_cache_on_commit() {
+        let mut s = session();
+        s.suggestion_state.dir_cache = Some(DirCache {
+            all_entries: vec!["foo".to_string()],
+            dirs: vec![],
+            fetched_at: std::time::Instant::now(),
+        });
+        // Simulate: user types "cd /tmp" + Enter, then shell responds.
+        s.track_input(b"cd /tmp\r");
+        s.write_output(b"\r\n");
+        // The cache should have been invalidated by commit_input_line.
+        assert!(s.suggestion_state.dir_cache.is_none());
+    }
+
+    #[test]
+    fn non_cd_command_keeps_dir_cache() {
+        let mut s = session();
+        s.suggestion_state.dir_cache = Some(DirCache {
+            all_entries: vec!["foo".to_string()],
+            dirs: vec![],
+            fetched_at: std::time::Instant::now(),
+        });
+        s.track_input(b"ls -la\r");
+        s.write_output(b"\r\n");
+        assert!(s.suggestion_state.dir_cache.is_some());
+    }
+
+    // --- Multi-token / pipeline / flags completion (broader command coverage) ---
+
+    #[test]
+    fn last_segment_tracks_the_command_after_a_pipe() {
+        assert_eq!(last_segment("ps -ef|grep java"), "grep java");
+        assert_eq!(last_segment("ps -ef | grep java"), "grep java");
+        assert_eq!(last_segment("cd /tmp && ls -l"), "ls -l");
+        assert_eq!(last_segment("echo hi; ls"), "ls");
+        // No separator: the whole line is the segment.
+        assert_eq!(last_segment("ps -ef"), "ps -ef");
+        // Trailing separator with nothing typed after it yet.
+        assert_eq!(last_segment("ls -la |"), "");
+    }
+
+    #[test]
+    fn last_token_finds_the_token_being_typed() {
+        // Single flag: the whole arg is the token.
+        assert_eq!(last_token("-ef"), "-ef");
+        // Multiple tokens: only the trailing one matters.
+        assert_eq!(last_token("-Xmx512m -jar app"), "app");
+        assert_eq!(last_token("-9 123"), "123");
+        assert_eq!(last_token(""), "");
+    }
+
+    #[test]
+    fn flags_for_known_commands_covers_common_flags() {
+        assert!(flags_for("ps").contains(&"-ef"));
+        assert!(flags_for("kill").contains(&"-9"));
+        assert!(flags_for("java").contains(&"-jar"));
+        assert!(flags_for("grep").contains(&"-r"));
+        assert!(flags_for("docker").contains(&"--rm"));
+        assert!(flags_for("totally-unknown-cmd").is_empty());
+    }
+
+    #[test]
+    fn flag_match_suffix_completes_ps_ef() {
+        // Simulates what recompute_active_suggestion does: cur_token starts
+        // with '-', so it's matched against flags_for("ps").
+        let suffix = match_suffix("-e", flags_for("ps").iter().copied());
+        assert_eq!(suffix, Some("f".to_string()));
+    }
+
+    #[test]
+    fn command_name_suggestion_falls_back_to_known_commands() {
+        // No history at all: should still suggest from the static list.
+        let empty: Vec<&str> = vec![];
+        assert_eq!(
+            command_name_suggestion("doc", empty.iter().copied()),
+            Some("ker".to_string())
+        );
+    }
+
+    #[test]
+    fn command_name_suggestion_prefers_history_over_static_list() {
+        // History has a fuller remembered command; it should win over the
+        // bare static command name.
+        let hist = ["docker ps -a"];
+        assert_eq!(
+            command_name_suggestion("doc", hist.iter().copied()),
+            Some("ker ps -a".to_string())
+        );
+    }
+
+    // --- prev_token / learned token model / help scrape ---
+
+    #[test]
+    fn prev_token_finds_the_token_before_the_cursor() {
+        assert_eq!(prev_token("-jar "), "-jar");
+        assert_eq!(prev_token("-Xmx512m -jar app"), "-jar");
+        assert_eq!(prev_token("app"), ""); // first arg: no prior token
+        assert_eq!(prev_token("--deploy-env "), "--deploy-env");
+    }
+
+    #[test]
+    fn model_learns_flags_for_third_party_commands() {
+        let mut m = TokenModel::default();
+        m.learn("mytool --deploy-env prod");
+        m.learn("mytool --deploy-env prod");
+        // Flag is learned even though `mytool` is in no static table.
+        let flags = m.token_candidates("mytool", "--dep");
+        assert_eq!(flags.first().map(String::as_str), Some("--deploy-env"));
+    }
+
+    #[test]
+    fn model_learns_value_after_a_flag_via_bigram() {
+        let mut m = TokenModel::default();
+        m.learn("mytool --deploy-env prod");
+        // What usually follows `--deploy-env`? → "prod".
+        let vals = m.bigram_candidates("mytool", "--deploy-env", "");
+        assert_eq!(vals, vec!["prod".to_string()]);
+        // And prefix-filtered.
+        assert_eq!(
+            m.bigram_candidates("mytool", "--deploy-env", "pr"),
+            vec!["prod".to_string()]
+        );
+    }
+
+    #[test]
+    fn model_ranks_by_frecency() {
+        let mut m = TokenModel::default();
+        // "build" seen 3×, "bench" seen 1× — build should rank first.
+        m.learn("cargo bench");
+        m.learn("cargo build");
+        m.learn("cargo build");
+        m.learn("cargo build");
+        let cands = m.token_candidates("cargo", "b");
+        assert_eq!(cands.first().map(String::as_str), Some("build"));
+    }
+
+    #[test]
+    fn model_does_not_learn_volatile_values_for_kill() {
+        let mut m = TokenModel::default();
+        m.learn("kill -9 12345");
+        // The flag is fine to learn…
+        assert_eq!(
+            m.token_candidates("kill", "-9"),
+            Vec::<String>::new(),
+            "exact match yields no extending suffix"
+        );
+        assert!(m.token_candidates("kill", "-").contains(&"-9".to_string()));
+        // …but the PID value must NOT be learned.
+        assert!(m.bigram_candidates("kill", "-9", "").is_empty());
+        assert!(!m.token_candidates("kill", "1").contains(&"12345".to_string()));
+    }
+
+    #[test]
+    fn model_skips_paths_and_numbers_as_values() {
+        let mut m = TokenModel::default();
+        m.learn("cat /etc/passwd");
+        m.learn("sleep 300");
+        // Paths and bare numbers are not learnable values.
+        assert!(m.token_candidates("cat", "/").is_empty());
+        assert!(m.token_candidates("sleep", "3").is_empty());
+    }
+
+    #[test]
+    fn model_learns_each_pipeline_segment() {
+        let mut m = TokenModel::default();
+        m.learn("ps -ef | grep java");
+        // Both `ps` and `grep` are learned as commands.
+        assert!(m.command_candidates("p").contains(&"ps".to_string()));
+        assert!(m.command_candidates("gr").contains(&"grep".to_string()));
+    }
+
+    #[test]
+    fn parse_help_flags_extracts_options() {
+        let help = "\
+Usage: mytool [OPTIONS]
+
+Options:
+  -h, --help            Print help
+  -v, --verbose         Be noisy
+      --deploy-env ENV  Target environment
+  -o, --output=FILE     Write to FILE
+";
+        let flags = parse_help_flags(help);
+        assert!(flags.contains(&"-h".to_string()));
+        assert!(flags.contains(&"--help".to_string()));
+        assert!(flags.contains(&"--verbose".to_string()));
+        assert!(flags.contains(&"--deploy-env".to_string()));
+        // `=FILE` suffix stripped.
+        assert!(flags.contains(&"--output".to_string()));
+        assert!(!flags.iter().any(|f| f.contains('=')));
+    }
+
+    #[test]
+    fn parse_help_flags_ignores_prose_lines() {
+        let help = "This tool does things.\nRun it carefully.\nNo options here.";
+        assert!(parse_help_flags(help).is_empty());
+    }
+
+    #[test]
+    fn help_probe_safety_gate() {
+        assert!(is_help_probe_safe("docker"));
+        assert!(is_help_probe_safe("my-tool.sh"));
+        assert!(!is_help_probe_safe("./script")); // path
+        assert!(!is_help_probe_safe("rm -rf")); // space / metachar
+        assert!(!is_help_probe_safe("")); // empty
+        assert!(!is_help_probe_safe("2tool")); // leading digit
     }
 }
