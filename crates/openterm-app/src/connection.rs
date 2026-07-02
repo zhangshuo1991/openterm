@@ -77,6 +77,11 @@ pub enum Command {
     },
     /// Create a remote directory.
     SftpMkdir(String),
+    /// Pause an in-flight transfer at a safe point, keeping its `.part` so it
+    /// can be resumed later by re-issuing the original download/upload command.
+    SftpPauseTransfer { id: u64 },
+    /// Cancel an in-flight transfer and delete its `.part` scratch file(s).
+    SftpCancelTransfer { id: u64 },
     /// Remove a remote file or directory.
     SftpRemove { path: String, is_dir: bool },
     /// Rename / move a remote path.
@@ -142,6 +147,12 @@ pub enum Event {
         name: String,
         direction: Direction,
         total: u64,
+        /// Resolved remote path (for rebuilding a resume command).
+        remote: String,
+        /// Resolved local path (for rebuilding a resume command).
+        local: String,
+        /// Whether this transfer is a whole directory tree.
+        is_dir: bool,
     },
     /// Progress update for a streamed transfer (throttled).
     TransferProgress {
@@ -155,6 +166,17 @@ pub enum Event {
         session_id: u64,
         id: u64,
         result: Result<u64, String>,
+    },
+    /// A transfer was paused at a safe point (its `.part` is preserved).
+    TransferPaused {
+        session_id: u64,
+        id: u64,
+        transferred: u64,
+    },
+    /// A transfer was cancelled and its `.part` scratch removed.
+    TransferCanceled {
+        session_id: u64,
+        id: u64,
     },
     /// Raw stdout of one resource-monitor sample, parsed by the UI side.
     Metrics {
@@ -216,6 +238,8 @@ impl Event {
             | Event::TransferStarted { session_id, .. }
             | Event::TransferProgress { session_id, .. }
             | Event::TransferFinished { session_id, .. }
+            | Event::TransferPaused { session_id, .. }
+            | Event::TransferCanceled { session_id, .. }
             | Event::Metrics { session_id, .. }
             | Event::Processes { session_id, .. }
             | Event::Ports { session_id, .. }
@@ -325,6 +349,11 @@ async fn run_connection(
     });
     // #16: track all fire-and-forget tasks so they're aborted on disconnect.
     let mut bg_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    // Per-transfer control, keyed by transfer id, so pause/cancel can act on an
+    // in-flight transfer — or, once the transfer task has exited (e.g. after a
+    // pause), so a later cancel can still clean up the `.part` scratch itself.
+    let mut transfers: std::collections::HashMap<u64, TransferCtl> =
+        std::collections::HashMap::new();
     // #5: accumulate output bytes and flush at ~60fps to reduce per-byte overhead.
     let mut output_buf: Vec<u8> = Vec::new();
     let mut flush_tick = tokio::time::interval(std::time::Duration::from_millis(16));
@@ -349,20 +378,88 @@ async fn run_connection(
                     bg_tasks.push(spawn_sftp_list(session_id, session.clone(), out.clone(), path));
                 }
                 Some(Command::SftpDownload { id, name, remote, local, size, is_dir }) => {
+                    let mode = Arc::new(std::sync::atomic::AtomicU8::new(0));
+                    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                    let finalized = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    transfers.insert(id, TransferCtl {
+                        mode: mode.clone(),
+                        running: running.clone(),
+                        finalized: finalized.clone(),
+                        remote: remote.clone(),
+                        local: local.clone(),
+                        direction: Direction::Download,
+                    });
                     bg_tasks.push(spawn_transfer(
                         session_id,
                         session.clone(),
                         out.clone(),
                         Transfer { id, name, direction: Direction::Download, remote, local, size, is_dir },
+                        mode,
+                        running,
+                        finalized,
                     ));
                 }
                 Some(Command::SftpUpload { id, name, local, remote, size, is_dir }) => {
+                    let mode = Arc::new(std::sync::atomic::AtomicU8::new(0));
+                    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                    let finalized = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    transfers.insert(id, TransferCtl {
+                        mode: mode.clone(),
+                        running: running.clone(),
+                        finalized: finalized.clone(),
+                        remote: remote.clone(),
+                        local: local.clone(),
+                        direction: Direction::Upload,
+                    });
                     bg_tasks.push(spawn_transfer(
                         session_id,
                         session.clone(),
                         out.clone(),
                         Transfer { id, name, direction: Direction::Upload, remote, local, size, is_dir },
+                        mode,
+                        running,
+                        finalized,
                     ));
+                }
+                Some(Command::SftpPauseTransfer { id }) => {
+                    // Cooperative pause: mode=1 → the running task stops at its
+                    // next safe point and keeps the `.part` for a later resume.
+                    if let Some(ctl) = transfers.get(&id) {
+                        ctl.mode.store(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+                Some(Command::SftpCancelTransfer { id }) => {
+                    if let Some(ctl) = transfers.get(&id) {
+                        ctl.mode.store(2, std::sync::atomic::Ordering::SeqCst);
+                        // If the task is still running it will observe mode=2 and
+                        // handle its own cleanup on exit — we must NOT claim
+                        // `finalized` here or the task would lose the claim and
+                        // skip cleanup. Only take over when the task has already
+                        // exited (e.g. a paused transfer, whose task is gone).
+                        let task_done = !ctl.running.load(std::sync::atomic::Ordering::SeqCst);
+                        if task_done
+                            && ctl
+                                .finalized
+                                .compare_exchange(
+                                    false,
+                                    true,
+                                    std::sync::atomic::Ordering::SeqCst,
+                                    std::sync::atomic::Ordering::SeqCst,
+                                )
+                                .is_ok()
+                        {
+                            let files = vec![(
+                                ctl.remote.clone(),
+                                std::path::PathBuf::from(&ctl.local),
+                                0u64,
+                            )];
+                            let (sess, mut o, dir) = (session.clone(), out.clone(), ctl.direction);
+                            bg_tasks.push(tokio::spawn(async move {
+                                cleanup_part_files(&sess, &files, dir).await;
+                                let _ = o.send(Event::TransferCanceled { session_id, id }).await;
+                            }));
+                        }
+                    }
                 }
                 Some(Command::SftpMkdir(path)) => {
                     bg_tasks.push(spawn_sftp_simple(session_id, session.clone(), out.clone(),
@@ -430,6 +527,10 @@ async fn run_connection(
                         Err(_) => {}
                     }
                 }
+                // Prune finished background tasks to avoid unbounded memory growth.
+                // Over a long session with many SFTP ops, bg_tasks could accumulate
+                // thousands of completed JoinHandles (~72 bytes each) if not cleaned.
+                bg_tasks.retain(|h| !h.is_finished());
             }
         }
     };
@@ -497,12 +598,37 @@ struct Transfer {
     is_dir: bool,
 }
 
+/// Actor-side control handle for one transfer. `mode` is the cooperative stop
+/// token shared with the streaming task (0 = run, 1 = pause, 2 = cancel).
+/// `running` is set false by the task as it exits, so a cancel arriving after
+/// the task is gone (e.g. on a paused transfer) can still remove the `.part`.
+struct TransferCtl {
+    mode: Arc<std::sync::atomic::AtomicU8>,
+    running: Arc<std::sync::atomic::AtomicBool>,
+    /// Claimed (false→true) by whichever of the task or the worker handles the
+    /// terminal cancel, so the cleanup + `TransferCanceled` fire exactly once
+    /// even if both race to it.
+    finalized: Arc<std::sync::atomic::AtomicBool>,
+    remote: String,
+    local: String,
+    direction: Direction,
+}
+
 /// Run a streamed transfer (a single file or a whole directory tree), emitting
-/// Started → throttled Progress (≈12/s, with instantaneous speed) → Finished.
+/// Started → throttled Progress (≈12/s, with instantaneous speed) → Finished
+/// (or Paused / Canceled if `stop` is signalled — 1 = pause, 2 = cancel).
 /// A directory is walked first to build a flat file list and a true total, then
 /// every file streams with progress accumulated across the whole tree, so a
 /// folder appears as one transfer with one aggregate progress bar.
-fn spawn_transfer(session_id: u64, session: Arc<RusshSession>, mut out: OutSink, t: Transfer) -> tokio::task::JoinHandle<()> {
+fn spawn_transfer(
+    session_id: u64,
+    session: Arc<RusshSession>,
+    mut out: OutSink,
+    t: Transfer,
+    stop: Arc<std::sync::atomic::AtomicU8>,
+    running: Arc<std::sync::atomic::AtomicBool>,
+    finalized: Arc<std::sync::atomic::AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
     return tokio::spawn(async move {
         // Build the work list of (remote, local, size) and the overall total.
         // A directory is expanded into its files (creating the destination
@@ -530,6 +656,9 @@ fn spawn_transfer(session_id: u64, session: Arc<RusshSession>, mut out: OutSink,
                             name: t.name.clone(),
                             direction: t.direction,
                             total: 0,
+                            remote: t.remote.clone(),
+                            local: t.local.clone(),
+                            is_dir: t.is_dir,
                         })
                         .await;
                     let _ = out
@@ -570,6 +699,9 @@ fn spawn_transfer(session_id: u64, session: Arc<RusshSession>, mut out: OutSink,
                 name: t.name.clone(),
                 direction: t.direction,
                 total,
+                remote: t.remote.clone(),
+                local: t.local.clone(),
+                is_dir: t.is_dir,
             })
             .await;
 
@@ -610,9 +742,52 @@ fn spawn_transfer(session_id: u64, session: Arc<RusshSession>, mut out: OutSink,
 
         // Stream every file, accumulating bytes across the whole tree so the
         // one progress bar advances continuously over a folder.
-        let result = transfer_files(&session, t.direction, &files, ptx).await;
+        let result = transfer_files(&session, t.direction, &files, ptx, stop.clone()).await;
         // ptx was consumed by transfer_files → throttle forwarder ends.
         let _ = forwarder.await;
+
+        // Mark the task as no longer running BEFORE re-reading the mode, so a
+        // cancel that arrives concurrently is guaranteed to be handled by
+        // exactly one side (see the worker's SftpCancelTransfer arm).
+        running.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        // If a stop was requested, emit Paused/Canceled instead of Finished.
+        let mode = stop.load(std::sync::atomic::Ordering::SeqCst);
+        if mode == 1 {
+            // Pause is NOT terminal: do not claim `finalized`, so a later cancel
+            // on the paused row can still take over and clean up.
+            let transferred = result.unwrap_or(0);
+            let _ = out
+                .send(Event::TransferPaused {
+                    session_id,
+                    id: t.id,
+                    transferred,
+                })
+                .await;
+            return;
+        }
+
+        // Terminal (finish or cancel): claim `finalized` so exactly one side
+        // emits a terminal event. If we lose the claim, a concurrent cancel in
+        // the worker already took over — stay silent.
+        let won = finalized
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok();
+        if !won {
+            return;
+        }
+        if mode == 2 {
+            cleanup_part_files(&session, &files, t.direction).await;
+            let _ = out
+                .send(Event::TransferCanceled { session_id, id: t.id })
+                .await;
+            return;
+        }
 
         let _ = out
             .send(Event::TransferFinished {
@@ -624,19 +799,51 @@ fn spawn_transfer(session_id: u64, session: Arc<RusshSession>, mut out: OutSink,
     });
 }
 
+/// Remove the `.part` scratch file(s) for a cancelled transfer. For a single
+/// file this is exactly one path; for a directory tree the current in-flight
+/// file's `.part` is the one that matters (completed files were already
+/// promoted, un-started ones never created a `.part`), but we sweep every
+/// candidate best-effort since a stale `.part` is harmless.
+async fn cleanup_part_files(
+    session: &RusshSession,
+    files: &[(String, std::path::PathBuf, u64)],
+    direction: Direction,
+) {
+    for (remote, local, _sz) in files {
+        match direction {
+            Direction::Download => {
+                let mut name = local.file_name().unwrap_or_default().to_os_string();
+                name.push(".part");
+                let part = local.with_file_name(name);
+                let _ = tokio::fs::remove_file(&part).await;
+            }
+            Direction::Upload => {
+                let part = format!("{remote}.part");
+                let _ = session.remove_path(&part, RemoteFileKind::File).await;
+            }
+        }
+    }
+}
+
 /// Stream every file in `files` (already-resolved `(remote, local, size)`),
 /// reporting cumulative bytes across the whole list over `progress`, and return
 /// the total bytes transferred. Each file's own 0..size progress is offset by
 /// the bytes already done so the combined stream is monotonic. The first
-/// failure aborts the rest, matching single-file semantics.
+/// failure aborts the rest, matching single-file semantics. A nonzero `stop`
+/// token stops the per-file streaming at a safe point (the ssh method leaves a
+/// resumable `.part`) and prevents starting the next file.
 async fn transfer_files(
     session: &RusshSession,
     direction: Direction,
     files: &[(String, std::path::PathBuf, u64)],
     progress: mpsc::Sender<u64>,
+    stop: Arc<std::sync::atomic::AtomicU8>,
 ) -> Result<u64, SshError> {
     let mut base = 0_u64;
     for (remote, local, _sz) in files {
+        if stop.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+            break; // don't begin another file once a stop is requested
+        }
         let (fptx, mut fprx) = mpsc::channel::<u64>(256);
         let agg = progress.clone();
         let base_now = base;
@@ -646,8 +853,8 @@ async fn transfer_files(
             }
         });
         let one = match direction {
-            Direction::Download => session.download_file(remote, local, fptx).await,
-            Direction::Upload => session.upload_file(local, remote, fptx).await,
+            Direction::Download => session.download_file(remote, local, fptx, stop.clone()).await,
+            Direction::Upload => session.upload_file(local, remote, fptx, stop.clone()).await,
         };
         // fptx dropped → inner forwarder ends.
         let _ = fwd.await;
@@ -703,7 +910,12 @@ fn collect_local_tree<'a>(
     >,
 > {
     Box::pin(async move {
-        // Best-effort: the directory may already exist on the remote.
+        // SFTP has no "already exists" status code — servers return generic
+        // Failure(4) for an existing dir, so we can't distinguish it from a
+        // real error here. Silently ignore the result: if the dir truly can't
+        // be created, the subsequent file uploads will fail with a clear error.
+        // Channel exhaustion (the historic cause of silent failures here) is now
+        // prevented by the connection-level `channel_sem` semaphore.
         let _ = session.create_dir(remote_dir).await;
         let mut files = Vec::new();
         let mut rd = tokio::fs::read_dir(local_dir).await?;
@@ -1070,7 +1282,7 @@ mod tests {
             }
             (last, monotonic)
         });
-        let uploaded = transfer_files(&session, Direction::Upload, &up_files, uptx)
+        let uploaded = transfer_files(&session, Direction::Upload, &up_files, uptx, Arc::new(std::sync::atomic::AtomicU8::new(0)))
             .await
             .expect("upload tree");
         let (up_last, up_monotonic) = up_progress.await.unwrap();
@@ -1103,7 +1315,7 @@ mod tests {
             }
             last
         });
-        let downloaded = transfer_files(&session, Direction::Download, &down_files, dntx)
+        let downloaded = transfer_files(&session, Direction::Download, &down_files, dntx, Arc::new(std::sync::atomic::AtomicU8::new(0)))
             .await
             .expect("download tree");
         let dn_last = dn_progress.await.unwrap();

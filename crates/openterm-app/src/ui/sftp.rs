@@ -272,6 +272,31 @@ fn path_field<'a>(
         .into()
 }
 
+/// A small button used inside a transfer row. `danger` tints it red (Cancel).
+fn ctrl_button(label: &str, on_press: Message, danger: bool) -> Element<'_, Message> {
+    button(text(label.to_string()).size(10).color(if danger {
+        theme::status_error()
+    } else {
+        theme::text_high()
+    }))
+    .padding([3, 8])
+    .on_press(on_press)
+    .style(move |_, status| {
+        let hovered = matches!(status, button::Status::Hovered);
+        button::Style {
+            background: Some(if hovered { theme::surface_3() } else { theme::surface_2() }.into()),
+            text_color: if danger { theme::status_error() } else { theme::text_high() },
+            border: Border {
+                color: theme::border_subtle(),
+                width: 1.0,
+                radius: 5.0.into(),
+            },
+            ..Default::default()
+        }
+    })
+    .into()
+}
+
 fn nav_button(label: &str, on_press: Message) -> Element<'_, Message> {
     let primary = label == "Upload" || label == "Download";
     button(text(label.to_string()).size(12).color(if primary {
@@ -532,6 +557,29 @@ fn transfer_row(t: &Transfer) -> Element<'_, Message> {
             )
             .width(Length::Fixed(160.0));
 
+            // Time readout: elapsed always; ETA when it can be estimated.
+            // e.g. "0:12 · ETA 0:47" or just "0:12" before the first estimate.
+            let time_label = match t.eta_secs() {
+                Some(eta) => format!(
+                    "{} · ETA {}",
+                    fmt_duration(t.elapsed().as_secs_f64()),
+                    fmt_duration(eta)
+                ),
+                None => fmt_duration(t.elapsed().as_secs_f64()),
+            };
+
+            // While a pause is pending (worker still draining), show "Pausing…"
+            // and disable the Pause button so it reads as acknowledged.
+            let pause_ctrl: Element<'_, Message> = if t.pause_requested {
+                text("Pausing…")
+                    .font(theme::TERMINAL_FONT)
+                    .size(10)
+                    .color(theme::status_warn())
+                    .into()
+            } else {
+                ctrl_button("Pause", Message::TransferPause(t.id), false)
+            };
+
             row![
                 text(pct_label)
                     .font(theme::TERMINAL_FONT)
@@ -549,15 +597,43 @@ fn transfer_row(t: &Transfer) -> Element<'_, Message> {
                     .size(11)
                     .color(theme::accent())
                     .width(Length::Fixed(80.0)),
+                text(time_label)
+                    .font(theme::TERMINAL_FONT)
+                    .size(11)
+                    .color(theme::text_muted())
+                    .width(Length::Fixed(130.0)),
+                pause_ctrl,
+                ctrl_button("Cancel", Message::TransferCancel(t.id), true),
             ]
             .spacing(8)
             .align_y(iced::Alignment::Center)
             .into()
         }
-        TransferStatus::Done => text(format!("Done · {}", human_size(t.total)))
-            .size(11)
-            .color(theme::status_ok())
-            .into(),
+        TransferStatus::Paused => row![
+            text("Paused")
+                .font(theme::TERMINAL_FONT)
+                .size(11)
+                .color(theme::status_warn())
+                .width(Length::Fixed(52.0)),
+            text(format!("{} / {}", human_size(t.transferred), human_size(t.total)))
+                .font(theme::TERMINAL_FONT)
+                .size(11)
+                .color(theme::text_muted())
+                .width(Length::Fixed(120.0)),
+            ctrl_button("Resume", Message::TransferResume(t.id), false),
+            ctrl_button("Cancel", Message::TransferCancel(t.id), true),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center)
+        .into(),
+        TransferStatus::Done => text(format!(
+            "Done · {} · {}",
+            human_size(t.total),
+            fmt_duration(t.elapsed().as_secs_f64())
+        ))
+        .size(11)
+        .color(theme::status_ok())
+        .into(),
         TransferStatus::Failed(e) => text(format!("Failed: {e}"))
             .size(11)
             .color(theme::status_error())
@@ -601,6 +677,20 @@ fn speed_label(bps: f64) -> String {
         return String::new();
     }
     format!("{}/s", human_size(bps as u64))
+}
+
+/// Format a duration in seconds as a compact clock: "0:07", "1:23", or
+/// "1:02:33" once it passes an hour.
+fn fmt_duration(secs: f64) -> String {
+    let total = secs.max(0.0).round() as u64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
 }
 
 // --- name prompt overlay (new folder / rename) ---
@@ -905,22 +995,39 @@ fn action_btn(label: &str, primary: bool, on_press: Message) -> Element<'_, Mess
 /// Format a Unix mode word (lower 12 bits) as `rwxr-xr-x`.
 fn fmt_mtime(ts: u32) -> String {
     const MONTHS: [&str; 12] = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
-    let s = ts as u64;
-    let h = (s % 86400) / 3600;
-    let m = (s % 3600) / 60;
-    // Gregorian approximation good enough for display.
-    let days = s / 86400 + 719468;
-    let era = days / 146097;
-    let doe = days % 146097;
-    let yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365*yoe + yoe/4 - yoe/100);
-    let mp = (5*doy + 2) / 153;
-    let d = doy - (153*mp + 2)/5 + 1;
-    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if mo <= 2 { y + 1 } else { y };
-    let _ = y;
-    format!("{} {:2} {:02}:{:02}", MONTHS[(mo as usize).saturating_sub(1).min(11)], d, h, m)
+    // Convert the SFTP Unix timestamp to local time using the system timezone
+    // (respects TZ env var / /etc/localtime), so users in e.g. CST+8 see
+    // local time instead of UTC.
+    #[cfg(unix)]
+    {
+        let t = ts as libc::time_t;
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        unsafe { libc::localtime_r(&t, &mut tm); }
+        let mo = (tm.tm_mon as usize).min(11); // 0-based
+        return format!(
+            "{} {:2} {:02}:{:02}",
+            MONTHS[mo],
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min,
+        );
+    }
+    // Fallback for non-unix builds: keep the old UTC approximation.
+    #[cfg(not(unix))]
+    {
+        let s = ts as u64;
+        let h = (s % 86400) / 3600;
+        let m = (s % 3600) / 60;
+        let days = s / 86400 + 719468;
+        let era = days / 146097;
+        let doe = days % 146097;
+        let yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+        let doy = doe - (365*yoe + yoe/4 - yoe/100);
+        let mp = (5*doy + 2) / 153;
+        let d = doy - (153*mp + 2)/5 + 1;
+        let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+        format!("{} {:2} {:02}:{:02}", MONTHS[(mo as usize).saturating_sub(1).min(11)], d, h, m)
+    }
 }
 
 fn fmt_mode(mode: u32) -> String {

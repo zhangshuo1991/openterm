@@ -265,6 +265,7 @@ impl RusshBackend {
             handle,
             jump_handle: None,
             remote_forward_sender,
+            channel_sem: Arc::new(tokio::sync::Semaphore::new(6)),
         })
     }
 
@@ -337,6 +338,7 @@ impl RusshBackend {
             handle,
             jump_handle: Some(jump.handle),
             remote_forward_sender,
+            channel_sem: Arc::new(tokio::sync::Semaphore::new(6)),
         })
     }
 
@@ -691,6 +693,32 @@ pub struct RusshSession {
     handle: client::Handle<ClientHandler>,
     jump_handle: Option<client::Handle<ClientHandler>>,
     remote_forward_sender: Arc<Mutex<Option<mpsc::Sender<RemoteForwardChannel>>>>,
+    /// Limits concurrent SSH channels so we never exceed the server's
+    /// MaxSessions cap (OpenSSH default = 10). Every method that opens a
+    /// channel acquires a permit for the channel's lifetime.
+    channel_sem: Arc<tokio::sync::Semaphore>,
+}
+
+/// An SFTP session paired with the channel semaphore permit that guards it.
+/// Dropping (or calling `.close()`) releases both the SFTP session and the
+/// permit, making the slot available for the next caller.
+struct SftpHandle {
+    inner: SftpSession,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl SftpHandle {
+    async fn close(self) -> Result<(), russh_sftp::client::error::Error> {
+        self.inner.close().await
+        // _permit drops here, freeing the channel slot
+    }
+}
+
+impl std::ops::Deref for SftpHandle {
+    type Target = SftpSession;
+    fn deref(&self) -> &SftpSession {
+        &self.inner
+    }
 }
 
 pub struct RusshPtyChannel {
@@ -783,6 +811,12 @@ impl RusshSession {
     /// and SFTP), so an `Arc<RusshSession>` can sample remote state — e.g. the
     /// resource monitor reading `/proc` — without disturbing the interactive PTY.
     pub async fn exec_capture(&self, command: &str) -> Result<ExecOutput, SshError> {
+        let _permit = self
+            .channel_sem
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("channel semaphore closed");
         let mut channel = self.handle.channel_open_session().await?;
         channel.exec(true, command).await?;
 
@@ -921,6 +955,24 @@ impl RusshSession {
         Ok(exit_status)
     }
 
+    /// Open an SFTP subsystem channel, acquiring one slot from the connection-level
+    /// channel semaphore. The permit is released when the returned `SftpHandle` is
+    /// dropped (or closed), so callers MUST call `.close()` or let it drop when done.
+    async fn open_sftp_guarded(&self) -> Result<SftpHandle, SshError> {
+        let _permit = self
+            .channel_sem
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("channel semaphore closed");
+        let channel = self.handle.channel_open_session().await?;
+        channel.request_subsystem(true, "sftp").await?;
+        let inner = SftpSession::new(channel.into_stream()).await?;
+        Ok(SftpHandle { inner, _permit })
+    }
+
+    /// Public entry point kept for external users (e.g. tests). Internally
+    /// prefer `open_sftp_guarded` so the semaphore is always respected.
     pub async fn open_sftp(&self) -> Result<SftpSession, SshError> {
         let channel = self.handle.channel_open_session().await?;
         channel.request_subsystem(true, "sftp").await?;
@@ -929,14 +981,14 @@ impl RusshSession {
 
     /// Resolve a (possibly relative) remote path to its absolute form.
     pub async fn canonicalize(&self, path: &str) -> Result<String, SshError> {
-        let sftp = self.open_sftp().await?;
+        let sftp = self.open_sftp_guarded().await?;
         let result = sftp.canonicalize(path).await.map_err(SshError::from);
         let _ = sftp.close().await;
         result
     }
 
     pub async fn list_dir(&self, path: &str) -> Result<Vec<RemoteFileEntry>, SshError> {
-        let sftp = self.open_sftp().await?;
+        let sftp = self.open_sftp_guarded().await?;
         let result: Result<Vec<RemoteFileEntry>, SshError> = async {
             let mut entries = sftp
                 .read_dir(path)
@@ -965,7 +1017,7 @@ impl RusshSession {
     }
 
     pub async fn read_file(&self, remote_path: &str) -> Result<Vec<u8>, SshError> {
-        let sftp = self.open_sftp().await?;
+        let sftp = self.open_sftp_guarded().await?;
         let result = sftp.read(remote_path).await.map_err(SshError::from);
         let _ = sftp.close().await;
         result
@@ -973,7 +1025,7 @@ impl RusshSession {
 
     /// Read `len` bytes starting at `offset` from a remote file.
     pub async fn read_file_range(&self, remote_path: &str, offset: u64, len: u64) -> Result<(Vec<u8>, u64), SshError> {
-        let sftp = self.open_sftp().await?;
+        let sftp = self.open_sftp_guarded().await?;
         let result: Result<(Vec<u8>, u64), SshError> = async {
             let total = sftp.metadata(remote_path).await?.size.unwrap_or(0);
             let mut file = sftp.open(remote_path).await?;
@@ -994,7 +1046,7 @@ impl RusshSession {
     }
 
     pub async fn write_file(&self, remote_path: &str, bytes: Vec<u8>) -> Result<(), SshError> {
-        let sftp = self.open_sftp().await?;
+        let sftp = self.open_sftp_guarded().await?;
         let result: Result<(), SshError> = async {
             let mut file = sftp.create(remote_path).await?;
             file.write_all(&bytes).await?;
@@ -1007,7 +1059,7 @@ impl RusshSession {
 
     /// Size of a remote file in bytes (0 if unknown).
     pub async fn remote_file_size(&self, remote_path: &str) -> Result<u64, SshError> {
-        let sftp = self.open_sftp().await?;
+        let sftp = self.open_sftp_guarded().await?;
         let result = sftp.metadata(remote_path).await.map(|m| m.size.unwrap_or(0)).map_err(SshError::from);
         let _ = sftp.close().await;
         result
@@ -1030,12 +1082,21 @@ impl RusshSession {
         remote_path: &str,
         local_path: &std::path::Path,
         progress: mpsc::Sender<u64>,
+        stop: Arc<std::sync::atomic::AtomicU8>,
     ) -> Result<u64, SshError> {
         use std::os::unix::fs::FileExt;
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
         const CHUNK: u64 = 256 * 1024;
         const WINDOW: usize = 16;
+
+        // Acquire a channel slot before opening the raw SFTP subsystem.
+        let _chan_permit = self
+            .channel_sem
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("channel semaphore closed");
 
         // A dedicated SFTP channel as a RawSftpSession for positioned reads.
         let channel = self.handle.channel_open_session().await?;
@@ -1082,12 +1143,28 @@ impl RusshSession {
             })
         };
 
+        // The highest contiguous offset we've finished spawning work for. When
+        // a stop is requested we drain the in-flight window, so everything in
+        // `[resume, contiguous_end)` is guaranteed written — the `.part` is
+        // then truncated to that watermark so a later resume starts clean
+        // (windowed writes could otherwise leave holes past this point).
+        let mut contiguous_end = resume;
+        let mut stopped = false;
+
         let outcome: Result<(), SshError> = async {
             if total > resume {
                 let sem = Arc::new(tokio::sync::Semaphore::new(WINDOW));
                 let mut set = tokio::task::JoinSet::new();
                 let mut off = resume;
                 while off < total {
+                    // Cooperative stop: quit spawning new chunks, then fall
+                    // through to drain whatever is already in flight. A nonzero
+                    // stop token means pause or cancel (both stop here; the
+                    // caller decides what to do with the `.part`).
+                    if stop.load(Ordering::Relaxed) != 0 {
+                        stopped = true;
+                        break;
+                    }
                     let end = (off + CHUNK).min(total);
                     let permit = sem.clone().acquire_owned().await.expect("semaphore");
                     let (raw, handle, file, counter) =
@@ -1109,6 +1186,7 @@ impl RusshSession {
                         Ok::<(), SshError>(())
                     });
                     off = end;
+                    contiguous_end = off;
                 }
                 while let Some(joined) = set.join_next().await {
                     joined.map_err(|e| std::io::Error::other(format!("download task failed: {e}")))??;
@@ -1123,6 +1201,16 @@ impl RusshSession {
         let _ = raw.close(handle).await;
         let _ = raw.close_session();
         outcome?;
+
+        if stopped {
+            // Paused/cancelled: keep the `.part` as a clean resumable prefix
+            // (truncate off any holes past the contiguous watermark). Do NOT
+            // promote to the final name.
+            file.set_len(contiguous_end)?;
+            file.sync_all()?;
+            drop(file);
+            return Ok(contiguous_end);
+        }
 
         // Flush to disk and promote `.part` → final (overwriting any old file).
         file.sync_all()?;
@@ -1142,8 +1230,10 @@ impl RusshSession {
         local_path: &std::path::Path,
         remote_path: &str,
         progress: mpsc::Sender<u64>,
+        stop: Arc<std::sync::atomic::AtomicU8>,
     ) -> Result<u64, SshError> {
-        let sftp = self.open_sftp().await?;
+        use std::sync::atomic::Ordering;
+        let sftp = self.open_sftp_guarded().await?;
         let result: Result<u64, SshError> = async {
             let total = tokio::fs::metadata(local_path).await.map(|m| m.len()).unwrap_or(0);
             let part = format!("{remote_path}.part");
@@ -1164,7 +1254,15 @@ impl RusshSession {
             let mut transferred = resume;
             let _ = progress.send(transferred).await;
             let mut buffer = vec![0_u8; 256 * 1024];
+            let mut stopped = false;
             loop {
+                // Cooperative stop: the sequential loop breaks at a clean byte
+                // boundary; the `.part` on the remote is a valid prefix that a
+                // later resume continues from. Nonzero token = pause or cancel.
+                if stop.load(Ordering::Relaxed) != 0 {
+                    stopped = true;
+                    break;
+                }
                 let read = local.read(&mut buffer).await?;
                 if read == 0 { break; }
                 remote.write_all(&buffer[..read]).await?;
@@ -1173,6 +1271,10 @@ impl RusshSession {
             }
             remote.flush().await?;
             remote.shutdown().await?;
+            if stopped {
+                // Leave `.part` in place for resume; don't promote to final.
+                return Ok(transferred);
+            }
             let _ = sftp.remove_file(remote_path).await;
             sftp.rename(&part, remote_path).await?;
             Ok(transferred)
@@ -1182,7 +1284,7 @@ impl RusshSession {
     }
 
     pub async fn create_dir(&self, remote_path: &str) -> Result<(), SshError> {
-        let sftp = self.open_sftp().await?;
+        let sftp = self.open_sftp_guarded().await?;
         let result = sftp.create_dir(remote_path).await.map_err(SshError::from);
         let _ = sftp.close().await;
         result
@@ -1193,7 +1295,7 @@ impl RusshSession {
         remote_path: &str,
         kind: RemoteFileKind,
     ) -> Result<(), SshError> {
-        let sftp = self.open_sftp().await?;
+        let sftp = self.open_sftp_guarded().await?;
         let result = match kind {
             RemoteFileKind::Directory => remove_dir_recursive(&sftp, remote_path).await,
             RemoteFileKind::File | RemoteFileKind::Symlink | RemoteFileKind::Other => {
@@ -1205,7 +1307,7 @@ impl RusshSession {
     }
 
     pub async fn rename_path(&self, old_path: &str, new_path: &str) -> Result<(), SshError> {
-        let sftp = self.open_sftp().await?;
+        let sftp = self.open_sftp_guarded().await?;
         let result = sftp.rename(old_path, new_path).await.map_err(SshError::from);
         let _ = sftp.close().await;
         result
@@ -1213,7 +1315,7 @@ impl RusshSession {
 
     /// Change the permissions of a remote file (SFTP setstat).
     pub async fn chmod_path(&self, path: &str, mode: u32) -> Result<(), SshError> {
-        let sftp = self.open_sftp().await?;
+        let sftp = self.open_sftp_guarded().await?;
         let mut attrs = FileAttributes::default();
         attrs.permissions = Some(mode);
         let result = sftp.set_metadata(path, attrs).await.map_err(SshError::from);

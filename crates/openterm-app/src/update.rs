@@ -554,6 +554,34 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             start_download(app);
             Task::none()
         }
+        Message::TransferPause(id) => {
+            // Optimistic feedback: mark "Pausing…" immediately so the row reacts
+            // to the click even though the worker must drain in-flight chunks
+            // before it confirms with TransferPaused.
+            if let Some(session) = app.active_session_mut() {
+                if let Some(t) = session.transfers.iter_mut().find(|t| t.id == id) {
+                    if t.status == crate::session::TransferStatus::Active {
+                        t.pause_requested = true;
+                    }
+                }
+            }
+            transfer_control(app, id, crate::connection::Command::SftpPauseTransfer { id });
+            Task::none()
+        }
+        Message::TransferCancel(id) => {
+            // Optimistic feedback: drop the row now; the worker removes the
+            // `.part` and emits TransferCanceled (a no-op for the already-gone
+            // row). Works whether the transfer is active or paused.
+            if let Some(session) = app.active_session_mut() {
+                session.transfers.retain(|t| t.id != id);
+            }
+            transfer_control(app, id, crate::connection::Command::SftpCancelTransfer { id });
+            Task::none()
+        }
+        Message::TransferResume(id) => {
+            resume_transfer(app, id);
+            Task::none()
+        }
         Message::SftpDeleteRemoteSelected => {
             delete_remote_selected(app);
             Task::none()
@@ -2142,6 +2170,66 @@ fn start_upload(app: &mut App) {
     app.next_transfer_id += queued;
 }
 
+/// Send a pause/cancel command for a transfer to the active session's worker.
+fn transfer_control(app: &mut App, _id: u64, command: crate::connection::Command) {
+    if let Some(session) = app.active_session() {
+        if let Some(tx) = &session.cmd_tx {
+            let _ = tx.try_send(command);
+        }
+    }
+}
+
+/// Resume a paused transfer by re-issuing the original download/upload command
+/// with the same id. The `.part` scratch on disk drives the resume offset, so
+/// the worker picks up where it left off.
+fn resume_transfer(app: &mut App, id: u64) {
+    let Some(session) = app.active_session_mut() else {
+        return;
+    };
+    let Some(t) = session.transfers.iter_mut().find(|t| t.id == id) else {
+        return;
+    };
+    if t.status != crate::session::TransferStatus::Paused {
+        return;
+    }
+    // Flip the row back to Active; the worker will emit fresh progress.
+    t.status = crate::session::TransferStatus::Active;
+    t.finished_at = None;
+    t.speed_bps = 0.0;
+    t.pause_requested = false;
+    let (direction, name, remote, local, size, is_dir) = (
+        t.direction,
+        t.name.clone(),
+        t.remote.clone(),
+        t.local.clone(),
+        t.total,
+        t.is_dir,
+    );
+    if let Some(tx) = &session.cmd_tx {
+        let command = match direction {
+            crate::connection::Direction::Download => crate::connection::Command::SftpDownload {
+                id,
+                name,
+                remote,
+                local,
+                // Total is already known; pass it so the bar keeps its total.
+                // The `.part` on disk is what actually drives the resume offset.
+                size,
+                is_dir,
+            },
+            crate::connection::Direction::Upload => crate::connection::Command::SftpUpload {
+                id,
+                name,
+                local,
+                remote,
+                size,
+                is_dir,
+            },
+        };
+        let _ = tx.try_send(command);
+    }
+}
+
 /// Delete all selected remote entries over the live connection.
 fn delete_remote_selected(app: &mut App) {
     if let Some(session) = app.active_session() {
@@ -2545,23 +2633,42 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
             name,
             direction,
             total,
+            remote,
+            local,
+            is_dir,
             ..
         } => {
             crate::smoke::record(&smoke, "transfer_started");
-            session.transfers.insert(
-                0,
-                crate::session::Transfer {
-                    id,
-                    name,
-                    direction,
-                    total,
-                    transferred: 0,
-                    speed_bps: 0.0,
-                    status: crate::session::TransferStatus::Active,
-                },
-            );
-            // Cap history length.
-            session.transfers.truncate(40);
+            // A resume re-issues TransferStarted with the same id: update the
+            // existing row in place rather than inserting a duplicate.
+            if let Some(t) = session.transfers.iter_mut().find(|t| t.id == id) {
+                t.status = crate::session::TransferStatus::Active;
+                t.finished_at = None;
+                if total > 0 {
+                    t.total = total;
+                }
+            } else {
+                session.transfers.insert(
+                    0,
+                    crate::session::Transfer {
+                        id,
+                        name,
+                        direction,
+                        total,
+                        transferred: 0,
+                        speed_bps: 0.0,
+                        status: crate::session::TransferStatus::Active,
+                        started_at: std::time::Instant::now(),
+                        finished_at: None,
+                        remote,
+                        local,
+                        is_dir,
+                        pause_requested: false,
+                    },
+                );
+                // Cap history length.
+                session.transfers.truncate(40);
+            }
         }
         ConnEvent::TransferProgress {
             id,
@@ -2585,11 +2692,31 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
                         }
                         t.speed_bps = 0.0;
                         t.status = crate::session::TransferStatus::Done;
+                        t.finished_at = Some(std::time::Instant::now());
                     }
-                    Err(e) => t.status = crate::session::TransferStatus::Failed(e),
+                    Err(e) => {
+                        t.status = crate::session::TransferStatus::Failed(e);
+                        t.finished_at = Some(std::time::Instant::now());
+                    }
                 }
             }
             // A finished transfer changes both panes (new file present).
+            session.refresh_local(sort, sort_asc);
+            return sftp_refresh(app);
+        }
+        ConnEvent::TransferPaused { id, transferred, .. } => {
+            if let Some(t) = session.transfers.iter_mut().find(|t| t.id == id) {
+                t.transferred = transferred;
+                t.speed_bps = 0.0;
+                t.status = crate::session::TransferStatus::Paused;
+                t.pause_requested = false;
+                t.finished_at = Some(std::time::Instant::now());
+            }
+        }
+        ConnEvent::TransferCanceled { id, .. } => {
+            // Drop the row entirely — the `.part` scratch was removed worker-side.
+            session.transfers.retain(|t| t.id != id);
+            // A cancelled upload may have left/removed a remote `.part`; refresh.
             session.refresh_local(sort, sort_asc);
             return sftp_refresh(app);
         }

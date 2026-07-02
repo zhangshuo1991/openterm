@@ -124,6 +124,12 @@ pub enum Message {
     SftpParentDir,
     SftpDownloadSelected,
     SftpDeleteRemoteSelected,
+    /// Pause an active transfer (keeps its `.part` for resume).
+    TransferPause(u64),
+    /// Resume a paused transfer (re-issues the original download/upload).
+    TransferResume(u64),
+    /// Cancel a transfer and delete its `.part` scratch.
+    TransferCancel(u64),
     // Local pane
     SftpLocalPathChanged(String),
     SftpSelectLocal(usize),

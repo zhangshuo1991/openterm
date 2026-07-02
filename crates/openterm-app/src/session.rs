@@ -1033,13 +1033,60 @@ pub struct Transfer {
     pub transferred: u64,
     pub speed_bps: f64,
     pub status: TransferStatus,
+    /// When the transfer began (for elapsed time + ETA).
+    pub started_at: std::time::Instant,
+    /// When it finished (Done/Failed) — freezes the elapsed clock. `None`
+    /// while still active.
+    pub finished_at: Option<std::time::Instant>,
+    /// Resolved remote path — kept so a paused transfer can be resumed by
+    /// re-issuing the original download/upload command.
+    pub remote: String,
+    /// Resolved local path (same purpose as `remote`).
+    pub local: String,
+    /// Whether this transfer is a whole directory tree.
+    pub is_dir: bool,
+    /// True between clicking Pause and the worker confirming the pause (the
+    /// worker must drain in-flight chunks first). Shows "Pausing…" so the row
+    /// gives instant feedback instead of looking unresponsive.
+    pub pause_requested: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransferStatus {
     Active,
+    /// Paused at a safe point; the `.part` is preserved. Holds the byte count
+    /// reached, so resume can show where it left off.
+    Paused,
     Done,
     Failed(String),
+}
+
+impl Transfer {
+    /// Wall-clock time the transfer has run: live while active, frozen once
+    /// finished.
+    pub fn elapsed(&self) -> std::time::Duration {
+        let end = self.finished_at.unwrap_or_else(std::time::Instant::now);
+        end.saturating_duration_since(self.started_at)
+    }
+
+    /// Estimated seconds remaining, based on *average* throughput so far
+    /// (steadier than the instantaneous speed). `None` when the total is
+    /// unknown, nothing has transferred yet, or the transfer is complete.
+    pub fn eta_secs(&self) -> Option<f64> {
+        if self.total == 0 || self.transferred >= self.total || self.transferred == 0 {
+            return None;
+        }
+        let elapsed = self.elapsed().as_secs_f64();
+        if elapsed <= 0.0 {
+            return None;
+        }
+        let avg_bps = self.transferred as f64 / elapsed;
+        if avg_bps <= 0.0 {
+            return None;
+        }
+        let remaining = (self.total - self.transferred) as f64;
+        Some(remaining / avg_bps)
+    }
 }
 
 impl Session {
