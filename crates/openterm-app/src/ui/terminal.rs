@@ -4,8 +4,8 @@
 //! overflows vertically.
 
 use iced::advanced::widget;
-use iced::widget::{button, canvas, container, mouse_area, row, stack, text, text_input};
-use iced::{mouse, Alignment, Border, Color, Element, Length};
+use iced::widget::{button, canvas, container, row, stack, text, text_input};
+use iced::{Alignment, Border, Color, Element, Length};
 use once_cell::sync::Lazy;
 use openterm_terminal::TerminalEngine;
 
@@ -32,6 +32,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
         snapshot: session.terminal.snapshot(),
         font_size: app.font_size,
         selection: session.selection,
+        mouse: session.terminal.mouse_protocol(),
         search_query: query.to_lowercase(),
         search_current: app.terminal_search_idx,
         cursor_shape: app.cursor_shape(),
@@ -39,18 +40,13 @@ pub fn view(app: &App) -> Element<'_, Message> {
         inline_suggestion: session.inline_suggestion.clone().unwrap_or_default(),
     };
 
+    // Wheel handling lives inside the canvas `update` (so mouse-reporting apps
+    // like vim/tmux receive wheel escape sequences, and local scroll still
+    // works otherwise), so no `mouse_area` scroll wrapper is needed here.
     let surface = canvas(program).width(Length::Fill).height(Length::Fill);
 
-    let scrollable_surface = mouse_area(surface).on_scroll(|delta| {
-        let lines = match delta {
-            mouse::ScrollDelta::Lines { y, .. } => y,
-            mouse::ScrollDelta::Pixels { y, .. } => y / 16.0,
-        };
-        Message::TerminalScroll(lines)
-    });
-
     // Wrap in ImeEnabled so winit activates the OS input method (Chinese/Japanese/Korean).
-    let ime_surface: Element<'_, Message> = super::ime::ImeEnabled::new(scrollable_surface).into();
+    let ime_surface: Element<'_, Message> = super::ime::ImeEnabled::new(surface).into();
 
     let body = container(ime_surface)
         .width(Length::Fill)
@@ -61,7 +57,9 @@ pub fn view(app: &App) -> Element<'_, Message> {
             ..Default::default()
         });
 
-    // Overlay the search bar in the top-right when search is open.
+    // Overlays: search bar (top-right) and/or the right-click context menu.
+    let mut layers: Vec<Element<'_, Message>> = vec![body.into()];
+
     if app.terminal_search.is_some() {
         let bar = search_bar(query);
         let overlay = container(bar)
@@ -70,10 +68,72 @@ pub fn view(app: &App) -> Element<'_, Message> {
             .align_x(Alignment::End)
             .align_y(Alignment::Start)
             .padding([10, 18]);
-        stack![body, overlay].into()
-    } else {
-        body.into()
+        layers.push(overlay.into());
     }
+
+    if let Some((mx, my)) = app.terminal_menu {
+        let has_selection = session.selection.is_some();
+        // Position the menu near the click using left/top padding. Clamp so it
+        // stays on-screen-ish even near the right/bottom edges.
+        let left = (mx + 14.0).clamp(0.0, 2000.0);
+        let top = (my + 6.0).clamp(0.0, 2000.0);
+        let menu = container(context_menu(has_selection))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Alignment::Start)
+            .align_y(Alignment::Start)
+            .padding(iced::Padding { top, right: 0.0, bottom: 0.0, left });
+        layers.push(menu.into());
+    }
+
+    if layers.len() == 1 {
+        layers.pop().unwrap()
+    } else {
+        stack(layers).into()
+    }
+}
+
+/// The terminal right-click context menu: Copy (when a selection exists),
+/// Paste, Select All, Clear.
+fn context_menu<'a>(has_selection: bool) -> Element<'a, Message> {
+    let mut col = iced::widget::column![].spacing(1);
+    if has_selection {
+        col = col.push(menu_item("Copy", Message::TerminalCopy));
+    }
+    col = col
+        .push(menu_item("Paste", Message::PasteRequested))
+        .push(menu_item("Select All", Message::TerminalSelectAll))
+        .push(menu_item("Clear", Message::ClearTerminal));
+
+    container(col)
+        .padding(4)
+        .style(|_| container::Style {
+            background: Some(theme::surface_2().into()),
+            border: Border {
+                color: theme::border_strong(),
+                width: 1.0,
+                radius: 8.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
+fn menu_item<'a>(label: &'a str, msg: Message) -> Element<'a, Message> {
+    button(text(label).size(12).color(theme::text_high()))
+        .width(Length::Fixed(140.0))
+        .padding([5, 10])
+        .on_press(msg)
+        .style(|_, status| {
+            let hovered = matches!(status, button::Status::Hovered);
+            button::Style {
+                background: Some(if hovered { theme::surface_3() } else { Color::TRANSPARENT }.into()),
+                text_color: theme::text_high(),
+                border: Border { radius: 5.0.into(), ..Default::default() },
+                ..Default::default()
+            }
+        })
+        .into()
 }
 
 fn search_bar(query: &str) -> Element<'_, Message> {

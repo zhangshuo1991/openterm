@@ -240,6 +240,51 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
 
         // --- Terminal ---
         Message::TerminalInput(bytes) => terminal_input(app, bytes),
+        Message::TerminalWriteRaw(bytes) => {
+            // Straight to the PTY — no snippet/suggestion/scroll side effects.
+            if let Some(session) = app.active_session() {
+                if let Some(tx) = &session.cmd_tx {
+                    let _ = tx.try_send(Command::Write(bytes));
+                }
+            }
+            Task::none()
+        }
+        Message::OpenUrl(url) => {
+            // Only allow http/https to reach the OS opener, so a crafted
+            // "file://" or other scheme in remote output can't trigger
+            // something unexpected on click.
+            if url.starts_with("http://") || url.starts_with("https://") {
+                #[cfg(target_os = "macos")]
+                let _ = std::process::Command::new("open").arg(&url).spawn();
+                #[cfg(all(unix, not(target_os = "macos")))]
+                let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+                app.status = format!("Opening {url}");
+            }
+            Task::none()
+        }
+        Message::TerminalSelectAll => {
+            app.terminal_menu = None;
+            // Select the whole visible grid: (0,0) to (last_col, last_row).
+            if let Some(session) = app.active_session_mut() {
+                let snap = session.terminal.snapshot();
+                let last_row = snap.cells.len().saturating_sub(1);
+                let last_col = snap
+                    .cells
+                    .get(last_row)
+                    .map(|r| r.len().saturating_sub(1))
+                    .unwrap_or(0);
+                session.selection = Some((0, 0, last_col, last_row));
+            }
+            Task::none()
+        }
+        Message::TerminalOpenMenu(x, y) => {
+            app.terminal_menu = Some((x, y));
+            Task::none()
+        }
+        Message::TerminalCloseMenu => {
+            app.terminal_menu = None;
+            Task::none()
+        }
         Message::TerminalScroll(lines) => {
             if let Some(session) = app.active_session_mut() {
                 // Wheel up (positive) scrolls toward older output.
@@ -255,14 +300,20 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             apply_grid(app)
         }
         Message::TerminalAreaResized(_) => apply_grid(app),
-        Message::PasteRequested => clipboard::read().map(Message::PasteReady),
+        Message::PasteRequested => {
+            app.terminal_menu = None;
+            clipboard::read().map(Message::PasteReady)
+        }
         Message::SelectionChanged(sel) => {
+            // A fresh click/drag on the canvas also dismisses the context menu.
+            app.terminal_menu = None;
             if let Some(session) = app.active_session_mut() {
                 session.selection = sel;
             }
             Task::none()
         }
         Message::TerminalCopy => {
+            app.terminal_menu = None;
             let text = app.active_session().and_then(|s| {
                 let (c1, r1, c2, r2) = s.selection?;
                 let snap = s.terminal.snapshot();
@@ -294,6 +345,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::PasteReady(None) => Task::none(),
         Message::ClearTerminal => {
+            app.terminal_menu = None;
             if let Some(session) = app.active_session_mut() {
                 session.clear_grid();
             }
@@ -1112,10 +1164,16 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                     let entering_edit = fv.mode != crate::session::ViewerMode::Edit;
                     fv.mode = if entering_edit {
                         // Populate the text_editor from current content.
-                        let text = match &fv.content {
+                        // Normalize CRLF/CR → LF first: iced's editor backend
+                        // (cosmic-text) treats a lone '\r' as its own line
+                        // break, so a '\r\n' file would render a blank line
+                        // between every real line ("大量无效换行"). We edit in
+                        // LF and the shell/editors handle LF fine.
+                        let raw = match &fv.content {
                             crate::session::ViewerContent::Loaded(t) => t.clone(),
                             _ => String::new(),
                         };
+                        let text = raw.replace("\r\n", "\n").replace('\r', "\n");
                         fv.editor = iced::widget::text_editor::Content::with_text(&text);
                         crate::session::ViewerMode::Edit
                     } else {
@@ -1910,6 +1968,12 @@ fn load_config_into_slot(app: &mut App, config: SessionConfig) {
         if let Some(session) = app.active_session_mut() {
             session.config = config;
             session.phase = Phase::Idle;
+            // Clear any leftover terminal output from a prior connection so the
+            // view switches back to the connect/edit form. Without this, a
+            // disconnected session keeps its scrollback and `terminal_has_content()`
+            // stays true, so the edit panel never shows (the user had to close the
+            // whole tab to see it).
+            session.clear_grid();
         }
     } else {
         let (cols, rows) = app.current_grid();

@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "OpenTerm 产品功能与技术架构",
+    "subtitle": "离线优先的 SSH 桌面工作台",
+    "output": "openterm-product-intro.html",
+    "viewBox": [1280, 900]
+  },
+  "components": [
+    { "id": "feat-terminal", "type": "frontend", "label": "终端会话", "sublabel": "多标签 PTY / 搜索 / 主题", "pos": [60, 70], "size": [160, 64] },
+    { "id": "feat-hosts", "type": "backend", "label": "主机管理", "sublabel": "侧边栏 / 分组 / 搜索", "pos": [250, 70], "size": [160, 64] },
+    { "id": "feat-auth", "type": "security", "label": "认证方式", "sublabel": "密码 / 密钥 / Agent", "pos": [440, 70], "size": [160, 64] },
+    { "id": "feat-sftp", "type": "cloud", "label": "SFTP 传输", "sublabel": "双窗格文件管理", "pos": [630, 70], "size": [160, 64] },
+    { "id": "feat-forward", "type": "messagebus", "label": "端口转发", "sublabel": "-L / -R / -D / 跳板", "pos": [820, 70], "size": [160, 64] },
+    { "id": "feat-vault", "type": "security", "label": "加密 Vault", "sublabel": "Argon2id + ChaCha20", "pos": [1010, 70], "size": [160, 64] },
+
+    { "id": "use-add", "type": "frontend", "label": "1. 添加主机", "sublabel": "地址 / 用户名", "pos": [80, 290], "size": [140, 56] },
+    { "id": "use-config", "type": "frontend", "label": "2. 配置认证", "sublabel": "密码或私钥", "pos": [270, 290], "size": [140, 56] },
+    { "id": "use-save", "type": "backend", "label": "3. 保存主机", "sublabel": "写入本地 redb", "pos": [460, 290], "size": [140, 56] },
+    { "id": "use-connect", "type": "backend", "label": "4. 一键连接", "sublabel": "SSH 握手 + PTY", "pos": [650, 290], "size": [140, 56] },
+    { "id": "use-session", "type": "frontend", "label": "5. 终端操作", "sublabel": "命令 / SFTP / 转发", "pos": [840, 290], "size": [140, 56] },
+    { "id": "use-reconnect", "type": "frontend", "label": "6. 断开重连", "sublabel": "新 tab 复用配置", "pos": [1030, 290], "size": [140, 56] },
+
+    { "id": "app", "type": "frontend", "label": "openterm-app", "sublabel": "iced GUI 桌面端", "pos": [80, 500], "size": [150, 60] },
+    { "id": "cli", "type": "external", "label": "openterm-cli", "sublabel": "命令行入口", "pos": [80, 620], "size": [150, 60] },
+    { "id": "ui", "type": "backend", "label": "openterm-ui", "sublabel": "UI 状态与壳逻辑", "pos": [300, 500], "size": [150, 60] },
+    { "id": "core", "type": "backend", "label": "openterm-core", "sublabel": "领域模型 / 事件 / 校验", "pos": [500, 500], "size": [150, 60] },
+    { "id": "config", "type": "cloud", "label": "openterm-config", "sublabel": "SSH 配置导入导出", "pos": [700, 500], "size": [150, 60] },
+    { "id": "ssh", "type": "backend", "label": "openterm-ssh", "sublabel": "russh / PTY / SFTP", "pos": [300, 620], "size": [150, 60] },
+    { "id": "terminal", "type": "frontend", "label": "openterm-terminal", "sublabel": "alacritty_terminal", "pos": [500, 620], "size": [150, 60] },
+    { "id": "storage", "type": "database", "label": "openterm-storage", "sublabel": "redb 本地持久化", "pos": [700, 620], "size": [150, 60] },
+    { "id": "crypto", "type": "security", "label": "openterm-crypto", "sublabel": "Argon2id / ChaCha20", "pos": [900, 620], "size": [150, 60] }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "产品功能", "wraps": ["feat-terminal", "feat-hosts", "feat-auth", "feat-sftp", "feat-forward", "feat-vault"] },
+    { "kind": "region", "label": "使用流程", "wraps": ["use-add", "use-config", "use-save", "use-connect", "use-session", "use-reconnect"] },
+    { "kind": "region", "label": "技术架构", "wraps": ["app", "cli", "ui", "core", "config", "ssh", "terminal", "storage", "crypto"] }
+  ],
+  "connections": [
+    { "from": "use-add", "to": "use-config", "variant": "emphasis" },
+    { "from": "use-config", "to": "use-save", "variant": "emphasis" },
+    { "from": "use-save", "to": "use-connect", "variant": "emphasis" },
+    { "from": "use-connect", "to": "use-session", "variant": "emphasis" },
+    { "from": "use-session", "to": "use-reconnect", "variant": "emphasis" },
+
+    { "from": "app", "to": "ui", "variant": "emphasis" },
+    { "from": "cli", "to": "core", "variant": "emphasis" },
+    { "from": "ui", "to": "core", "variant": "emphasis" },
+    { "from": "core", "to": "ssh", "variant": "emphasis" },
+    { "from": "core", "to": "terminal", "variant": "emphasis" },
+    { "from": "core", "to": "storage", "variant": "emphasis" },
+    { "from": "core", "to": "crypto", "variant": "security" },
+    { "from": "core", "to": "config", "variant": "dashed" },
+    { "from": "ssh", "to": "terminal", "variant": "emphasis" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "核心理念", "items": ["离线优先，无需账号", "本地加密存储，零 Telemetry", "Terminal-first 会话型工作台"] },
+    { "dot": "emerald", "title": "关键特性", "items": ["多标签 PTY 终端 + 搜索 + CJK 输入", "双窗格 SFTP、端口转发、跳板主机", "Command Palette (Ctrl/Cmd+K)"] },
+    { "dot": "rose", "title": "安全设计", "items": ["Argon2id + ChaCha20Poly1305 加密 Vault", "known_hosts 指纹校验", "密码永不落地明文"] }
+  ]
+}

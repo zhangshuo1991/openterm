@@ -169,6 +169,8 @@ pub struct App {
     pub terminal_search: Option<String>,
     /// Which visible match is the "current" one (cycles mod match count).
     pub terminal_search_idx: usize,
+    /// Terminal right-click context-menu anchor (canvas-local x, y). None = closed.
+    pub terminal_menu: Option<(f32, f32)>,
 
     // --- Vault master password ---
     /// Whether the credential vault is enabled. When false, secrets use the
@@ -339,6 +341,7 @@ impl App {
             now: Instant::now(),
             terminal_search: None,
             terminal_search_idx: 0,
+            terminal_menu: None,
             vault_enabled: settings.vault_enabled,
             vault_master: None,
             vault_has_canary: false, // will be set below

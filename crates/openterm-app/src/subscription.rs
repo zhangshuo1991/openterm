@@ -37,6 +37,13 @@ pub fn subscription(app: &App) -> Subscription<Message> {
         .active_session()
         .map(|s| s.phase == Phase::Connected)
         .unwrap_or(false);
+    // DECCKM: when the remote app (vim, less, …) requests application cursor
+    // keys, arrows/Home/End must be encoded as ESC O x, not ESC [ x. Read it
+    // here so the (non-capturing) filter_map can pick the right sequence.
+    let app_cursor = app
+        .active_session()
+        .map(|s| s.terminal.mouse_protocol().app_cursor)
+        .unwrap_or(false);
     let palette_open = app.palette_open;
 
     // Vault auto-lock heartbeat: only needed while the vault is enabled.
@@ -152,10 +159,11 @@ pub fn subscription(app: &App) -> Subscription<Message> {
         return Subscription::batch([connections, modifiers, keys, frames, vault_tick]);
     }
 
-    // `with` carries the connected flag into the (non-capturing) filter_map.
+    // `with` carries the connected + app-cursor flags into the (non-capturing)
+    // filter_map so the terminal-byte encoder can pick the right arrow sequence.
     let typing = keyboard::listen()
-        .with(active_connected)
-        .filter_map(|(connected, event)| {
+        .with((active_connected, app_cursor))
+        .filter_map(|((connected, app_cursor), event)| {
             let keyboard::Event::KeyPressed {
                 key,
                 modifiers,
@@ -181,7 +189,8 @@ pub fn subscription(app: &App) -> Subscription<Message> {
                         }
                     }
                 }
-                crate::keys::encode_key(key, modifiers, text.as_deref()).map(Message::TerminalInput)
+                crate::keys::encode_key(key, modifiers, text.as_deref(), app_cursor)
+                    .map(Message::TerminalInput)
             } else {
                 None
             }
@@ -255,6 +264,7 @@ fn app_shortcut(key: &Key, modifiers: Modifiers) -> Option<Message> {
         Key::Character(v) if v.eq_ignore_ascii_case("k") => Some(Message::TogglePalette),
         Key::Character(v) if v.eq_ignore_ascii_case("f") => Some(Message::TerminalSearchOpen),
         Key::Character(v) if v.eq_ignore_ascii_case("c") => Some(Message::TerminalCopy),
+        Key::Character(v) if v.eq_ignore_ascii_case("a") => Some(Message::TerminalSelectAll),
         Key::Character(v) if v.eq_ignore_ascii_case("v") => Some(Message::PasteRequested),
         Key::Character(v) if v.eq_ignore_ascii_case("b") => Some(Message::ToggleSidebar),
         Key::Character(v) if v == "," => Some(Message::OpenSettings),

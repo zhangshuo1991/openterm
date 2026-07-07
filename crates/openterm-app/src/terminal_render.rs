@@ -3,7 +3,7 @@
 use iced::widget::canvas::{self, Action, Event, Frame, Geometry, Path, Text};
 use iced::widget::text::LineHeight;
 use iced::{alignment, mouse, Color, Font, Point, Rectangle, Renderer, Size, Theme};
-use openterm_terminal::{TerminalCell, TerminalColor, TerminalSnapshot};
+use openterm_terminal::{MouseProtocol, TerminalCell, TerminalColor, TerminalSnapshot};
 
 use crate::message::Message;
 use crate::theme;
@@ -100,6 +100,68 @@ fn pos_to_cell(pos: Point, m: Metrics, rows: usize) -> (usize, usize) {
     (col, row.min(rows.saturating_sub(1)))
 }
 
+/// One kind of mouse event we may forward to a remote app.
+#[derive(Debug, Clone, Copy)]
+enum MouseKind {
+    Press,
+    Release,
+    Motion,
+    WheelUp,
+    WheelDown,
+}
+
+/// Encode a mouse event into the escape sequence the active protocol expects
+/// (SGR mode 1006 or legacy X10). `col`/`row` are 0-based cell coordinates;
+/// `base_button` is 0=left, 1=middle, 2=right. Returns `None` when the event
+/// can't be represented (e.g. X10 coords past the 223-cell limit).
+fn encode_mouse_report(
+    proto: MouseProtocol,
+    kind: MouseKind,
+    base_button: u8,
+    col: usize,
+    row: usize,
+    shift: bool,
+    alt: bool,
+    ctrl: bool,
+) -> Option<Vec<u8>> {
+    // Base button code per the xterm protocol.
+    let mut cb: u32 = match kind {
+        MouseKind::WheelUp => 64,
+        MouseKind::WheelDown => 65,
+        MouseKind::Release if !proto.sgr => 3, // X10 can't tell which button released
+        MouseKind::Press | MouseKind::Release => u32::from(base_button),
+        MouseKind::Motion => u32::from(base_button) + 32,
+    };
+    // Modifier bits.
+    if shift { cb += 4; }
+    if alt { cb += 8; }
+    if ctrl { cb += 16; }
+
+    // Coordinates are 1-based on the wire.
+    let cx = col as u32 + 1;
+    let cy = row as u32 + 1;
+
+    if proto.sgr {
+        // ESC [ < Cb ; Cx ; Cy (M for press/motion/wheel, m for release)
+        let final_char = if matches!(kind, MouseKind::Release) { 'm' } else { 'M' };
+        Some(format!("\x1b[<{cb};{cx};{cy}{final_char}").into_bytes())
+    } else {
+        // Legacy X10: ESC [ M  (Cb+32) (Cx+32) (Cy+32), each a single byte.
+        // Cannot encode coordinates beyond 223 (255-32).
+        if cx > 223 || cy > 223 {
+            return None;
+        }
+        Some(vec![
+            0x1b,
+            b'[',
+            b'M',
+            (cb + 32) as u8,
+            (cx + 32) as u8,
+            (cy + 32) as u8,
+        ])
+    }
+}
+
 /// Return true if (col, row) falls within the selection [start..end] (order-independent).
 fn in_selection(col: usize, row: usize, start: (usize, usize), end: (usize, usize)) -> bool {
     // Normalize to top-left / bottom-right.
@@ -151,6 +213,114 @@ pub struct SelectionState {
     dragging: bool,
     pub start: Option<(usize, usize)>,
     pub end: Option<(usize, usize)>,
+    /// Time + cell of the previous left-press, for double/triple-click detection.
+    last_click: Option<(std::time::Instant, (usize, usize))>,
+    /// Consecutive-click counter (1=single, 2=double, 3=triple), reset when the
+    /// press lands on a different cell or after the double-click timeout.
+    click_streak: u8,
+    /// Latest keyboard modifiers seen by this canvas (for mouse-report bits and
+    /// the Shift-to-override-mouse-mode gesture).
+    modifiers: iced::keyboard::Modifiers,
+    /// Cell of the last mouse-report we forwarded while a button is held, so we
+    /// only emit a motion report when the cell actually changes.
+    last_report_cell: Option<(usize, usize)>,
+    /// Button currently held for mouse-motion reports (0=left,1=mid,2=right).
+    held_button: Option<u8>,
+    /// Fractional wheel-line accumulator, so macOS pixel-based trackpad deltas
+    /// emit remote scroll events at line granularity instead of per-pixel.
+    scroll_accum: f32,
+}
+
+/// True for characters that count as part of a "word" when double-clicking.
+/// Mirrors common terminal behavior: alphanumerics plus a few path/URL glyphs.
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '~' | ':' | '@')
+}
+
+/// Given a clicked cell, expand left/right along the row to the word boundaries
+/// and return the inclusive `(start_col, end_col)`. Returns `None` if the
+/// clicked cell is whitespace/empty (nothing to select).
+fn word_bounds_at(
+    snapshot: &TerminalSnapshot,
+    col: usize,
+    row: usize,
+) -> Option<(usize, usize)> {
+    let cells = snapshot.cells.get(row)?;
+    if cells.is_empty() {
+        return None;
+    }
+    let col = col.min(cells.len() - 1);
+    let ch = cells.get(col)?.ch;
+    if !is_word_char(ch) {
+        return None;
+    }
+    let mut start = col;
+    while start > 0 {
+        let prev = cells[start - 1].ch;
+        if is_word_char(prev) {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    let mut end = col;
+    while end + 1 < cells.len() {
+        let next = cells[end + 1].ch;
+        if is_word_char(next) {
+            end += 1;
+        } else {
+            break;
+        }
+    }
+    Some((start, end))
+}
+
+/// Characters allowed inside a URL (a pragmatic subset of RFC 3986).
+fn is_url_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric()
+        || matches!(
+            ch,
+            '-' | '.' | '_' | '~' | ':' | '/' | '?' | '#' | '[' | ']' | '@'
+                | '!' | '$' | '&' | '\'' | '(' | ')' | '*' | '+' | ',' | ';'
+                | '=' | '%'
+        )
+}
+
+/// If the clicked cell falls inside an `http://`/`https://` URL on its row,
+/// return that URL. Scans the row's contiguous run of URL characters around the
+/// click and checks it begins with a supported scheme.
+fn url_at(snapshot: &TerminalSnapshot, col: usize, row: usize) -> Option<String> {
+    let cells = snapshot.cells.get(row)?;
+    if cells.is_empty() {
+        return None;
+    }
+    let col = col.min(cells.len() - 1);
+    if !is_url_char(cells.get(col)?.ch) {
+        return None;
+    }
+    // Expand to the maximal run of URL characters (skip wide spacers).
+    let mut start = col;
+    while start > 0 && is_url_char(cells[start - 1].ch) {
+        start -= 1;
+    }
+    let mut end = col;
+    while end + 1 < cells.len() && is_url_char(cells[end + 1].ch) {
+        end += 1;
+    }
+    let run: String = cells[start..=end]
+        .iter()
+        .filter(|c| !c.wide_spacer)
+        .map(|c| c.ch)
+        .collect();
+    // Find a scheme within the run (the run may start mid-word before it).
+    let lower = run.to_ascii_lowercase();
+    let pos = lower.find("https://").or_else(|| lower.find("http://"))?;
+    let url = run[pos..].trim_end_matches(|c| matches!(c, '.' | ',' | ')' | ']' | ';' | ':'));
+    if url.len() > 8 {
+        Some(url.to_string())
+    } else {
+        None
+    }
 }
 
 /// A canvas program that paints one terminal snapshot.
@@ -160,6 +330,9 @@ pub struct TerminalCanvas {
     pub font_size: u16,
     /// Committed selection from the session (for cross-frame highlight when not dragging).
     pub selection: Option<(usize, usize, usize, usize)>,
+    /// Mouse-reporting protocol the remote app requested. When `report` is set,
+    /// clicks/drags/wheel are forwarded to the PTY instead of selecting locally.
+    pub mouse: MouseProtocol,
     /// Lowercased search query; empty disables highlighting.
     pub search_query: String,
     /// Index of the "current" match to emphasize (wraps modulo match count).
@@ -184,10 +357,159 @@ impl canvas::Program<Message> for TerminalCanvas {
     ) -> Option<Action<Message>> {
         let m = metrics(self.font_size);
         let rows = self.snapshot.cells.len();
+
+        // Track modifiers so mouse reports carry the right bits and Shift can
+        // override mouse mode (the standard "select locally anyway" gesture).
+        if let Event::Keyboard(iced::keyboard::Event::ModifiersChanged(mods)) = event {
+            state.modifiers = *mods;
+            return None;
+        }
+
+        let shift = state.modifiers.shift();
+        let alt = state.modifiers.alt();
+        let ctrl = state.modifiers.control();
+        // When the remote app is reading the mouse and Shift is NOT held, we
+        // forward events to the PTY instead of doing local selection.
+        let report_to_remote = self.mouse.report && !shift;
+
+        // --- Mouse reporting path (vim / tmux / htop / less …) ---
+        if report_to_remote {
+            let btn = |b: &mouse::Button| -> Option<u8> {
+                match b {
+                    mouse::Button::Left => Some(0),
+                    mouse::Button::Middle => Some(1),
+                    mouse::Button::Right => Some(2),
+                    _ => None,
+                }
+            };
+            match event {
+                Event::Mouse(mouse::Event::ButtonPressed(b)) => {
+                    if let (Some(base), Some(pos)) = (btn(b), cursor.position_in(bounds)) {
+                        let (col, row) = pos_to_cell(pos, m, rows);
+                        state.held_button = Some(base);
+                        state.last_report_cell = Some((col, row));
+                        if let Some(seq) = encode_mouse_report(
+                            self.mouse, MouseKind::Press, base, col, row, shift, alt, ctrl,
+                        ) {
+                            return Some(Action::publish(Message::TerminalWriteRaw(seq)).and_capture());
+                        }
+                    }
+                }
+                Event::Mouse(mouse::Event::ButtonReleased(b)) => {
+                    if let (Some(base), Some(pos)) = (btn(b), cursor.position_in(bounds)) {
+                        let (col, row) = pos_to_cell(pos, m, rows);
+                        state.held_button = None;
+                        state.last_report_cell = None;
+                        if let Some(seq) = encode_mouse_report(
+                            self.mouse, MouseKind::Release, base, col, row, shift, alt, ctrl,
+                        ) {
+                            return Some(Action::publish(Message::TerminalWriteRaw(seq)).and_capture());
+                        }
+                    }
+                }
+                Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                    // Motion reports: button-drag (1002) needs a held button;
+                    // any-motion (1003) reports even with none.
+                    let want_motion = (self.mouse.button_motion && state.held_button.is_some())
+                        || self.mouse.any_motion;
+                    if want_motion {
+                        if let Some(pos) = cursor.position_in(bounds) {
+                            let (col, row) = pos_to_cell(pos, m, rows);
+                            if state.last_report_cell != Some((col, row)) {
+                                state.last_report_cell = Some((col, row));
+                                let base = state.held_button.unwrap_or(3); // 3 = no button
+                                if let Some(seq) = encode_mouse_report(
+                                    self.mouse, MouseKind::Motion, base, col, row, shift, alt, ctrl,
+                                ) {
+                                    return Some(
+                                        Action::publish(Message::TerminalWriteRaw(seq)).and_capture(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
+                    let dy = match delta {
+                        mouse::ScrollDelta::Lines { y, .. } => *y,
+                        mouse::ScrollDelta::Pixels { y, .. } => *y / 16.0,
+                    };
+                    if dy.abs() >= 0.01 {
+                        if let Some(pos) = cursor.position_in(bounds) {
+                            let (col, row) = pos_to_cell(pos, m, rows);
+                            let kind = if dy > 0.0 { MouseKind::WheelUp } else { MouseKind::WheelDown };
+                            if let Some(seq) = encode_mouse_report(
+                                self.mouse, kind, 0, col, row, shift, alt, ctrl,
+                            ) {
+                                return Some(Action::publish(Message::TerminalWriteRaw(seq)).and_capture());
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return None;
+        }
+
+        // --- Local selection path (no remote mouse reporting) ---
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 if let Some(pos) = cursor.position_in(bounds) {
                     let cell = pos_to_cell(pos, m, rows);
+
+                    // Cmd/Ctrl+click on a URL opens it in the system browser.
+                    if state.modifiers.command() || ctrl {
+                        if let Some(url) = url_at(&self.snapshot, cell.0, cell.1) {
+                            return Some(Action::publish(Message::OpenUrl(url)).and_capture());
+                        }
+                    }
+
+                    let now = std::time::Instant::now();
+                    // Track consecutive clicks on the same cell within 400ms:
+                    // 2 = word select, 3 = line select.
+                    let within = state.last_click.is_some_and(|(t, c)| {
+                        c == cell && now.duration_since(t) <= std::time::Duration::from_millis(400)
+                    });
+                    state.click_streak = if within { state.click_streak + 1 } else { 1 };
+                    state.last_click = Some((now, cell));
+
+                    if state.click_streak >= 3 {
+                        // Triple-click: select the whole line (all columns of the row).
+                        state.dragging = false;
+                        state.click_streak = 0; // reset so a 4th click starts over
+                        let last_col = self
+                            .snapshot
+                            .cells
+                            .get(cell.1)
+                            .map(|r| r.len().saturating_sub(1))
+                            .unwrap_or(0);
+                        state.start = Some((0, cell.1));
+                        state.end = Some((last_col, cell.1));
+                        return Some(
+                            Action::publish(Message::SelectionChanged(Some((
+                                0, cell.1, last_col, cell.1,
+                            ))))
+                            .and_capture(),
+                        );
+                    }
+
+                    if state.click_streak == 2 {
+                        // Double-click: select the whole word under the cursor.
+                        // Consume it so the pending single-click drag doesn't
+                        // collapse it back to an empty selection.
+                        state.dragging = false;
+                        if let Some((sc, ec)) = word_bounds_at(&self.snapshot, cell.0, cell.1) {
+                            state.start = Some((sc, cell.1));
+                            state.end = Some((ec, cell.1));
+                            return Some(
+                                Action::publish(Message::SelectionChanged(Some((
+                                    sc, cell.1, ec, cell.1,
+                                ))))
+                                .and_capture(),
+                            );
+                        }
+                    }
+
                     state.dragging = true;
                     state.start = Some(cell);
                     state.end = Some(cell);
@@ -214,6 +536,52 @@ impl canvas::Program<Message> for TerminalCanvas {
                         };
                         return Some(Action::publish(msg).and_capture());
                     }
+                }
+            }
+            Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
+                // Only act on wheel when the pointer is over this canvas.
+                if cursor.position_in(bounds).is_some() {
+                    let lines = match delta {
+                        mouse::ScrollDelta::Lines { y, .. } => *y,
+                        mouse::ScrollDelta::Pixels { y, .. } => *y / 16.0,
+                    };
+                    // Alternate-scroll: on the alt screen (vim/less/man/htop
+                    // without `set mouse=a`) there is no local scrollback, so a
+                    // wheel would do nothing. Translate it into arrow-key presses
+                    // the remote app scrolls with — exactly what xterm/iTerm do.
+                    if self.mouse.alt_screen && self.mouse.alternate_scroll {
+                        // Accumulate fractional (trackpad) deltas; ~3 lines/notch.
+                        state.scroll_accum += lines * 3.0;
+                        let steps = state.scroll_accum.trunc() as i32;
+                        if steps != 0 {
+                            state.scroll_accum -= steps as f32;
+                            let up = steps > 0;
+                            // DECCKM (app cursor) → ESC O A/B, else ESC [ A/B.
+                            let arrow: &[u8] = match (self.mouse.app_cursor, up) {
+                                (true, true) => b"\x1bOA",
+                                (true, false) => b"\x1bOB",
+                                (false, true) => b"\x1b[A",
+                                (false, false) => b"\x1b[B",
+                            };
+                            let n = steps.unsigned_abs() as usize;
+                            let mut seq = Vec::with_capacity(arrow.len() * n);
+                            for _ in 0..n {
+                                seq.extend_from_slice(arrow);
+                            }
+                            return Some(
+                                Action::publish(Message::TerminalWriteRaw(seq)).and_capture(),
+                            );
+                        }
+                        return None;
+                    }
+                    return Some(Action::publish(Message::TerminalScroll(lines)));
+                }
+            }
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
+                if let Some(pos) = cursor.position_in(bounds) {
+                    return Some(
+                        Action::publish(Message::TerminalOpenMenu(pos.x, pos.y)).and_capture(),
+                    );
                 }
             }
             _ => {}

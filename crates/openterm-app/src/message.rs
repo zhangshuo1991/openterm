@@ -83,8 +83,19 @@ pub enum Message {
 
     // --- Terminal ---
     TerminalInput(Vec<u8>),
+    /// Raw bytes written straight to the PTY, bypassing snippet expansion,
+    /// input tracking, and auto-scroll. Used for mouse-report escape sequences.
+    TerminalWriteRaw(Vec<u8>),
     TerminalAreaResized(Size),
     TerminalScroll(f32),
+    /// Open a URL clicked in the terminal (Cmd/Ctrl+click) in the system browser.
+    OpenUrl(String),
+    /// Select the entire terminal grid (Cmd+A).
+    TerminalSelectAll,
+    /// Open the terminal right-click context menu at (x, y) canvas-local px.
+    TerminalOpenMenu(f32, f32),
+    /// Close the terminal context menu.
+    TerminalCloseMenu,
     WindowResized(Size),
     PasteRequested,
     PasteReady(Option<String>),

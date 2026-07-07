@@ -2,8 +2,29 @@ use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::test::TermSize;
-use alacritty_terminal::term::{Config, Term};
+use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{self, Color, NamedColor, Rgb};
+
+/// Mouse-reporting state a remote app has requested via DECSET private modes.
+/// When `report` is set, the UI must forward mouse events to the PTY as escape
+/// sequences instead of doing local text selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MouseProtocol {
+    /// Any button-event reporting is on (mode 1000/1002/1003).
+    pub report: bool,
+    /// Report motion while a button is held (mode 1002).
+    pub button_motion: bool,
+    /// Report all motion, even with no button held (mode 1003).
+    pub any_motion: bool,
+    /// SGR extended encoding (mode 1006). When false, use legacy X10.
+    pub sgr: bool,
+    /// Alternate-scroll: wheel becomes arrow keys on the alt screen (mode 1007).
+    pub alternate_scroll: bool,
+    /// The terminal is currently on the alternate screen.
+    pub alt_screen: bool,
+    /// Application cursor keys (DECCKM): arrows are ESC O A/B instead of ESC [ A/B.
+    pub app_cursor: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerminalSize {
@@ -154,6 +175,22 @@ impl AlacrittyTerminalBuffer {
     /// (0 means pinned to the latest output).
     pub fn scroll_offset(&self) -> usize {
         self.term.grid().display_offset()
+    }
+
+    /// The mouse-reporting protocol the remote app has requested. Used by the
+    /// UI to decide whether a click/drag/wheel should be forwarded to the PTY
+    /// (vim, tmux, htop, less …) instead of driving local selection/scroll.
+    pub fn mouse_protocol(&self) -> MouseProtocol {
+        let mode = self.term.mode();
+        MouseProtocol {
+            report: mode.intersects(TermMode::MOUSE_MODE),
+            button_motion: mode.contains(TermMode::MOUSE_DRAG),
+            any_motion: mode.contains(TermMode::MOUSE_MOTION),
+            sgr: mode.contains(TermMode::SGR_MOUSE),
+            alternate_scroll: mode.contains(TermMode::ALTERNATE_SCROLL),
+            alt_screen: mode.contains(TermMode::ALT_SCREEN),
+            app_cursor: mode.contains(TermMode::APP_CURSOR),
+        }
     }
 
     /// Returns the trimmed text of the line at the current cursor row.
@@ -561,6 +598,37 @@ mod tests {
         assert!(snapshot.cells[0][1].wide_spacer);
         assert_eq!(snapshot.cells[0][2].ch, 'a');
         assert_eq!(snapshot.render_plain_text(), "中a\n█");
+    }
+
+    #[test]
+    fn mouse_protocol_tracks_private_modes() {
+        let mut buffer = AlacrittyTerminalBuffer::new(TerminalSize { cols: 20, rows: 4 });
+
+        // Defaults: no reporting, alternate-scroll on, primary screen.
+        let p = buffer.mouse_protocol();
+        assert!(!p.report);
+        assert!(p.alternate_scroll, "alternate scroll should default on");
+        assert!(!p.alt_screen);
+
+        // vim-like startup: alt screen + app cursor + SGR mouse drag reporting.
+        buffer
+            .write_remote_output(b"\x1b[?1049h\x1b[?1h\x1b[?1002h\x1b[?1006h")
+            .unwrap();
+        let p = buffer.mouse_protocol();
+        assert!(p.report, "1002 should enable reporting");
+        assert!(p.button_motion);
+        assert!(p.sgr, "1006 should select SGR encoding");
+        assert!(p.alt_screen, "1049 should switch to alt screen");
+        assert!(p.app_cursor, "DECCKM should set app cursor");
+
+        // Teardown restores the primary screen and disables reporting.
+        buffer
+            .write_remote_output(b"\x1b[?1002l\x1b[?1006l\x1b[?1l\x1b[?1049l")
+            .unwrap();
+        let p = buffer.mouse_protocol();
+        assert!(!p.report);
+        assert!(!p.alt_screen);
+        assert!(!p.app_cursor);
     }
 
     #[test]

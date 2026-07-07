@@ -27,7 +27,7 @@ base64 = "0.22.1"
 chacha20poly1305 = { version = "0.10.1", features = ["std"] }
 clap = { version = "4.5.58", features = ["derive"] }
 directories = "5.0.1"
-iced = { version = "0.14.0", features = ["tokio", "canvas", "advanced", "svg"] }
+iced = { version = "0.14.0", features = ["tokio", "canvas", "advanced", "svg", "highlighter"] }
 libc = "0.2.186"
 redb = "2.6.3"
 russh = "0.61.1"

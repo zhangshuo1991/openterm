@@ -83,12 +83,7 @@ fn content_area(state: &FileViewerState) -> Element<'_, Message> {
 
         ViewerContent::Loaded(txt) => {
             if state.mode == ViewerMode::Edit {
-                iced::widget::text_editor(&state.editor)
-                    .on_action(Message::FileViewerAction)
-                    .size(13)
-                    .font(iced::Font::MONOSPACE)
-                    .height(Length::Fill)
-                    .into()
+                editor_view(state)
             } else {
                 highlighted_view(txt, &state.highlight_cache)
             }
@@ -119,6 +114,51 @@ fn content_area(state: &FileViewerState) -> Element<'_, Message> {
         .height(Length::Fill)
         .padding(4)
         .into()
+}
+
+/// Edit mode: a line-number gutter beside a syntax-highlighted `text_editor`.
+/// The editor is `Shrink`-height so it lays out at full content height; the
+/// gutter shares the same outer scrollable, so the two columns scroll together
+/// and never drift (the same trick the read-only preview uses).
+fn editor_view(state: &FileViewerState) -> Element<'_, Message> {
+    let line_count = state.editor.line_count().max(1);
+    let gutter_width = line_count.to_string().len();
+
+    // Line-number gutter. Uses the same font/size/line-height as the editor so
+    // rows line up. Wrapping is disabled on the editor (below), so one logical
+    // line = one visual row and the numbers stay aligned.
+    let mut gutter_text = String::with_capacity(line_count * (gutter_width + 1));
+    for n in 1..=line_count {
+        gutter_text.push_str(&format!("{n:>gutter_width$}\n"));
+    }
+    let gutter = container(
+        text(gutter_text)
+            .size(13)
+            .font(iced::Font::MONOSPACE)
+            .line_height(iced::widget::text::LineHeight::default())
+            .color(theme::text_dim()),
+    )
+    .padding(iced::Padding::from([12.0, 8.0]));
+
+    let editor = iced::widget::text_editor(&state.editor)
+        .on_action(Message::FileViewerAction)
+        .size(13)
+        .font(iced::Font::MONOSPACE)
+        .padding(12)
+        .wrapping(iced::widget::text::Wrapping::None)
+        .height(Length::Shrink)
+        .highlight(&state.ext(), iced::highlighter::Theme::Base16Ocean);
+
+    scrollable(
+        row![gutter, editor].width(Length::Fill),
+    )
+    .direction(iced::widget::scrollable::Direction::Both {
+        vertical: iced::widget::scrollable::Scrollbar::default(),
+        horizontal: iced::widget::scrollable::Scrollbar::default(),
+    })
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
 }
 
 fn highlighted_view<'a>(content: &'a str, spans: &[(iced::Color, String)]) -> Element<'a, Message> {

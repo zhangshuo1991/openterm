@@ -991,6 +991,16 @@ impl FileViewerState {
         }
     }
 
+    /// Lowercase file extension (e.g. "py", "rs"), used as the syntect token
+    /// for the editor's syntax highlighter. Empty when the name has no ext.
+    pub fn ext(&self) -> String {
+        let name = self.path.rsplit('/').next().unwrap_or(&self.path);
+        match name.rsplit_once('.') {
+            Some((_, ext)) => ext.to_ascii_lowercase(),
+            None => String::new(),
+        }
+    }
+
     /// Recompute match offsets for the current search query.
     pub fn refresh_matches(&mut self) {
         self.matches.clear();
