@@ -539,8 +539,13 @@ pub fn last_segment(line: &str) -> &str {
 /// token completion should actually match against — `ps -ef` → arg="-ef",
 /// `java -Xmx512m -jar app` → arg last token = "app".
 pub fn last_token(arg: &str) -> &str {
-    match arg.rfind(char::is_whitespace) {
-        Some(pos) => &arg[pos + 1..],
+    // Find the last whitespace *char* and slice after it by its real UTF-8
+    // length. `char::is_whitespace` matches multi-byte spaces (full-width
+    // U+3000, no-break U+00A0) common in CJK IME / pasted text, so a naive
+    // `pos + 1` would land mid-codepoint and panic — and this runs on every
+    // keystroke.
+    match arg.char_indices().rev().find(|(_, c)| c.is_whitespace()) {
+        Some((pos, c)) => &arg[pos + c.len_utf8()..],
         None => arg,
     }
 }
@@ -551,9 +556,12 @@ pub fn last_token(arg: &str) -> &str {
 /// token (still typing the first argument).
 pub fn prev_token(arg: &str) -> &str {
     let cur = last_token(arg);
+    // `cur` is a suffix of `arg`, so this byte split is on a char boundary.
     let head = arg[..arg.len() - cur.len()].trim_end();
-    match head.rfind(char::is_whitespace) {
-        Some(pos) => &head[pos + 1..],
+    // Same multi-byte-whitespace hazard as `last_token`: advance by the real
+    // char length, not a hard-coded +1.
+    match head.char_indices().rev().find(|(_, c)| c.is_whitespace()) {
+        Some((pos, c)) => &head[pos + c.len_utf8()..],
         None => head,
     }
 }
@@ -1520,13 +1528,73 @@ fn strip_prompt(line: &str) -> Option<&str> {
 }
 
 /// Order local entries: directories always first, then by the chosen field.
+/// Human-friendly name ordering: case-insensitive, with runs of digits
+/// compared as numbers so `item2` sorts before `item10` (the way Finder /
+/// Explorer order files) instead of byte-lexicographically. Non-digit
+/// characters compare by lowercased char; a purely lexicographic tie falls
+/// back to the raw bytes so distinct names never compare equal.
+pub fn natural_name_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let mut ai = a.chars().peekable();
+    let mut bi = b.chars().peekable();
+    loop {
+        match (ai.peek().copied(), bi.peek().copied()) {
+            (None, None) => return a.cmp(b), // equal so far → stable raw tiebreak
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(ca), Some(cb)) => {
+                if ca.is_ascii_digit() && cb.is_ascii_digit() {
+                    // Compare the two digit runs as numbers, ignoring leading
+                    // zeros; the longer run (after trimming zeros) is larger.
+                    let na: String = collect_digits(&mut ai);
+                    let nb: String = collect_digits(&mut bi);
+                    let ta = na.trim_start_matches('0');
+                    let tb = nb.trim_start_matches('0');
+                    let ord = ta.len().cmp(&tb.len()).then_with(|| ta.cmp(tb));
+                    if ord != Ordering::Equal {
+                        return ord;
+                    }
+                    // Numerically equal (e.g. "01" vs "1") → shorter first.
+                    let zord = na.len().cmp(&nb.len());
+                    if zord != Ordering::Equal {
+                        return zord;
+                    }
+                } else {
+                    let la = ca.to_ascii_lowercase();
+                    let lb = cb.to_ascii_lowercase();
+                    let ord = la.cmp(&lb);
+                    if ord != Ordering::Equal {
+                        return ord;
+                    }
+                    ai.next();
+                    bi.next();
+                }
+            }
+        }
+    }
+}
+
+/// Pull the leading run of ASCII digits off `it` into a string.
+fn collect_digits(it: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
+    let mut s = String::new();
+    while let Some(&c) = it.peek() {
+        if c.is_ascii_digit() {
+            s.push(c);
+            it.next();
+        } else {
+            break;
+        }
+    }
+    s
+}
+
 pub fn sort_local(entries: &mut [LocalEntry], sort: SortField, ascending: bool) {
     entries.sort_by(|a, b| {
         b.is_dir.cmp(&a.is_dir).then_with(|| {
             let ord = match sort {
-                SortField::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-                SortField::Size => a.size.cmp(&b.size),
-                SortField::Modified => a.modified.cmp(&b.modified),
+                SortField::Name => natural_name_cmp(&a.name, &b.name),
+                SortField::Size => a.size.cmp(&b.size).then_with(|| natural_name_cmp(&a.name, &b.name)),
+                SortField::Modified => a.modified.cmp(&b.modified).then_with(|| natural_name_cmp(&a.name, &b.name)),
             };
             if ascending {
                 ord
@@ -1549,9 +1617,17 @@ pub fn sort_remote(
         let b_dir = matches!(b.kind, RemoteFileKind::Directory);
         b_dir.cmp(&a_dir).then_with(|| {
             let ord = match sort {
-                SortField::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-                SortField::Size => a.size.unwrap_or(0).cmp(&b.size.unwrap_or(0)),
-                SortField::Modified => a.modified.unwrap_or(0).cmp(&b.modified.unwrap_or(0)),
+                SortField::Name => natural_name_cmp(&a.name, &b.name),
+                SortField::Size => a
+                    .size
+                    .unwrap_or(0)
+                    .cmp(&b.size.unwrap_or(0))
+                    .then_with(|| natural_name_cmp(&a.name, &b.name)),
+                SortField::Modified => a
+                    .modified
+                    .unwrap_or(0)
+                    .cmp(&b.modified.unwrap_or(0))
+                    .then_with(|| natural_name_cmp(&a.name, &b.name)),
             };
             if ascending {
                 ord
@@ -2130,5 +2206,62 @@ Options:
         assert!(!is_help_probe_safe("rm -rf")); // space / metachar
         assert!(!is_help_probe_safe("")); // empty
         assert!(!is_help_probe_safe("2tool")); // leading digit
+    }
+
+    #[test]
+    fn token_helpers_survive_multibyte_whitespace_and_args() {
+        // Full-width space (U+3000, 3 bytes) and no-break space (U+00A0, 2
+        // bytes) between tokens used to panic last_token/prev_token via a
+        // `pos + 1` slice landing mid-codepoint. These must not panic and must
+        // return the right token.
+        assert_eq!(last_token("ls\u{3000}foo"), "foo");
+        assert_eq!(last_token("git\u{00A0}commit"), "commit");
+        assert_eq!(prev_token("ls\u{3000}foo bar"), "foo");
+        assert_eq!(prev_token("a\u{00A0}b\u{3000}c"), "b");
+        // Multi-byte token content is fine too.
+        assert_eq!(last_token("cd 文档"), "文档");
+        assert_eq!(prev_token("cd 文档/"), "cd");
+        // No whitespace → whole arg; trailing space → empty current token.
+        assert_eq!(last_token("solo"), "solo");
+        assert_eq!(last_token("cmd "), "");
+    }
+
+    #[test]
+    fn parse_hex_rejects_multibyte_that_is_six_bytes() {
+        use crate::theme::parse_hex;
+        // "中中" is 2 chars but 6 bytes — must be rejected, not panic.
+        assert!(parse_hex("中中").is_none());
+        assert!(parse_hex("#中中").is_none());
+        // Valid colors still parse.
+        assert!(parse_hex("#3c9e8f").is_some());
+        assert!(parse_hex("3c9e8f").is_some());
+        assert!(parse_hex("xyzxyz").is_none()); // ascii but not hex digits
+    }
+
+    #[test]
+    fn natural_name_cmp_orders_numbers_and_case_like_a_file_manager() {
+        use std::cmp::Ordering;
+        // Numeric runs compare as numbers, not bytes: item2 < item10.
+        assert_eq!(natural_name_cmp("item2", "item10"), Ordering::Less);
+        assert_eq!(natural_name_cmp("file9", "file100"), Ordering::Less);
+        // Case-insensitive: "Apple" and "apple" tie on the letters, and the raw
+        // tiebreak keeps them distinct (uppercase byte < lowercase byte).
+        assert_eq!(natural_name_cmp("apple", "Banana"), Ordering::Less);
+        assert_eq!(natural_name_cmp("Banana", "apple"), Ordering::Greater);
+
+        // A full sort lands in human order, not lexicographic (…1, 10, 2…).
+        let mut names = vec!["item10", "item2", "Item1", "item20", "item3"];
+        names.sort_by(|a, b| natural_name_cmp(a, b));
+        assert_eq!(names, vec!["Item1", "item2", "item3", "item10", "item20"]);
+
+        // Sort is total/consistent: no pair is simultaneously Less both ways.
+        let sample = ["a", "A", "a1", "a10", "a2", "b", "10", "2", "ab"];
+        for x in sample {
+            for y in sample {
+                let xy = natural_name_cmp(x, y);
+                let yx = natural_name_cmp(y, x);
+                assert_eq!(xy, yx.reverse(), "asymmetry between {x:?} and {y:?}");
+            }
+        }
     }
 }

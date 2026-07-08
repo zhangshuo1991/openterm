@@ -202,7 +202,10 @@ pub fn set_accent_override(hex: &str) {
 /// Parse "#rrggbb" (or "rrggbb") into a Color. Returns None when malformed.
 pub fn parse_hex(hex: &str) -> Option<Color> {
     let h = hex.trim().trim_start_matches('#');
-    if h.len() != 6 {
+    // Require 6 ASCII chars: `len()` is bytes, so a 6-byte multi-byte string
+    // like "中中" (2 chars × 3 bytes) would otherwise pass and then panic when
+    // sliced at `[0..2]` mid-codepoint. A real hex color is always ASCII.
+    if h.len() != 6 || !h.is_ascii() {
         return None;
     }
     let r = u8::from_str_radix(&h[0..2], 16).ok()?;

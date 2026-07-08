@@ -988,10 +988,32 @@ impl RusshSession {
     }
 
     pub async fn list_dir(&self, path: &str) -> Result<Vec<RemoteFileEntry>, SshError> {
+        Ok(self.list_dir_resolved(path).await?.1)
+    }
+
+    /// List `path`, canonicalizing it first *only when needed* (relative paths
+    /// like the initial "."), reusing a single SFTP channel for both the
+    /// canonicalize and the read_dir. Returns `(resolved_path, entries)`.
+    ///
+    /// Navigation always builds absolute paths (`join_remote`/`parent_remote`),
+    /// so after the first connect the canonicalize round-trip is pure overhead;
+    /// skipping it — and not opening a second channel — removes the per-folder
+    /// stall.
+    pub async fn list_dir_resolved(
+        &self,
+        path: &str,
+    ) -> Result<(String, Vec<RemoteFileEntry>), SshError> {
         let sftp = self.open_sftp_guarded().await?;
-        let result: Result<Vec<RemoteFileEntry>, SshError> = async {
+        let result: Result<(String, Vec<RemoteFileEntry>), SshError> = async {
+            // Absolute paths are already resolved; only relative ones (".",
+            // "..", "foo/bar") need a canonicalize round-trip.
+            let resolved = if path.starts_with('/') {
+                path.to_string()
+            } else {
+                sftp.canonicalize(path).await.unwrap_or_else(|_| path.to_string())
+            };
             let mut entries = sftp
-                .read_dir(path)
+                .read_dir(&resolved)
                 .await?
                 .map(|entry| {
                     let metadata = entry.metadata();
@@ -1010,7 +1032,7 @@ impl RusshSession {
                 let b_dir = matches!(b.kind, RemoteFileKind::Directory);
                 b_dir.cmp(&a_dir).then_with(|| a.name.cmp(&b.name))
             });
-            Ok(entries)
+            Ok((resolved, entries))
         }.await;
         let _ = sftp.close().await;
         result

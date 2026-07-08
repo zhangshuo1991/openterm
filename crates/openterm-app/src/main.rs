@@ -1074,3 +1074,51 @@ fn current_timestamp() -> String {
         .unwrap_or_default();
     format!("unix:{seconds}")
 }
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    /// Connecting makes the `Terminal | Files` subtab bar appear, so the
+    /// terminal canvas loses `SUBTAB_HEIGHT` of vertical space. The grid must
+    /// shrink to match — otherwise the extra rows (and the cursor) render below
+    /// the canvas and get clipped, leaving the terminal with no visible cursor
+    /// and no way to type. Locks the fix for that regression.
+    #[test]
+    fn reserved_top_shrinks_terminal_grid() {
+        let window = Size::new(1200.0, 780.0);
+        let sidebar = theme::SIDEBAR_WIDTH;
+
+        let idle = terminal_area(window, sidebar, 0.0, 0.0);
+        let connected = terminal_area(window, sidebar, 0.0, ui::SUBTAB_HEIGHT);
+
+        // The connected area is exactly the subtab band shorter, never taller.
+        assert!(connected.height < idle.height);
+        assert!((idle.height - connected.height - ui::SUBTAB_HEIGHT).abs() < 0.01);
+
+        let (_, idle_rows) =
+            terminal_render::grid_for_viewport(idle.width, idle.height, theme::DEFAULT_FONT_SIZE);
+        let (_, connected_rows) = terminal_render::grid_for_viewport(
+            connected.width,
+            connected.height,
+            theme::DEFAULT_FONT_SIZE,
+        );
+        // Reserving the subtab band must cost at least one row at the default
+        // font size (SUBTAB_HEIGHT > one line height), so the grid genuinely
+        // gets re-derived rather than staying at the taller idle count.
+        assert!(connected_rows < idle_rows);
+    }
+
+    /// The grid never overflows the area it was sized for: `rows * line_height`
+    /// stays within the available height. Guards the drawn-height invariant the
+    /// whole layout relies on.
+    #[test]
+    fn grid_never_exceeds_its_area() {
+        let window = Size::new(1440.0, 900.0);
+        let area = terminal_area(window, theme::SIDEBAR_WIDTH, ui::RAIL_WIDTH, ui::SUBTAB_HEIGHT);
+        let (_, rows) =
+            terminal_render::grid_for_viewport(area.width, area.height, theme::DEFAULT_FONT_SIZE);
+        let line_height = terminal_render::metrics(theme::DEFAULT_FONT_SIZE).line_height;
+        assert!(f32::from(rows) * line_height <= area.height + 0.01);
+    }
+}

@@ -75,6 +75,13 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 {
                     app.start_card_entrance();
                 }
+                // `reserved_top`/`reserved_right` key off the *active* session's
+                // phase, so switching between an idle and a connected tab moves
+                // the subtab band and rail — shrinking the canvas. Re-derive the
+                // grid for the newly-active session or its bottom rows (and the
+                // cursor) render below the canvas and get clipped, the same
+                // no-cursor / no-input symptom as connecting.
+                return apply_grid(app);
             }
             Task::none()
         }
@@ -1144,7 +1151,15 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                     finalize_tab_close(app, id);
                 }
             }
-            Task::none()
+            // Sidebar / history / rail slides change the terminal's available
+            // width every frame. Those toggles call `apply_grid` at t=0, when
+            // the animated width is still the *old* value, so the grid would
+            // otherwise stay sized for the pre-animation layout until the next
+            // window resize. Re-derive each frame so the grid tracks the slide
+            // and lands correct on the final frame. `resize_grid` no-ops when
+            // the size is unchanged, so a steady frame (e.g. a toast fading)
+            // costs nothing.
+            return apply_grid(app);
         }
         Message::PulseTick => {
             app.connecting_pulse = !app.connecting_pulse;
@@ -1694,19 +1709,18 @@ fn recompute_active_suggestion(app: &mut App) {
 
     // Stabilization: if we already have a suggestion and the user just typed
     // along its path, trim instead of full recompute.
+    //
+    // Operate on `char`s, never byte offsets: the input line can end in a
+    // multi-byte UTF-8 char (e.g. `cd 文档`), and slicing at `len()-1` would
+    // split a codepoint and panic the whole app.
     if let Some(existing) = &app.sessions[index].inline_suggestion {
-        if !existing.is_empty() && line.len() > 0 {
-            let typed_char = &line[line.len() - 1..];
-            let first_char_len = existing
-                .char_indices()
-                .nth(1)
-                .map(|(i, _)| i)
-                .unwrap_or(existing.len());
-            let suggest_first = &existing[..first_char_len];
+        if let (Some(typed_char), Some(suggest_first)) =
+            (line.chars().next_back(), existing.chars().next())
+        {
             if typed_char == suggest_first {
-                let trimmed = &existing[typed_char.len()..];
+                let trimmed: String = existing.chars().skip(1).collect();
                 app.sessions[index].inline_suggestion =
-                    if trimmed.is_empty() { None } else { Some(trimmed.to_string()) };
+                    if trimmed.is_empty() { None } else { Some(trimmed) };
                 return;
             }
         }
@@ -2145,8 +2159,13 @@ fn finalize_tab_close(app: &mut App, id: u64) {
 fn apply_grid(app: &mut App) -> Task<Message> {
     let (cols, rows) = app.current_grid();
     for session in &mut app.sessions {
+        // Only touch the PTY when the size actually changes. `apply_grid` now
+        // runs every animation frame (via `Tick`), and `any_animating()` stays
+        // true for seconds while a toast is up or a copy-flash fades, so an
+        // unconditional resize would spam the PTY channel with no-op resizes.
+        let changed = cols != session.grid_cols || rows != session.grid_rows;
         session.resize_grid(cols, rows);
-        if session.phase.is_active() {
+        if changed && session.phase.is_active() {
             if let Some(tx) = &session.cmd_tx {
                 let _ = tx.try_send(Command::Resize { cols, rows });
             }
@@ -2560,6 +2579,14 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
     // Toast to surface after the `session` borrow ends (kind, message).
     let mut toast: Option<(crate::ui::toasts::ToastKind, String)> = None;
     let mut recompute_after = false;
+    // When true, re-derive the grid once the `session` borrow ends. Set on the
+    // Connected transition: going Connected makes the `Terminal | Files` subtab
+    // bar appear, so `reserved_top` jumps 0→SUBTAB_HEIGHT and the terminal
+    // canvas shrinks. Without a re-grid the grid keeps its taller pre-connect
+    // row count, so the bottom rows (and the cursor) fall below the canvas and
+    // get clipped — the terminal looks like it has no cursor and won't accept
+    // input until the next window resize.
+    let mut regrid_after = false;
     // Host label whose persisted history should seed the learned token model
     // once the `session` borrow below is released (set on Connected).
     let mut seed_model_host: Option<String> = None;
@@ -2581,6 +2608,9 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
             session.status = "Connected".to_string();
             session.host_key = None;
             session.connected_at = Some(std::time::Instant::now());
+            // The subtab bar now appears (SSH sessions), shrinking the canvas;
+            // re-derive the grid once the borrow ends so nothing is clipped.
+            regrid_after = true;
             crate::smoke::record(&smoke, "connected");
             touch_host_id = session.config.host_id;
             // Seed the learned token model from this host's persisted history
@@ -2848,6 +2878,9 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
             session.connected_at = None;
             session.suggestion_state.clear_all();
             session.inline_suggestion = None;
+            // Leaving Connected hides the subtab band + rail, so the canvas
+            // grows again; re-derive the grid to reclaim the rows.
+            regrid_after = true;
             toast = Some((
                 crate::ui::toasts::ToastKind::Info,
                 format!("Disconnected from {}", session.config.target_label()),
@@ -2860,6 +2893,8 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
             session.connected_at = None;
             session.suggestion_state.clear_all();
             session.inline_suggestion = None;
+            // Same as Closed: the subtab band/rail go away, so re-grid.
+            regrid_after = true;
             toast = Some((crate::ui::toasts::ToastKind::Error, error));
         }
         ConnEvent::SuggestionData { tag, candidates, .. } => {
@@ -2926,6 +2961,12 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
     }
     if recompute_after {
         recompute_active_suggestion(app);
+    }
+    if regrid_after {
+        // Resize the grid + push a PTY resize now that the layout reserves the
+        // subtab band. `resize_grid` no-ops when the size is unchanged, so this
+        // is cheap when the grid was already correct.
+        let _ = apply_grid(app);
     }
     if let Some((kind, msg)) = toast {
         app.push_toast(kind, msg);

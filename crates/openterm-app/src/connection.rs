@@ -569,17 +569,18 @@ type OutSink = iced::futures::channel::mpsc::Sender<Event>;
 
 fn spawn_sftp_list(session_id: u64, session: Arc<RusshSession>, mut out: OutSink, path: String) -> tokio::task::JoinHandle<()> {
     return tokio::spawn(async move {
-        // Resolve relative paths (e.g. "." on connect) to an absolute path so
-        // "Up" navigation has somewhere to go.
-        let resolved = session
-            .canonicalize(&path)
-            .await
-            .unwrap_or_else(|_| path.clone());
-        let result = session.list_dir(&resolved).await.map_err(|e| e.to_string());
+        // Resolve + list over a single SFTP channel. `list_dir_resolved` only
+        // canonicalizes relative paths (e.g. "." on connect), so ordinary
+        // navigation into absolute paths pays for just one channel + one
+        // round-trip instead of a canonicalize channel plus a list channel.
+        let (path, result) = match session.list_dir_resolved(&path).await {
+            Ok((resolved, entries)) => (resolved, Ok(entries)),
+            Err(e) => (path, Err(e.to_string())),
+        };
         let _ = out
             .send(Event::SftpListed {
                 session_id,
-                path: resolved,
+                path,
                 result,
             })
             .await;
