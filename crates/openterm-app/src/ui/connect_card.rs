@@ -231,7 +231,7 @@ fn labeled<'a>(label: &'a str, control: Element<'a, Message>) -> Element<'a, Mes
 }
 
 fn browse_btn() -> Element<'static, Message> {
-    button(text("浏览").size(12).color(theme::text_high()))
+    button(text("Browse").size(12).color(theme::text_high()))
         .padding([8, 12])
         .on_press(Message::BrowseKeyFile)
         .style(|_, status| {
@@ -260,7 +260,7 @@ fn browse_btn() -> Element<'static, Message> {
 fn jump_section(config: &SessionConfig) -> Element<'_, Message> {
     let arrow = if config.show_jump { "▼" } else { "▶" };
     let header = button(
-        text(format!("{arrow} 跳板机（可选）"))
+        text(format!("{arrow} Jump host (optional)"))
             .size(12)
             .color(theme::text_muted()),
     )
@@ -276,7 +276,7 @@ fn jump_section(config: &SessionConfig) -> Element<'_, Message> {
         column![
             header,
             labeled(
-                "跳板机主机",
+                "Jump host",
                 widgets::field(
                     "bastion.example.com",
                     &config.jump_host,
@@ -290,7 +290,7 @@ fn jump_section(config: &SessionConfig) -> Element<'_, Message> {
         column![
             header,
             container(
-                text("通过 bastion 主机连接 → 选择已保存的主机...")
+                text("Connect through a bastion host → pick a saved host...")
                     .size(11)
                     .color(theme::text_dim()),
             )

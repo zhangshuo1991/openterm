@@ -41,7 +41,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
     });
 
     let search = container(
-        text_input("搜索名称、IP、标签...", &app.host_search)
+        text_input("Search name, IP, tag...", &app.host_search)
             .on_input(Message::HostSearchChanged)
             .padding([8, 11])
             .size(13)
@@ -412,20 +412,38 @@ fn host_row<'a>(
     let avatar = host_avatar(host, ping_ms.is_some());
 
     let meta = host.display_target();
-    // Append a relative "last connected" hint when we have one.
+    // Append a relative "last connected" hint when we have one. The primary
+    // `meta` text takes `Fill` and clips (Wrapping::None) so a long
+    // `user@host:port` shrinks within `info_col` at narrow sidebar widths
+    // instead of overflowing into the status column and overlapping it.
     let meta_line: Element<'_, Message> =
         match host.last_connected_at.as_deref().and_then(relative_time) {
             Some(rel) => row![
-                text(meta).size(11).color(theme::text_muted()),
+                text(meta)
+                    .size(11)
+                    .color(theme::text_muted())
+                    .wrapping(text::Wrapping::None)
+                    .width(Length::Fill),
                 text("·").size(11).color(theme::text_dim()),
                 text(rel).size(11).color(theme::text_dim()),
             ]
             .spacing(5)
             .into(),
-            None => text(meta).size(11).color(theme::text_muted()).into(),
+            None => text(meta)
+                .size(11)
+                .color(theme::text_muted())
+                .wrapping(text::Wrapping::None)
+                .width(Length::Fill)
+                .into(),
         };
     let name_row = {
-        let mut r = row![text(host.name.clone()).size(13).color(theme::text_high())].spacing(6).align_y(iced::Alignment::Center);
+        let mut r = row![text(host.name.clone())
+            .size(13)
+            .color(theme::text_high())
+            .wrapping(text::Wrapping::None)
+            .width(Length::Fill)]
+        .spacing(6)
+        .align_y(iced::Alignment::Center);
         if let Some(tag) = host.tags.first() {
             r = r.push(tag_chip(tag));
         }
@@ -451,11 +469,15 @@ fn host_row<'a>(
 
     let ping_label: Element<'_, Message> = match ping_ms {
         Some(ms) => text(format!("{ms}ms")).size(10).color(theme::text_dim()).into(),
-        None => text("离线").size(10).color(theme::text_dim()).into(),
+        None => text("Offline").size(10).color(theme::text_dim()).into(),
     };
 
+    // Fixed-width slot so the dot + "142ms" / "Offline" label always has its
+    // own reserved space; without this the Fill `info_col` expands over it at
+    // narrow widths and the labels overlap.
     let status_col = column![status_dot, ping_label]
         .spacing(2)
+        .width(Length::Fixed(44.0))
         .align_x(iced::Alignment::Center);
 
     let info_col = column![

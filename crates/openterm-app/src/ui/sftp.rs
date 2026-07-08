@@ -104,7 +104,9 @@ fn local_pane<'a>(app: &'a App, session: &'a Session) -> Element<'a, Message> {
                 is_dir: entry.is_dir,
                 name: &entry.name,
                 size: human_size(entry.size),
-                modified: None,
+                // Local rows carry an mtime too (read in `refresh_local`); 0
+                // means "couldn't stat", so show nothing for those.
+                modified: (entry.modified != 0).then_some(entry.modified as u32),
                 perms: None,
                 selected,
                 menu_open,
@@ -347,9 +349,9 @@ struct FileRow<'a> {
     is_dir: bool,
     name: &'a str,
     size: String,
-    /// Unix mtime — only for remote rows.
+    /// Unix mtime (epoch seconds) — set for both local and remote rows.
     modified: Option<u32>,
-    /// Formatted permission string — only for remote rows.
+    /// Formatted permission string — remote rows only.
     perms: Option<String>,
     selected: bool,
     menu_open: bool,

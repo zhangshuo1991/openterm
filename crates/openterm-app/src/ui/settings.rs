@@ -138,7 +138,7 @@ fn content_panel(app: &App) -> Element<'_, Message> {
 fn terminal_panel(app: &App) -> Element<'_, Message> {
     column![
         panel_title("Terminal", "Font, cursor, and scrollback preferences."),
-        group_label("字体"),
+        group_label("Font"),
         setting_row(
             "Font size",
             "Affects all terminals.",
@@ -153,7 +153,7 @@ fn terminal_panel(app: &App) -> Element<'_, Message> {
             .align_y(iced::Alignment::Center)
             .into(),
         ),
-        group_label("滚动"),
+        group_label("Scrolling"),
         setting_row(
             "Scrollback lines",
             "Lines kept in memory per session.",
@@ -199,7 +199,7 @@ fn ssh_panel(app: &App) -> Element<'_, Message> {
 
     column![
         panel_title("SSH", "Default values pre-filled for new connections."),
-        group_label("默认值"),
+        group_label("Defaults"),
         setting_row(
             "Default username",
             "Pre-filled for new sessions.",
@@ -222,7 +222,7 @@ fn ssh_panel(app: &App) -> Element<'_, Message> {
                 .width(Length::Fixed(70.0))
                 .into(),
         ),
-        group_label("连接保活"),
+        group_label("Keep-alive"),
         setting_row(
             "ServerAliveInterval",
             "Send keepalive every N seconds. 0 = disabled.",
@@ -234,7 +234,7 @@ fn ssh_panel(app: &App) -> Element<'_, Message> {
                 .width(Length::Fixed(70.0))
                 .into(),
         ),
-        group_label("断线行为"),
+        group_label("Disconnect behavior"),
         setting_row("On disconnect", "What to do when a connection drops.", on_disc_row),
     ]
     .spacing(0)
@@ -309,7 +309,7 @@ fn appearance_panel(app: &App) -> Element<'_, Message> {
             "Override the scheme's accent. Default keeps the theme's own.",
             accent_picker(app),
         ),
-        group_label("终端"),
+        group_label("Terminal"),
         setting_row(
             "Cursor shape",
             "How the terminal cursor is drawn.",
@@ -440,7 +440,7 @@ fn snippets_panel(app: &App) -> Element<'_, Message> {
             "Snippets",
             "Type an abbreviation then Space or Tab to expand it (e.g. gp → git push).",
         ),
-        group_label("新建"),
+        group_label("New"),
         row![
             text_input("abbr", &app.snippet_draft_abbr)
                 .on_input(Message::SnippetDraftAbbr)
@@ -459,7 +459,7 @@ fn snippets_panel(app: &App) -> Element<'_, Message> {
         ]
         .spacing(8)
         .align_y(iced::Alignment::Center),
-        group_label("已保存"),
+        group_label("Saved"),
     ]
     .spacing(0);
 
@@ -546,9 +546,9 @@ fn advanced_panel(app: &App) -> Element<'_, Message> {
 
     column![
         panel_title("Advanced", "Power-user options."),
-        group_label("安全"),
+        group_label("Security"),
         setting_row("Credential vault", vault_hint, vault_control),
-        group_label("历史记录"),
+        group_label("History"),
         danger_row(
             "Clear command history",
             "Remove all persisted command history.",
