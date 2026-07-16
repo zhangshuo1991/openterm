@@ -117,7 +117,6 @@ pub enum TerminalError {
 pub trait TerminalEngine {
     fn resize(&mut self, size: TerminalSize);
     fn write_remote_output(&mut self, bytes: &[u8]) -> Result<(), TerminalError>;
-    fn visible_lines(&self) -> &[TerminalLine];
     fn snapshot(&self) -> TerminalSnapshot;
 }
 
@@ -125,50 +124,40 @@ pub struct AlacrittyTerminalBuffer {
     size: TerminalSize,
     term: Term<VoidListener>,
     parser: ansi::Processor,
-    lines: Vec<TerminalLine>,
+    /// Bumped on every mutation that changes what a snapshot would render
+    /// (output, resize, scroll). Consumers cache the last snapshot keyed on
+    /// this so an idle frame doesn't re-materialize the whole grid.
+    generation: u64,
 }
 
 impl AlacrittyTerminalBuffer {
     pub fn new(size: TerminalSize) -> Self {
         let term_size = TermSize::new(usize::from(size.cols), usize::from(size.rows));
         let term = Term::new(Config::default(), &term_size, VoidListener);
-        let mut buffer = Self {
+        Self {
             size,
             term,
             parser: ansi::Processor::new(),
-            lines: Vec::new(),
-        };
-        buffer.refresh_visible_lines();
-        buffer
+            generation: 0,
+        }
     }
 
-    fn refresh_visible_lines(&mut self) {
-        let snapshot = self.snapshot();
-        let mut rows = Vec::with_capacity(snapshot.cells.len());
-        for row in snapshot.cells {
-            let line = row
-                .into_iter()
-                .map(|cell| cell.ch)
-                .collect::<String>()
-                .trim_end()
-                .to_string();
-            rows.push(line);
-        }
-
-        self.lines = rows.into_iter().map(|text| TerminalLine { text }).collect();
+    /// Monotonic counter identifying the current grid state. See `generation`.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Scroll the viewport through scrollback history by `lines` (positive =
     /// toward older output, negative = toward newer). Used by the mouse wheel.
     pub fn scroll(&mut self, lines: i32) {
         self.term.scroll_display(Scroll::Delta(lines));
-        self.refresh_visible_lines();
+        self.generation += 1;
     }
 
     /// Jump back to the live bottom of the buffer.
     pub fn scroll_to_bottom(&mut self) {
         self.term.scroll_display(Scroll::Bottom);
-        self.refresh_visible_lines();
+        self.generation += 1;
     }
 
     /// How many lines the viewport is currently scrolled above the bottom
@@ -196,10 +185,22 @@ impl AlacrittyTerminalBuffer {
     /// Returns the trimmed text of the line at the current cursor row.
     /// Used to capture the fully tab-completed command before Enter is sent.
     pub fn cursor_line_text(&self) -> String {
-        // Read from the already-built text cache rather than calling snapshot().
+        // Read the single cursor row straight from the grid — no full-grid
+        // snapshot needed. Wide-char spacers are skipped so CJK text doesn't
+        // pick up a phantom space per glyph.
         let grid = self.term.grid();
-        let row = (grid.cursor.point.line.0 + grid.display_offset() as i32).max(0) as usize;
-        self.lines.get(row).map(|l| l.text.clone()).unwrap_or_default()
+        let row = &grid[grid.cursor.point.line];
+        let cols = usize::from(self.size.cols);
+        let mut text = String::with_capacity(cols);
+        for col in 0..cols {
+            let cell = &row[alacritty_terminal::index::Column(col)];
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            text.push(cell.c);
+        }
+        text.truncate(text.trim_end().len());
+        text
     }
 }
 
@@ -210,17 +211,13 @@ impl TerminalEngine for AlacrittyTerminalBuffer {
             usize::from(size.cols),
             usize::from(size.rows),
         ));
-        self.refresh_visible_lines();
+        self.generation += 1;
     }
 
     fn write_remote_output(&mut self, bytes: &[u8]) -> Result<(), TerminalError> {
         self.parser.advance(&mut self.term, bytes);
-        self.refresh_visible_lines();
+        self.generation += 1;
         Ok(())
-    }
-
-    fn visible_lines(&self) -> &[TerminalLine] {
-        &self.lines
     }
 
     fn snapshot(&self) -> TerminalSnapshot {
@@ -316,6 +313,12 @@ impl PlainTerminalBuffer {
             scrollback_limit,
         }
     }
+
+    pub fn visible_lines(&self) -> &[TerminalLine] {
+        let rows = usize::from(self.size.rows);
+        let start = self.lines.len().saturating_sub(rows);
+        &self.lines[start..]
+    }
 }
 
 impl TerminalEngine for PlainTerminalBuffer {
@@ -335,12 +338,6 @@ impl TerminalEngine for PlainTerminalBuffer {
             self.lines.drain(0..excess);
         }
         Ok(())
-    }
-
-    fn visible_lines(&self) -> &[TerminalLine] {
-        let rows = usize::from(self.size.rows);
-        let start = self.lines.len().saturating_sub(rows);
-        &self.lines[start..]
     }
 
     fn snapshot(&self) -> TerminalSnapshot {
@@ -547,15 +544,36 @@ mod tests {
             .write_remote_output(b"hello\rworld\x1b[2K\nnext")
             .unwrap();
 
-        let text = buffer
-            .visible_lines()
-            .iter()
-            .map(|line| line.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let text = buffer.snapshot().render_plain_text();
 
         assert!(text.contains("next"));
         assert!(!text.contains("\x1b"));
+    }
+
+    #[test]
+    fn generation_tracks_mutations() {
+        let mut buffer = AlacrittyTerminalBuffer::new(TerminalSize { cols: 20, rows: 4 });
+        let g0 = buffer.generation();
+
+        buffer.write_remote_output(b"hi").unwrap();
+        let g1 = buffer.generation();
+        assert!(g1 > g0, "output must bump the generation");
+
+        buffer.scroll(2);
+        assert!(buffer.generation() > g1, "scroll must bump the generation");
+
+        let g2 = buffer.generation();
+        buffer.resize(TerminalSize { cols: 30, rows: 5 });
+        assert!(buffer.generation() > g2, "resize must bump the generation");
+    }
+
+    #[test]
+    fn cursor_line_text_reads_cursor_row_and_skips_wide_spacers() {
+        let mut buffer = AlacrittyTerminalBuffer::new(TerminalSize { cols: 20, rows: 4 });
+        buffer
+            .write_remote_output("first\r\n$ vim 中文.txt".as_bytes())
+            .unwrap();
+        assert_eq!(buffer.cursor_line_text(), "$ vim 中文.txt");
     }
 
     #[test]

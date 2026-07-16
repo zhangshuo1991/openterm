@@ -146,7 +146,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
     // Toast notifications float above everything (but below the modal vault
     // gate, which is pushed last). Only present when there are active toasts.
     if !app.toasts.is_empty() {
-        layers = layers.push(toasts::view(&app.toasts));
+        layers = layers.push(toasts::view(&app.toasts, app.now()));
     }
 
     layers.width(Length::Fill).height(Length::Fill).into()

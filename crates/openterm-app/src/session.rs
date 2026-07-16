@@ -8,10 +8,61 @@
 
 use openterm_core::HostId;
 use openterm_ssh::HostKeyChallenge;
-use openterm_terminal::{AlacrittyTerminalBuffer, TerminalEngine, TerminalSize};
+use openterm_terminal::{AlacrittyTerminalBuffer, TerminalEngine, TerminalSize, TerminalSnapshot};
 use tokio::sync::mpsc;
 
 use crate::connection::{Command, ConnectParams};
+
+/// View-side render caches for the terminal canvas. Interior-mutable because
+/// they are refreshed lazily from `view(&App)`.
+///
+/// Two layers of caching keep an idle frame from re-doing terminal work:
+/// - `snapshot` memoizes the materialized cell grid, keyed by the buffer's
+///   generation counter, so unrelated messages (ticks, mouse moves, toasts)
+///   don't rebuild a `Vec<Vec<TerminalCell>>` per `view()`.
+/// - `canvas` stores the grid's tessellated geometry; it is cleared only when
+///   the render key (generation + font/theme/search state) changes, so a
+///   redraw of an unchanged grid re-uses the GPU geometry wholesale.
+#[derive(Default)]
+pub struct TerminalRenderCache {
+    snapshot: std::cell::RefCell<Option<(u64, std::sync::Arc<TerminalSnapshot>)>>,
+    pub canvas: iced::widget::canvas::Cache,
+    key: std::cell::Cell<u64>,
+}
+
+impl TerminalRenderCache {
+    /// The current grid snapshot, rebuilt only when the buffer generation
+    /// moved since the last call.
+    pub fn snapshot(&self, term: &AlacrittyTerminalBuffer) -> std::sync::Arc<TerminalSnapshot> {
+        let generation = term.generation();
+        let mut slot = self.snapshot.borrow_mut();
+        if let Some((cached_gen, snap)) = slot.as_ref() {
+            if *cached_gen == generation {
+                return snap.clone();
+            }
+        }
+        let snap = std::sync::Arc::new(term.snapshot());
+        *slot = Some((generation, snap.clone()));
+        snap
+    }
+
+    /// Install the render key for the cached grid geometry; clears the canvas
+    /// cache when it differs from the previous frame's key.
+    pub fn sync_key(&self, key: u64) {
+        if self.key.get() != key {
+            self.canvas.clear();
+            self.key.set(key);
+        }
+    }
+
+    /// Drop everything (used when the terminal buffer itself is replaced and
+    /// its generation counter restarts).
+    pub fn reset(&self) {
+        *self.snapshot.borrow_mut() = None;
+        self.canvas.clear();
+        self.key.set(0);
+    }
+}
 
 /// How the user authenticates a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -766,6 +817,8 @@ pub struct Session {
     pub config: SessionConfig,
     /// This session's own terminal grid. Never shared.
     pub terminal: AlacrittyTerminalBuffer,
+    /// Cached snapshot + canvas geometry for `terminal` (see the type docs).
+    pub render: TerminalRenderCache,
     pub grid_cols: u16,
     pub grid_rows: u16,
     pub phase: Phase,
@@ -1114,6 +1167,7 @@ impl Session {
             kind: SessionKind::Ssh,
             config,
             terminal: AlacrittyTerminalBuffer::new(TerminalSize { cols, rows }),
+            render: TerminalRenderCache::default(),
             grid_cols: cols,
             grid_rows: rows,
             phase: Phase::Idle,
@@ -1325,6 +1379,9 @@ impl Session {
             cols: self.grid_cols,
             rows: self.grid_rows,
         });
+        // The new buffer's generation restarts, so the old cached snapshot
+        // would otherwise look "current" — drop it explicitly.
+        self.render.reset();
         self.has_output = false;
     }
 

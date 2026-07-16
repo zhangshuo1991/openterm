@@ -324,9 +324,18 @@ fn url_at(snapshot: &TerminalSnapshot, col: usize, row: usize) -> Option<String>
 }
 
 /// A canvas program that paints one terminal snapshot.
+///
+/// Drawing is split into two layers:
+/// - the **grid layer** (cells, colors, cursor, search highlights) is stored
+///   in `cache` and only re-tessellated when the render key changes (see
+///   `TerminalRenderCache::sync_key`);
+/// - a cheap **overlay layer** (selection tint, copy flash, ghost suggestion)
+///   is rebuilt every frame, since it changes during drags/animations.
 #[derive(Debug)]
-pub struct TerminalCanvas {
-    pub snapshot: TerminalSnapshot,
+pub struct TerminalCanvas<'a> {
+    /// Persistent geometry cache owned by the session.
+    pub cache: &'a canvas::Cache,
+    pub snapshot: std::sync::Arc<TerminalSnapshot>,
     pub font_size: u16,
     /// Committed selection from the session (for cross-frame highlight when not dragging).
     pub selection: Option<(usize, usize, usize, usize)>,
@@ -345,7 +354,7 @@ pub struct TerminalCanvas {
     pub inline_suggestion: String,
 }
 
-impl canvas::Program<Message> for TerminalCanvas {
+impl canvas::Program<Message> for TerminalCanvas<'_> {
     type State = SelectionState;
 
     fn update(
@@ -598,17 +607,116 @@ impl canvas::Program<Message> for TerminalCanvas {
         _cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
         let m = metrics(self.font_size);
-        let mut frame = Frame::new(renderer, bounds.size());
 
+        // Grid layer: geometry is reused verbatim from the cache unless the
+        // session cleared it (content/font/theme/search changed).
+        let grid = self.cache.draw(renderer, bounds.size(), |frame| {
+            self.draw_grid(frame, m);
+        });
+
+        // Overlay layer: selection tint / copy flash / ghost suggestion —
+        // cheap to rebuild and changes during drags and animations.
         // Active in-progress drag takes priority; otherwise use the committed selection.
-        let sel: Option<((usize, usize), (usize, usize))> = if state.start.is_some() && state.end.is_some() && (state.dragging || state.start != state.end) {
+        let sel: Option<((usize, usize), (usize, usize))> = if state.start.is_some()
+            && state.end.is_some()
+            && (state.dragging || state.start != state.end)
+        {
             state.start.zip(state.end)
         } else {
             self.selection.map(|(c1, r1, c2, r2)| ((c1, r1), (c2, r2)))
         };
+        let want_ghost = !self.inline_suggestion.is_empty() && self.snapshot.cursor.visible;
+        if sel.is_none() && !want_ghost {
+            return vec![grid];
+        }
 
+        let mut overlay = Frame::new(renderer, bounds.size());
+
+        if let Some((s, e)) = sel {
+            // Translucent accent tint over the selected cells; the glyphs keep
+            // their own colors underneath. Flash brighter right after a copy.
+            let alpha = 0.32 + 0.38 * self.copy_flash;
+            let tint = theme::with_alpha(theme::accent(), alpha);
+            let (sr, er) = if s.1 <= e.1 { (s.1, e.1) } else { (e.1, s.1) };
+            for row_index in sr..=er {
+                let Some(row) = self.snapshot.cells.get(row_index) else { break };
+                for cell in row {
+                    if cell.wide_spacer {
+                        continue;
+                    }
+                    if in_selection(cell.col, row_index, s, e) {
+                        overlay.fill_rectangle(
+                            Point::new(
+                                cell.col as f32 * m.cell_width,
+                                row_index as f32 * m.line_height,
+                            ),
+                            Size::new(cell_draw_width(cell, m), m.line_height),
+                            tint,
+                        );
+                    }
+                }
+            }
+        }
+
+        // Inline ghost suggestion: draw the suffix starting at the cursor, in a
+        // dimmed accent so it reads as "not yet typed". Painted after the grid
+        // so it overlays the (blank) cells to the right of the cursor, and never
+        // injected into the PTY. Clipped to the grid width.
+        if want_ghost {
+            let cols = self.snapshot.size.cols as usize;
+            let row = self.snapshot.cursor.row;
+            let mut col = self.snapshot.cursor.col;
+            let y = row as f32 * m.line_height;
+            let ghost = theme::with_alpha(theme::text_muted(), 0.55);
+            for ch in self.inline_suggestion.chars() {
+                if col >= cols {
+                    break;
+                }
+                let x = col as f32 * m.cell_width;
+                if ch != ' ' {
+                    overlay.fill_text(Text {
+                        content: ch.to_string(),
+                        position: Point::new(x, y),
+                        max_width: m.cell_width,
+                        color: ghost,
+                        size: f32::from(self.font_size).into(),
+                        line_height: LineHeight::Absolute(m.line_height.into()),
+                        font: font_for(ch, false),
+                        align_x: alignment::Horizontal::Left.into(),
+                        align_y: alignment::Vertical::Top,
+                        shaping: iced::widget::text::Shaping::Advanced,
+                    });
+                }
+                col += 1;
+            }
+        }
+
+        vec![grid, overlay.into_geometry()]
+    }
+
+    fn mouse_interaction(
+        &self,
+        _state: &SelectionState,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> mouse::Interaction {
+        if cursor.is_over(bounds) {
+            mouse::Interaction::Text
+        } else {
+            mouse::Interaction::None
+        }
+    }
+}
+
+impl TerminalCanvas<'_> {
+    /// Paint the full cell grid — backgrounds, cursor, search highlights,
+    /// glyphs, underlines — into `frame`. Selection is deliberately absent:
+    /// it is drawn in the per-frame overlay so drag updates don't invalidate
+    /// this (cached) geometry.
+    fn draw_grid(&self, frame: &mut Frame, m: Metrics) {
         // Compute search-match highlights: a set of matched cells, plus the
         // cells belonging to the "current" match (emphasized differently).
+        // This only runs on a cache rebuild, never on an idle redraw.
         let mut match_cells: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
         let mut current_cells: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
         if !self.search_query.is_empty() {
@@ -662,7 +770,6 @@ impl canvas::Program<Message> for TerminalCanvas {
                 let cursor_here = self.snapshot.cursor.visible
                     && self.snapshot.cursor.row == row_index
                     && self.snapshot.cursor.col == cell.col;
-                let selected = sel.is_some_and(|(s, e)| in_selection(cell.col, row_index, s, e));
                 // Only a Block cursor inverts the whole cell; Underline/Beam
                 // leave the glyph untouched and add a thin bar instead.
                 let block_cursor =
@@ -683,14 +790,6 @@ impl canvas::Program<Message> for TerminalCanvas {
                         Size::new(cell_draw_width(cell, m), m.line_height),
                         hl,
                     );
-                } else if selected {
-                    // Flash brighter right after a copy, then settle back.
-                    let alpha = 0.4 + 0.45 * self.copy_flash;
-                    frame.fill_rectangle(
-                        Point::new(x, y),
-                        Size::new(cell_draw_width(cell, m), m.line_height),
-                        theme::with_alpha(theme::accent(), alpha),
-                    );
                 } else if inverse || cell.background.is_some() {
                     let bg = if inverse {
                         theme::accent_strong()
@@ -706,13 +805,13 @@ impl canvas::Program<Message> for TerminalCanvas {
 
                 // Underline / Beam cursor bars (drawn whether or not the cell is
                 // blank, so the cursor is visible on an empty line).
-                if cursor_here && !block_cursor && !selected {
-                    draw_cursor_bar(&mut frame, self.cursor_shape, x, y, cell_draw_width(cell, m), m.line_height);
+                if cursor_here && !block_cursor {
+                    draw_cursor_bar(frame, self.cursor_shape, x, y, cell_draw_width(cell, m), m.line_height);
                 }
 
                 if cell.ch == ' ' {
                     // A space under a Block cursor still needs the inverse fill.
-                    if block_cursor && !selected {
+                    if block_cursor {
                         frame.fill_rectangle(
                             Point::new(x, y),
                             Size::new(cell_draw_width(cell, m), m.line_height),
@@ -724,8 +823,6 @@ impl canvas::Program<Message> for TerminalCanvas {
 
                 let fg = if is_match {
                     Color::from_rgb(0.05, 0.05, 0.05)
-                } else if selected {
-                    theme::text_high()
                 } else if inverse {
                     theme::surface_0()
                 } else {
@@ -753,54 +850,6 @@ impl canvas::Program<Message> for TerminalCanvas {
                     frame.fill(&underline, fg);
                 }
             }
-        }
-
-        // Inline ghost suggestion: draw the suffix starting at the cursor, in a
-        // dimmed accent so it reads as "not yet typed". Painted after the grid
-        // so it overlays the (blank) cells to the right of the cursor, and never
-        // injected into the PTY. Clipped to the grid width.
-        if !self.inline_suggestion.is_empty() && self.snapshot.cursor.visible {
-            let cols = self.snapshot.size.cols as usize;
-            let row = self.snapshot.cursor.row;
-            let mut col = self.snapshot.cursor.col;
-            let y = row as f32 * m.line_height;
-            let ghost = theme::with_alpha(theme::text_muted(), 0.55);
-            for ch in self.inline_suggestion.chars() {
-                if col >= cols {
-                    break;
-                }
-                let x = col as f32 * m.cell_width;
-                if ch != ' ' {
-                    frame.fill_text(Text {
-                        content: ch.to_string(),
-                        position: Point::new(x, y),
-                        max_width: m.cell_width,
-                        color: ghost,
-                        size: f32::from(self.font_size).into(),
-                        line_height: LineHeight::Absolute(m.line_height.into()),
-                        font: font_for(ch, false),
-                        align_x: alignment::Horizontal::Left.into(),
-                        align_y: alignment::Vertical::Top,
-                        shaping: iced::widget::text::Shaping::Advanced,
-                    });
-                }
-                col += 1;
-            }
-        }
-
-        vec![frame.into_geometry()]
-    }
-
-    fn mouse_interaction(
-        &self,
-        _state: &SelectionState,
-        bounds: Rectangle,
-        cursor: mouse::Cursor,
-    ) -> mouse::Interaction {
-        if cursor.is_over(bounds) {
-            mouse::Interaction::Text
-        } else {
-            mouse::Interaction::None
         }
     }
 }

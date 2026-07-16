@@ -44,9 +44,13 @@ rfd = { version = "0.15.2", features = ["tokio"] }
 # Optimize the shipped binary for size (the "small package" goal) without
 # hurting runtime correctness. LTO + a single codegen unit + symbol stripping
 # trade compile time for a noticeably smaller binary.
+#
+# Panics unwind (the default): with `panic = "abort"` any stray panic —
+# including one on a background thread — kills the whole app and every open
+# session. Unwinding lets the GUI keep running and costs only a little binary
+# size; a panic hook in main() logs the location for diagnosis.
 [profile.release]
 opt-level = "z"
 lto = true
 codegen-units = 1
 strip = true
-panic = "abort"

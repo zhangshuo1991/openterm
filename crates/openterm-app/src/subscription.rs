@@ -54,6 +54,17 @@ pub fn subscription(app: &App) -> Subscription<Message> {
         Subscription::none()
     };
 
+    // Toast heartbeat: toast progress is wall-clock derived, so during the
+    // static hold phase a slow tick (instead of full-rate frames) is enough
+    // to retire finished toasts and hand control back to `frames` when the
+    // fade-out window approaches (see `Toast::animating`).
+    let toast_tick = if !app.toasts.is_empty() {
+        iced::time::every(std::time::Duration::from_millis(250))
+            .map(|_| Message::Tick(std::time::Instant::now()))
+    } else {
+        Subscription::none()
+    };
+
     // While the vault overlay is up it gates everything: only Enter (submit)
     // and Esc (manual lock when already unlockable) reach the app, and no
     // keystrokes leak to the terminal.
@@ -67,7 +78,7 @@ pub fn subscription(app: &App) -> Subscription<Message> {
                 _ => None,
             }
         });
-        return Subscription::batch([connections, modifiers, keys, vault_tick]);
+        return Subscription::batch([connections, modifiers, keys, vault_tick, toast_tick]);
     }
 
     // While the settings overlay is open, Esc closes it.
@@ -81,7 +92,7 @@ pub fn subscription(app: &App) -> Subscription<Message> {
                 _ => None,
             }
         });
-        return Subscription::batch([connections, modifiers, keys, vault_tick]);
+        return Subscription::batch([connections, modifiers, keys, vault_tick, toast_tick]);
     }
 
     // While terminal search is open, Esc closes it and app shortcuts still
@@ -107,11 +118,12 @@ pub fn subscription(app: &App) -> Subscription<Message> {
             Subscription::none()
         };
         let metrics = if active_connected {
-            iced::time::every(std::time::Duration::from_secs(2)).map(|_| Message::MetricsTick)
+            let period = if app.rail_visible() { 2 } else { 10 };
+            iced::time::every(std::time::Duration::from_secs(period)).map(|_| Message::MetricsTick)
         } else {
             Subscription::none()
         };
-        return Subscription::batch([connections, modifiers, search_keys, frames, metrics, vault_tick]);
+        return Subscription::batch([connections, modifiers, search_keys, frames, metrics, vault_tick, toast_tick]);
     }
 
     // While the palette is open it owns the keyboard (nav + run + close).
@@ -133,7 +145,7 @@ pub fn subscription(app: &App) -> Subscription<Message> {
     } else {
         Subscription::none()
     };
-    return Subscription::batch([connections, modifiers, palette_keys, frames, vault_tick]);
+    return Subscription::batch([connections, modifiers, palette_keys, frames, vault_tick, toast_tick]);
     }
 
     // The Ctrl+R history-search overlay owns the keyboard while open: nav + run
@@ -156,7 +168,7 @@ pub fn subscription(app: &App) -> Subscription<Message> {
         } else {
             Subscription::none()
         };
-        return Subscription::batch([connections, modifiers, keys, frames, vault_tick]);
+        return Subscription::batch([connections, modifiers, keys, frames, vault_tick, toast_tick]);
     }
 
     // `with` carries the connected + app-cursor flags into the (non-capturing)
@@ -198,11 +210,14 @@ pub fn subscription(app: &App) -> Subscription<Message> {
 
     let resize = window::resize_events().map(|(_id, size)| Message::WindowResized(size));
 
-    // Poll remote resource metrics every 2s whenever the active session is
-    // connected — the resource rail is always shown, so this drives it. Zero
-    // overhead when disconnected.
+    // Poll remote resource metrics while the active session is connected:
+    // every 2s when the resource rail is visible (it drives the charts), and
+    // at a relaxed 10s when the rail is collapsed — then only the footer's
+    // coarse throughput label consumes samples. Zero overhead when
+    // disconnected.
     let metrics = if active_connected {
-        iced::time::every(std::time::Duration::from_secs(2)).map(|_| Message::MetricsTick)
+        let period = if app.rail_visible() { 2 } else { 10 };
+        iced::time::every(std::time::Duration::from_secs(period)).map(|_| Message::MetricsTick)
     } else {
         Subscription::none()
     };
@@ -239,7 +254,7 @@ pub fn subscription(app: &App) -> Subscription<Message> {
         Subscription::none()
     };
 
-    Subscription::batch([connections, modifiers, typing, resize, metrics, frames, ping_tick, pulse, ime, vault_tick])
+    Subscription::batch([connections, modifiers, typing, resize, metrics, frames, ping_tick, pulse, ime, vault_tick, toast_tick])
 }
 
 /// Builder for `Subscription::run_with` — must be a non-capturing fn pointer.

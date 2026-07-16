@@ -7,7 +7,6 @@ use iced::advanced::widget;
 use iced::widget::{button, canvas, container, row, stack, text, text_input};
 use iced::{Alignment, Border, Color, Element, Length};
 use once_cell::sync::Lazy;
-use openterm_terminal::TerminalEngine;
 
 use crate::message::Message;
 use crate::terminal_render::TerminalCanvas;
@@ -27,13 +26,41 @@ pub fn view(app: &App) -> Element<'_, Message> {
     };
 
     let query = app.terminal_search.as_deref().unwrap_or("");
+    let search_query = query.to_lowercase();
+
+    // Grid snapshot: memoized on the terminal's generation counter, so an
+    // unrelated message (tick, mouse move, toast) doesn't re-materialize it.
+    let snapshot = session.render.snapshot(&session.terminal);
+
+    // Render key: everything the *cached* grid geometry depends on. When it
+    // changes, the canvas cache is cleared and the grid re-tessellates once;
+    // otherwise every redraw reuses the stored geometry. Selection, copy
+    // flash, and the ghost suggestion live in a per-frame overlay and are
+    // intentionally absent here.
+    let key = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        session.terminal.generation().hash(&mut h);
+        app.font_size.hash(&mut h);
+        search_query.hash(&mut h);
+        app.terminal_search_idx.hash(&mut h);
+        app.cursor_shape().to_str().hash(&mut h);
+        theme::current_scheme().to_str().hash(&mut h);
+        let accent = theme::accent();
+        (accent.r.to_bits(), accent.g.to_bits(), accent.b.to_bits()).hash(&mut h);
+        let m = crate::terminal_render::metrics(app.font_size);
+        (m.cell_width.to_bits(), m.line_height.to_bits()).hash(&mut h);
+        h.finish()
+    };
+    session.render.sync_key(key);
 
     let program = TerminalCanvas {
-        snapshot: session.terminal.snapshot(),
+        cache: &session.render.canvas,
+        snapshot,
         font_size: app.font_size,
         selection: session.selection,
         mouse: session.terminal.mouse_protocol(),
-        search_query: query.to_lowercase(),
+        search_query,
         search_current: app.terminal_search_idx,
         cursor_shape: app.cursor_shape(),
         copy_flash: app.copy_flash(),

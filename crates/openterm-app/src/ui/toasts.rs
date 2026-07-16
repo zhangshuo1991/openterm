@@ -47,17 +47,26 @@ impl ToastKind {
     }
 }
 
-/// One toast. `progress` runs 0.0→~1.3 over its lifetime: it slides/fades in
-/// over the first ~12%, holds, then fades out past 1.0. `dismissed` forces an
-/// early retire on the next tick.
+/// One toast. Progress is derived from wall-clock age (see [`Toast::progress`])
+/// and runs 0.0→~1.3 over its lifetime: it slides/fades in over the first
+/// ~12%, holds, then fades out past 1.0. `dismissed` forces an early retire
+/// on the next tick.
+///
+/// Deriving progress from time (instead of accumulating per-frame deltas)
+/// means the hold phase needs no animation frames at all — a slow heartbeat
+/// tick retires the toast and catches the fade-out window, and full-rate
+/// frames only run during the actual fade transitions.
 #[derive(Debug, Clone)]
 pub struct Toast {
     pub id: u64,
     pub kind: ToastKind,
     pub msg: String,
-    pub progress: f32,
+    pub created: std::time::Instant,
     pub dismissed: bool,
 }
+
+/// Seconds per unit of progress (total lifetime = 1.3 × this ≈ 3.9 s).
+const LIFE_UNIT_SECS: f32 = 3.0;
 
 impl Toast {
     pub fn new(id: u64, kind: ToastKind, msg: impl Into<String>) -> Self {
@@ -65,33 +74,56 @@ impl Toast {
             id,
             kind,
             msg: msg.into(),
-            progress: 0.0,
+            created: std::time::Instant::now(),
             dismissed: false,
         }
     }
 
+    /// Lifecycle progress at `now`: fade in over [0, 0.12], hold over
+    /// [0.12, 1.0], fade out over [1.0, 1.3].
+    pub fn progress(&self, now: std::time::Instant) -> f32 {
+        now.saturating_duration_since(self.created).as_secs_f32() / LIFE_UNIT_SECS
+    }
+
+    /// Finished (fully faded out, or manually dismissed) — ready to retire.
+    pub fn done(&self, now: std::time::Instant) -> bool {
+        self.dismissed || self.progress(now) >= 1.3
+    }
+
+    /// True while an entrance/exit transition is running — the only phases
+    /// that need per-frame redraws; the hold phase is visually static. The
+    /// margins are wider than the exact fade windows so the ~250 ms heartbeat
+    /// hands over to full-rate frames before a fade visibly starts.
+    pub fn animating(&self, now: std::time::Instant) -> bool {
+        if self.dismissed {
+            return false;
+        }
+        let p = self.progress(now);
+        p < 0.13 || p > 0.95
+    }
+
     /// Entrance/exit eased opacity in 0.0..=1.0.
-    fn opacity(&self) -> f32 {
+    fn opacity(&self, now: std::time::Instant) -> f32 {
         if self.dismissed {
             return 0.0;
         }
-        // Fade in over [0, 0.12], full over [0.12, 1.0], fade out over [1.0, 1.3].
-        if self.progress < 0.12 {
-            (self.progress / 0.12).clamp(0.0, 1.0)
-        } else if self.progress <= 1.0 {
+        let progress = self.progress(now);
+        if progress < 0.12 {
+            (progress / 0.12).clamp(0.0, 1.0)
+        } else if progress <= 1.0 {
             1.0
         } else {
-            (1.0 - (self.progress - 1.0) / 0.3).clamp(0.0, 1.0)
+            (1.0 - (progress - 1.0) / 0.3).clamp(0.0, 1.0)
         }
     }
 }
 
 /// Stack of toasts, anchored top-right. Returns an overlay element to push onto
 /// the view's top `stack![]` layer.
-pub fn view(toasts: &[Toast]) -> Element<'_, Message> {
+pub fn view(toasts: &[Toast], now: std::time::Instant) -> Element<'_, Message> {
     let mut col = column![].spacing(8).align_x(iced::Alignment::End);
     for t in toasts {
-        col = col.push(toast_card(t));
+        col = col.push(toast_card(t, now));
     }
 
     container(col)
@@ -108,11 +140,11 @@ pub fn view(toasts: &[Toast]) -> Element<'_, Message> {
         .into()
 }
 
-fn toast_card(t: &Toast) -> Element<'_, Message> {
-    let alpha = t.opacity();
+fn toast_card(t: &Toast, now: std::time::Instant) -> Element<'_, Message> {
+    let alpha = t.opacity(now);
     let accent = t.kind.color();
     // Slide in ~24px from the right as it appears.
-    let slide = ((0.12 - t.progress.min(0.12)) / 0.12 * 24.0).max(0.0);
+    let slide = ((0.12 - t.progress(now).min(0.12)) / 0.12 * 24.0).max(0.0);
 
     // Circular glyph badge tinted with the toast's accent.
     let badge = container(

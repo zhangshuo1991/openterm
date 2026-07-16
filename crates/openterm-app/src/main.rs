@@ -42,6 +42,8 @@ const VAULT_DEFAULT_KEY: &[u8] = b"openterm-local-default-vault-v1";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn main() -> iced::Result {
+    install_panic_logger();
+
     // Fuse the native macOS titlebar into our chrome: the content fills the full
     // window height and the traffic lights float over our tab bar, reclaiming the
     // ~28px the system titlebar used to take.
@@ -68,8 +70,48 @@ fn app_theme(_app: &App) -> Theme {
     Theme::Dark
 }
 
+/// Log every panic (with location and payload) to `crash.log` next to the
+/// workspace database, then continue with the default hook. Panics unwind
+/// rather than abort (see the release profile note in Cargo.toml), so a bug
+/// on a background thread doesn't take down every open session — this hook
+/// makes sure it still leaves a trace we can diagnose.
+fn install_panic_logger() {
+    let log_path = openterm_ui::default_db_path().with_file_name("crash.log");
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".to_string());
+        let thread = std::thread::current();
+        let entry = format!(
+            "[{:?}] thread '{}' panicked at {location}: {payload}\n",
+            std::time::SystemTime::now(),
+            thread.name().unwrap_or("<unnamed>"),
+        );
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            use std::io::Write;
+            let _ = f.write_all(entry.as_bytes());
+        }
+        default_hook(info);
+    }));
+}
+
 pub struct App {
-    db_path: PathBuf,
+    /// The workspace database, opened once at startup and shared everywhere
+    /// (redb's `Database` is `Send + Sync`). `None` only when the DB could
+    /// not be opened — persistence is then disabled but the app still runs.
+    store: Option<std::sync::Arc<WorkspaceStore>>,
     hosts: Vec<HostProfile>,
     host_search: String,
     sessions: Vec<Session>,
@@ -242,7 +284,9 @@ pub struct App {
 impl App {
     fn new() -> (Self, Task<Message>) {
         let db_path = openterm_ui::default_db_path();
-        let (hosts, settings, all_history, snippets) = WorkspaceStore::open(&db_path)
+        let store = WorkspaceStore::open(&db_path).ok().map(std::sync::Arc::new);
+        let (hosts, settings, all_history, snippets) = store
+            .as_deref()
             .map(|store| {
                 (
                     store.list_hosts().unwrap_or_default(),
@@ -283,7 +327,7 @@ impl App {
         );
 
         let mut app = App {
-            db_path,
+            store,
             hosts,
             host_search: String::new(),
             sessions: Vec::new(),
@@ -372,8 +416,8 @@ impl App {
             reveal_password: false,
         };
         // Check whether a master-password canary already exists.
-        app.vault_has_canary = WorkspaceStore::open(&app.db_path)
-            .ok()
+        app.vault_has_canary = app
+            .store()
             .and_then(|s| s.get_master_canary().ok())
             .flatten()
             .is_some();
@@ -681,7 +725,7 @@ impl App {
             || self.rail_anim.is_animating(self.now)
             || self.settings_anim.is_animating(self.now)
             || self.closing_tabs.values().any(|a| a.is_animating(self.now))
-            || !self.toasts.is_empty()
+            || self.toasts.iter().any(|t| t.animating(self.now))
             || self.copy_flash_until.is_some_and(|t| self.now < t)
     }
 
@@ -751,9 +795,16 @@ impl App {
             .map(|s| s.expansion.as_str())
     }
 
+    /// Cheap owned handle to the workspace store (opened once at startup).
+    /// Returning an owned `Arc` avoids borrow conflicts at call sites that
+    /// also mutate `self`, and clones are pointer-sized.
+    pub fn store(&self) -> Option<std::sync::Arc<WorkspaceStore>> {
+        self.store.clone()
+    }
+
     fn decrypt_secret(&self, id: openterm_core::SecretId) -> Option<String> {
         if self.vault_locked() { return None; }
-        let store = WorkspaceStore::open(&self.db_path).ok()?;
+        let store = self.store()?;
         let secret = store.get_secret(id).ok().flatten()?;
         let bytes = self
             .vault()
@@ -889,7 +940,7 @@ impl App {
 
     /// Persist the current UI settings (font size, theme).
     fn persist_settings(&self) {
-        if let Ok(store) = WorkspaceStore::open(&self.db_path) {
+        if let Some(store) = self.store() {
             let _ = store.save_ui_settings(&UiSettings {
                 theme_mode: "dark".to_string(),
                 terminal_font_size: self.font_size,
@@ -908,7 +959,7 @@ impl App {
 
     /// Update a saved host's last-connected timestamp.
     fn touch_host(&mut self, host_id: HostId) {
-        let Ok(store) = WorkspaceStore::open(&self.db_path) else {
+        let Some(store) = self.store() else {
             return;
         };
         if let Ok(Some(mut host)) = store.get_host(host_id) {
@@ -925,7 +976,9 @@ fn persist_host(app: &App, config: &SessionConfig) -> Result<HostId, String> {
     // Validate by building a route first (re-uses the same checks).
     App::build_route(config).map_err(|e| e)?;
 
-    let store = WorkspaceStore::open(&app.db_path).map_err(|e| e.to_string())?;
+    let store = app
+        .store()
+        .ok_or_else(|| "Workspace storage is unavailable.".to_string())?;
     let vault = app.vault();
 
     // Reuse the existing host id when editing, so we update in place.

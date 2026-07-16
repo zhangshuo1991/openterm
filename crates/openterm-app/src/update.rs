@@ -2,7 +2,6 @@
 //! tasks. Connection lifecycle is the delicate part — see the `Conn` arm.
 
 use iced::{animation::Animation, clipboard, Task};
-use openterm_terminal::TerminalEngine;
 
 use crate::connection::{Command, ConnectParams, Event as ConnEvent};
 use crate::message::Message;
@@ -46,7 +45,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::ConfirmDeleteHost => {
             if let Some(index) = app.pending_host_delete.take() {
                 if let Some(host) = app.hosts.get(index).cloned() {
-                    if let Ok(store) = openterm_storage::WorkspaceStore::open(&app.db_path) {
+                    if let Some(store) = app.store() {
                         let _ = store.delete_host(host.id);
                         app.hosts = store.list_hosts().unwrap_or_default();
                     }
@@ -201,7 +200,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                         if let Some(session) = app.active_session_mut() {
                             session.config.host_id = Some(host_id);
                         }
-                        if let Ok(store) = openterm_storage::WorkspaceStore::open(&app.db_path) {
+                        if let Some(store) = app.store() {
                             app.hosts = store.list_hosts().unwrap_or_default();
                         }
                         app.touch_vault();
@@ -273,7 +272,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             app.terminal_menu = None;
             // Select the whole visible grid: (0,0) to (last_col, last_row).
             if let Some(session) = app.active_session_mut() {
-                let snap = session.terminal.snapshot();
+                let snap = session.render.snapshot(&session.terminal);
                 let last_row = snap.cells.len().saturating_sub(1);
                 let last_col = snap
                     .cells
@@ -323,7 +322,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             app.terminal_menu = None;
             let text = app.active_session().and_then(|s| {
                 let (c1, r1, c2, r2) = s.selection?;
-                let snap = s.terminal.snapshot();
+                let snap = s.render.snapshot(&s.terminal);
                 let t = crate::terminal_render::selected_text(&snap, (c1, r1), (c2, r2));
                 if t.is_empty() { None } else { Some(t) }
             });
@@ -391,7 +390,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::HistoryCopyCmd(cmd) => clipboard::write(cmd),
         Message::HistoryClearAll => {
-            if let Ok(store) = openterm_storage::WorkspaceStore::open(&app.db_path) {
+            if let Some(store) = app.store() {
                 let _ = store.clear_history();
             }
             app.all_history.clear();
@@ -491,8 +490,9 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             apply_grid(app)
         }
         Message::MetricsTick => {
-            // Sample whenever the active session is connected (the rail is always
-            // shown). Process sampling only runs while the expander is open.
+            // Sample while the active session is connected. Cadence is decided
+            // by the subscription (2s with the rail visible, 10s collapsed).
+            // Process sampling only runs while the expander is open.
             if let Some(session) = app.active_session() {
                 if session.phase == Phase::Connected {
                     if let Some(tx) = &session.cmd_tx {
@@ -970,7 +970,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 return Task::none();
             }
             let snippet = openterm_storage::Snippet { abbr, expansion };
-            if let Ok(store) = openterm_storage::WorkspaceStore::open(&app.db_path) {
+            if let Some(store) = app.store() {
                 let _ = store.save_snippet(&snippet);
                 app.snippets = store.list_snippets().unwrap_or_default();
             }
@@ -979,7 +979,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::SnippetDelete(abbr) => {
-            if let Ok(store) = openterm_storage::WorkspaceStore::open(&app.db_path) {
+            if let Some(store) = app.store() {
                 let _ = store.delete_snippet(&abbr);
                 app.snippets = store.list_snippets().unwrap_or_default();
             }
@@ -1084,9 +1084,15 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
 
         Message::PointerMoved(_) => Task::none(),
         Message::PingTick => {
+            // With the sidebar collapsed nothing shows per-host latency except
+            // the footer's sparkline for the active session's host — skip
+            // pinging every other saved host until the sidebar is back.
+            let active_host = app.active_session().and_then(|s| s.config.host_id);
+            let sidebar_visible = !app.sidebar_collapsed();
             let tasks: Vec<Task<Message>> = app
                 .hosts
                 .iter()
+                .filter(|host| sidebar_visible || Some(host.id) == active_host)
                 .map(|host| {
                     let host_id = host.id;
                     let addr = format!("{}:{}", host.host, host.port);
@@ -1121,20 +1127,12 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::Tick(now) => {
-            // Real delta since the last frame, clamped so a stale `now` (e.g. the
-            // first frame after idle) can't jolt time-based animations.
-            let dt = now
-                .saturating_duration_since(app.now)
-                .as_secs_f32()
-                .min(0.1);
             app.now = now;
 
-            // Advance toasts and retire finished / dismissed ones.
+            // Retire finished / dismissed toasts (progress is wall-clock
+            // derived, so there's nothing to advance here).
             if !app.toasts.is_empty() {
-                for t in &mut app.toasts {
-                    t.progress += dt / 3.0;
-                }
-                app.toasts.retain(|t| !t.dismissed && t.progress < 1.3);
+                app.toasts.retain(|t| !t.done(now));
             }
 
             // Finalize tab-close animations: once a tab has fully collapsed,
@@ -1250,7 +1248,12 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                     if let crate::session::ViewerContent::Loaded(ref mut c) = fv.content {
                         if let Some(&off) = fv.matches.get(fv.match_idx) {
                             let end = off + fv.search.len();
-                            if end <= c.len() {
+                            // Byte-offset safety: `get` returns None unless both
+                            // ends are valid char boundaries, and comparing the
+                            // slice against the search text rejects any stale
+                            // offset (multi-byte text made this class of code
+                            // panic before — see the UTF-8 slicing history).
+                            if c.get(off..end) == Some(fv.search.as_str()) {
                                 c.replace_range(off..end, &fv.replace.clone());
                                 fv.dirty = true;
                                 fv.refresh_matches();
@@ -1376,7 +1379,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                     app.vault_last_check = std::time::Instant::now();
                     app.status = "Vault unlocked.".to_string();
                     // Refresh hosts now that secrets can be decrypted.
-                    if let Ok(store) = openterm_storage::WorkspaceStore::open(&app.db_path) {
+                    if let Some(store) = app.store() {
                         app.hosts = store.list_hosts().unwrap_or_default();
                     }
                 }
@@ -1399,11 +1402,15 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                     app.vault_err = None;
                     app.vault_busy = true;
                     app.status = "Encrypting saved credentials…".to_string();
-                    let db_path = app.db_path.clone();
+                    let Some(store) = app.store() else {
+                        app.vault_busy = false;
+                        app.vault_err = Some("Workspace storage is unavailable.".to_string());
+                        return Task::none();
+                    };
                     return Task::perform(
                         async move {
                             tokio::task::spawn_blocking(move || {
-                                reencrypt_all_secrets(&db_path, crate::VAULT_DEFAULT_KEY, master.as_bytes())
+                                reencrypt_all_secrets(&store, crate::VAULT_DEFAULT_KEY, master.as_bytes())
                             })
                             .await
                             .unwrap_or_else(|e| Err(e.to_string()))
@@ -1438,7 +1445,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                     app.touch_vault();
                     app.vault_last_check = std::time::Instant::now();
                     app.persist_settings();
-                    if let Ok(store) = openterm_storage::WorkspaceStore::open(&app.db_path) {
+                    if let Some(store) = app.store() {
                         app.hosts = store.list_hosts().unwrap_or_default();
                     }
                     app.status = "Credential vault enabled.".to_string();
@@ -1448,7 +1455,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                     // encrypted under a master password the vault won't use.
                     app.vault_master = None;
                     app.vault_setup_prompt = false;
-                    if let Ok(store) = openterm_storage::WorkspaceStore::open(&app.db_path) {
+                    if let Some(store) = app.store() {
                         let _ = store.delete_master_canary();
                     }
                     app.vault_has_canary = false;
@@ -1469,11 +1476,15 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             };
             app.vault_busy = true;
             app.status = "Decrypting saved credentials…".to_string();
-            let db_path = app.db_path.clone();
+            let Some(store) = app.store() else {
+                app.vault_busy = false;
+                app.status = "Workspace storage is unavailable.".to_string();
+                return Task::none();
+            };
             Task::perform(
                 async move {
                     tokio::task::spawn_blocking(move || {
-                        reencrypt_all_secrets(&db_path, master.as_bytes(), crate::VAULT_DEFAULT_KEY)
+                        reencrypt_all_secrets(&store, master.as_bytes(), crate::VAULT_DEFAULT_KEY)
                     })
                     .await
                     .unwrap_or_else(|e| Err(e.to_string()))
@@ -1488,7 +1499,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                     app.vault_enabled = false;
                     app.vault_master = None;
                     app.vault_has_canary = false;
-                    if let Ok(store) = openterm_storage::WorkspaceStore::open(&app.db_path) {
+                    if let Some(store) = app.store() {
                         let _ = store.delete_master_canary();
                     }
                     app.persist_settings();
@@ -1511,8 +1522,11 @@ const VAULT_CANARY_PLAINTEXT: &[u8] = b"OpenTerm vault v1";
 
 /// Handle vault setup (first run) or unlock, running Argon2id off the UI thread.
 fn vault_submit(app: &mut App) -> Task<Message> {
-    let db_path = app.db_path.clone();
     let pw = app.vault_pw.clone();
+    let Some(store) = app.store() else {
+        app.vault_err = Some("Workspace storage is unavailable.".to_string());
+        return Task::none();
+    };
 
     if app.vault_has_canary {
         // Unlock: derive key, try to decrypt the stored canary.
@@ -1523,8 +1537,6 @@ fn vault_submit(app: &mut App) -> Task<Message> {
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    let store = openterm_storage::WorkspaceStore::open(&db_path)
-                        .map_err(|e| e.to_string())?;
                     let canary = store
                         .get_master_canary()
                         .map_err(|e| e.to_string())?
@@ -1554,8 +1566,6 @@ fn vault_submit(app: &mut App) -> Task<Message> {
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    let store = openterm_storage::WorkspaceStore::open(&db_path)
-                        .map_err(|e| e.to_string())?;
                     let vault = openterm_crypto::LocalVault::new(openterm_crypto::VaultConfig::default());
                     let canary = vault
                         .encrypt_secret(pw.as_bytes(), VAULT_CANARY_PLAINTEXT)
@@ -1578,11 +1588,10 @@ fn vault_submit(app: &mut App) -> Task<Message> {
 /// failure never leaves the store half-converted. Each secret keeps its `id`
 /// so host references stay valid.
 fn reencrypt_all_secrets(
-    db_path: &std::path::Path,
+    store: &openterm_storage::WorkspaceStore,
     old_key: &[u8],
     new_key: &[u8],
 ) -> Result<(), String> {
-    let store = openterm_storage::WorkspaceStore::open(db_path).map_err(|e| e.to_string())?;
     let vault = openterm_crypto::LocalVault::new(openterm_crypto::VaultConfig::default());
     let secrets = store.list_secrets().map_err(|e| e.to_string())?;
     let mut migrated = Vec::with_capacity(secrets.len());
@@ -2590,6 +2599,10 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
     // Host label whose persisted history should seed the learned token model
     // once the `session` borrow below is released (set on Connected).
     let mut seed_model_host: Option<String> = None;
+    // Field-level clone (not the `store()` method): `session` below holds a
+    // mutable borrow of `app.sessions`, and a method call would borrow all of
+    // `app`. Disjoint field access keeps the borrow checker happy.
+    let store_handle = app.store.clone();
     let session = &mut app.sessions[index];
 
     match event {
@@ -2632,17 +2645,16 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
                         prev.output.clone_from(&committed);
                     }
                     // #23: async write — never blocks the UI thread.
-                    let db = app.db_path.clone();
-                    extra_tasks.push(Task::perform(
-                        async move {
-                            let _ = tokio::task::spawn_blocking(move || {
-                                if let Ok(s) = openterm_storage::WorkspaceStore::open(&db) {
-                                    let _ = s.update_last_history_output(&committed);
-                                }
-                            }).await;
-                        },
-                        |_| Message::Noop,
-                    ));
+                    if let Some(store) = store_handle.clone() {
+                        extra_tasks.push(Task::perform(
+                            async move {
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    let _ = store.update_last_history_output(&committed);
+                                }).await;
+                            },
+                            |_| Message::Noop,
+                        ));
+                    }
                 }
                 session.command_history.last().map(|cmd: &String| {
                     // Live-learn the just-committed command into the token model.
@@ -2662,18 +2674,17 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
             };
             if let Some(entry) = new_entry {
                 // #23: async write — never blocks the UI thread.
-                let db = app.db_path.clone();
-                let e2 = entry.clone();
-                extra_tasks.push(Task::perform(
-                    async move {
-                        let _ = tokio::task::spawn_blocking(move || {
-                            if let Ok(s) = openterm_storage::WorkspaceStore::open(&db) {
-                                let _ = s.append_history(&e2);
-                            }
-                        }).await;
-                    },
-                    |_| Message::Noop,
-                ));
+                if let Some(store) = store_handle.clone() {
+                    let e2 = entry.clone();
+                    extra_tasks.push(Task::perform(
+                        async move {
+                            let _ = tokio::task::spawn_blocking(move || {
+                                let _ = store.append_history(&e2);
+                            }).await;
+                        },
+                        |_| Message::Noop,
+                    ));
+                }
                 app.all_history.push_front(entry); // #10: O(1) push_front
             }
             crate::smoke::record(&smoke, "output");

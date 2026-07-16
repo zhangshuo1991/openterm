@@ -55,6 +55,30 @@ pub enum SshError {
     Agent(String),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("operation timed out")]
+    Timeout,
+}
+
+/// Upper bound for short remote operations (exec samples, SFTP metadata,
+/// directory listings). Chosen well above normal round-trip times: its job is
+/// to release the channel-semaphore permit when a server stops responding
+/// (frozen disk, cgroup freeze), not to police slow-but-alive links.
+const OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Bulk-content bound (whole-file read/write, recursive deletes): more
+/// generous, since legitimately large payloads on slow links take a while.
+const CONTENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Run `fut` with a deadline, mapping expiry to [`SshError::Timeout`]. On
+/// timeout the in-flight future is dropped, which closes its channel and
+/// releases the channel-semaphore permit it held.
+async fn bounded<T>(
+    limit: std::time::Duration,
+    fut: impl std::future::Future<Output = Result<T, SshError>>,
+) -> Result<T, SshError> {
+    tokio::time::timeout(limit, fut)
+        .await
+        .unwrap_or(Err(SshError::Timeout))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -810,6 +834,10 @@ impl RusshSession {
     /// fresh exec channel on the live connection (multiplexed alongside the shell
     /// and SFTP), so an `Arc<RusshSession>` can sample remote state — e.g. the
     /// resource monitor reading `/proc` — without disturbing the interactive PTY.
+    ///
+    /// Bounded by [`OP_TIMEOUT`]: a hung remote (frozen disk, cgroup freeze)
+    /// would otherwise hold this permit forever, and six stuck samples would
+    /// starve SFTP/metrics/completion for the whole connection.
     pub async fn exec_capture(&self, command: &str) -> Result<ExecOutput, SshError> {
         let _permit = self
             .channel_sem
@@ -817,30 +845,33 @@ impl RusshSession {
             .acquire_owned()
             .await
             .expect("channel semaphore closed");
-        let mut channel = self.handle.channel_open_session().await?;
-        channel.exec(true, command).await?;
+        bounded(OP_TIMEOUT, async {
+            let mut channel = self.handle.channel_open_session().await?;
+            channel.exec(true, command).await?;
 
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let mut exit_status = None;
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let mut exit_status = None;
 
-        while let Some(message) = channel.wait().await {
-            match message {
-                ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
-                ChannelMsg::ExtendedData { data, ext: 1 } => stderr.extend_from_slice(&data),
-                ChannelMsg::ExitStatus { exit_status: code } => exit_status = Some(code),
-                ChannelMsg::Close => break,
-                _ => {}
+            while let Some(message) = channel.wait().await {
+                match message {
+                    ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
+                    ChannelMsg::ExtendedData { data, ext: 1 } => stderr.extend_from_slice(&data),
+                    ChannelMsg::ExitStatus { exit_status: code } => exit_status = Some(code),
+                    ChannelMsg::Close => break,
+                    _ => {}
+                }
             }
-        }
 
-        Ok(ExecOutput {
-            // Some servers close the channel without an explicit exit-status for
-            // piped commands; default to 0 rather than failing the sample.
-            exit_status: exit_status.unwrap_or(0),
-            stdout,
-            stderr,
+            Ok(ExecOutput {
+                // Some servers close the channel without an explicit exit-status for
+                // piped commands; default to 0 rather than failing the sample.
+                exit_status: exit_status.unwrap_or(0),
+                stdout,
+                stderr,
+            })
         })
+        .await
     }
 
     pub async fn interactive_shell<I, O>(
@@ -981,10 +1012,13 @@ impl RusshSession {
 
     /// Resolve a (possibly relative) remote path to its absolute form.
     pub async fn canonicalize(&self, path: &str) -> Result<String, SshError> {
-        let sftp = self.open_sftp_guarded().await?;
-        let result = sftp.canonicalize(path).await.map_err(SshError::from);
-        let _ = sftp.close().await;
-        result
+        bounded(OP_TIMEOUT, async {
+            let sftp = self.open_sftp_guarded().await?;
+            let result = sftp.canonicalize(path).await.map_err(SshError::from);
+            let _ = sftp.close().await;
+            result
+        })
+        .await
     }
 
     pub async fn list_dir(&self, path: &str) -> Result<Vec<RemoteFileEntry>, SshError> {
@@ -1003,6 +1037,7 @@ impl RusshSession {
         &self,
         path: &str,
     ) -> Result<(String, Vec<RemoteFileEntry>), SshError> {
+        bounded(OP_TIMEOUT, async {
         let sftp = self.open_sftp_guarded().await?;
         let result: Result<(String, Vec<RemoteFileEntry>), SshError> = async {
             // Absolute paths are already resolved; only relative ones (".",
@@ -1036,17 +1071,23 @@ impl RusshSession {
         }.await;
         let _ = sftp.close().await;
         result
+        })
+        .await
     }
 
     pub async fn read_file(&self, remote_path: &str) -> Result<Vec<u8>, SshError> {
-        let sftp = self.open_sftp_guarded().await?;
-        let result = sftp.read(remote_path).await.map_err(SshError::from);
-        let _ = sftp.close().await;
-        result
+        bounded(CONTENT_TIMEOUT, async {
+            let sftp = self.open_sftp_guarded().await?;
+            let result = sftp.read(remote_path).await.map_err(SshError::from);
+            let _ = sftp.close().await;
+            result
+        })
+        .await
     }
 
     /// Read `len` bytes starting at `offset` from a remote file.
     pub async fn read_file_range(&self, remote_path: &str, offset: u64, len: u64) -> Result<(Vec<u8>, u64), SshError> {
+        bounded(OP_TIMEOUT, async {
         let sftp = self.open_sftp_guarded().await?;
         let result: Result<(Vec<u8>, u64), SshError> = async {
             let total = sftp.metadata(remote_path).await?.size.unwrap_or(0);
@@ -1065,26 +1106,34 @@ impl RusshSession {
         }.await;
         let _ = sftp.close().await;
         result
+        })
+        .await
     }
 
     pub async fn write_file(&self, remote_path: &str, bytes: Vec<u8>) -> Result<(), SshError> {
-        let sftp = self.open_sftp_guarded().await?;
-        let result: Result<(), SshError> = async {
-            let mut file = sftp.create(remote_path).await?;
-            file.write_all(&bytes).await?;
-            file.shutdown().await?;
-            Ok(())
-        }.await;
-        let _ = sftp.close().await;
-        result
+        bounded(CONTENT_TIMEOUT, async {
+            let sftp = self.open_sftp_guarded().await?;
+            let result: Result<(), SshError> = async {
+                let mut file = sftp.create(remote_path).await?;
+                file.write_all(&bytes).await?;
+                file.shutdown().await?;
+                Ok(())
+            }.await;
+            let _ = sftp.close().await;
+            result
+        })
+        .await
     }
 
     /// Size of a remote file in bytes (0 if unknown).
     pub async fn remote_file_size(&self, remote_path: &str) -> Result<u64, SshError> {
-        let sftp = self.open_sftp_guarded().await?;
-        let result = sftp.metadata(remote_path).await.map(|m| m.size.unwrap_or(0)).map_err(SshError::from);
-        let _ = sftp.close().await;
-        result
+        bounded(OP_TIMEOUT, async {
+            let sftp = self.open_sftp_guarded().await?;
+            let result = sftp.metadata(remote_path).await.map(|m| m.size.unwrap_or(0)).map_err(SshError::from);
+            let _ = sftp.close().await;
+            result
+        })
+        .await
     }
 
     /// Download a remote file to a local path, streaming in chunks and reporting
@@ -1306,10 +1355,13 @@ impl RusshSession {
     }
 
     pub async fn create_dir(&self, remote_path: &str) -> Result<(), SshError> {
-        let sftp = self.open_sftp_guarded().await?;
-        let result = sftp.create_dir(remote_path).await.map_err(SshError::from);
-        let _ = sftp.close().await;
-        result
+        bounded(OP_TIMEOUT, async {
+            let sftp = self.open_sftp_guarded().await?;
+            let result = sftp.create_dir(remote_path).await.map_err(SshError::from);
+            let _ = sftp.close().await;
+            result
+        })
+        .await
     }
 
     pub async fn remove_path(
@@ -1317,32 +1369,41 @@ impl RusshSession {
         remote_path: &str,
         kind: RemoteFileKind,
     ) -> Result<(), SshError> {
-        let sftp = self.open_sftp_guarded().await?;
-        let result = match kind {
-            RemoteFileKind::Directory => remove_dir_recursive(&sftp, remote_path).await,
-            RemoteFileKind::File | RemoteFileKind::Symlink | RemoteFileKind::Other => {
-                sftp.remove_file(remote_path).await.map_err(SshError::from)
-            }
-        };
-        let _ = sftp.close().await;
-        result
+        bounded(CONTENT_TIMEOUT, async {
+            let sftp = self.open_sftp_guarded().await?;
+            let result = match kind {
+                RemoteFileKind::Directory => remove_dir_recursive(&sftp, remote_path).await,
+                RemoteFileKind::File | RemoteFileKind::Symlink | RemoteFileKind::Other => {
+                    sftp.remove_file(remote_path).await.map_err(SshError::from)
+                }
+            };
+            let _ = sftp.close().await;
+            result
+        })
+        .await
     }
 
     pub async fn rename_path(&self, old_path: &str, new_path: &str) -> Result<(), SshError> {
-        let sftp = self.open_sftp_guarded().await?;
-        let result = sftp.rename(old_path, new_path).await.map_err(SshError::from);
-        let _ = sftp.close().await;
-        result
+        bounded(OP_TIMEOUT, async {
+            let sftp = self.open_sftp_guarded().await?;
+            let result = sftp.rename(old_path, new_path).await.map_err(SshError::from);
+            let _ = sftp.close().await;
+            result
+        })
+        .await
     }
 
     /// Change the permissions of a remote file (SFTP setstat).
     pub async fn chmod_path(&self, path: &str, mode: u32) -> Result<(), SshError> {
-        let sftp = self.open_sftp_guarded().await?;
-        let mut attrs = FileAttributes::default();
-        attrs.permissions = Some(mode);
-        let result = sftp.set_metadata(path, attrs).await.map_err(SshError::from);
-        let _ = sftp.close().await;
-        result
+        bounded(OP_TIMEOUT, async {
+            let sftp = self.open_sftp_guarded().await?;
+            let mut attrs = FileAttributes::default();
+            attrs.permissions = Some(mode);
+            let result = sftp.set_metadata(path, attrs).await.map_err(SshError::from);
+            let _ = sftp.close().await;
+            result
+        })
+        .await
     }
 
     pub async fn run_local_forward(

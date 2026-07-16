@@ -1073,7 +1073,6 @@ fn spawn_suggestion_query(
 /// app needs no special-casing beyond picking which worker to run.
 #[cfg(unix)]
 pub fn local_worker(session_id: u64) -> impl iced::futures::Stream<Item = Event> {
-    use std::os::unix::io::RawFd;
     iced::stream::channel(256, move |mut out: OutSink| async move {
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<Command>(256);
         if out.send(Event::Ready { session_id, sender: cmd_tx }).await.is_err() {
@@ -1091,7 +1090,7 @@ pub fn local_worker(session_id: u64) -> impl iced::futures::Stream<Item = Event>
         let _ = out.send(Event::Connecting { session_id }).await;
 
         // Open a PTY pair and spawn $SHELL.
-        let (master_fd, child_pid) = match spawn_pty_shell(params.cols, params.rows) {
+        let (master_fd, mut child) = match spawn_pty_shell(params.cols, params.rows) {
             Ok(x) => x,
             Err(e) => {
                 let _ = out.send(Event::Failed { session_id, error: e.to_string() }).await;
@@ -1116,7 +1115,28 @@ pub fn local_worker(session_id: u64) -> impl iced::futures::Stream<Item = Event>
             tokio::select! {
                 cmd = cmd_rx.recv() => match cmd {
                     Some(Command::Write(bytes)) => {
-                        unsafe { libc::write(master_fd, bytes.as_ptr() as *const libc::c_void, bytes.len()); }
+                        // Write the full buffer: a PTY can take a partial
+                        // write under load (large pastes), and silently
+                        // dropping the tail would corrupt the shell's input.
+                        let mut off = 0;
+                        while off < bytes.len() {
+                            let n = unsafe {
+                                libc::write(
+                                    master_fd,
+                                    bytes[off..].as_ptr() as *const libc::c_void,
+                                    bytes.len() - off,
+                                )
+                            };
+                            if n < 0 {
+                                if std::io::Error::last_os_error().kind()
+                                    == std::io::ErrorKind::Interrupted
+                                {
+                                    continue;
+                                }
+                                break;
+                            }
+                            off += n as usize;
+                        }
                     }
                     Some(Command::Resize { cols, rows }) => {
                         let ws = libc::winsize { ws_col: cols, ws_row: rows, ws_xpixel: 0, ws_ypixel: 0 };
@@ -1154,17 +1174,34 @@ pub fn local_worker(session_id: u64) -> impl iced::futures::Stream<Item = Event>
 
         unsafe {
             libc::close(master_fd);
-            libc::kill(child_pid, libc::SIGHUP);
         }
+        // Reap the shell on a blocking thread so it never lingers as a
+        // zombie: HUP first (the normal terminal hang-up), escalate to KILL
+        // if it hasn't exited after a short grace period. Detached — the
+        // Closed event goes out immediately.
+        tokio::task::spawn_blocking(move || {
+            let pid = child.id() as libc::pid_t;
+            unsafe { libc::kill(pid, libc::SIGHUP); }
+            for _ in 0..40 {
+                match child.try_wait() {
+                    Ok(Some(_)) => return,
+                    Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                    Err(_) => return,
+                }
+            }
+            unsafe { libc::kill(pid, libc::SIGKILL); }
+            let _ = child.wait();
+        });
         let _ = out.send(Event::Closed { session_id }).await;
     })
 }
 
-/// Open a PTY pair and spawn `$SHELL`. Returns `(master_fd, child_pid)`.
+/// Open a PTY pair and spawn `$SHELL`. Returns `(master_fd, child)`.
 /// Uses `std::process::Command` + `pre_exec` instead of raw `fork()` so the
-/// call is safe from a multi-threaded tokio runtime.
+/// call is safe from a multi-threaded tokio runtime. The caller must reap
+/// the returned `Child` on disconnect or it becomes a zombie.
 #[cfg(unix)]
-fn spawn_pty_shell(cols: u16, rows: u16) -> std::io::Result<(libc::c_int, libc::pid_t)> {
+fn spawn_pty_shell(cols: u16, rows: u16) -> std::io::Result<(libc::c_int, std::process::Child)> {
     use std::os::fd::FromRawFd;
     use std::os::unix::process::CommandExt;
 
@@ -1207,16 +1244,82 @@ fn spawn_pty_shell(cols: u16, rows: u16) -> std::io::Result<(libc::c_int, libc::
     }
 
     let child = cmd.spawn()?;
-    let pid = child.id() as libc::pid_t;
-    // Leak the Child handle — we manage lifetime via master fd + SIGHUP on disconnect.
-    std::mem::forget(child);
-
-    Ok((master, pid))
+    Ok((master, child))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The local PTY worker must reap its shell after Disconnect — the old
+    /// `std::mem::forget(child)` path left one zombie process behind per
+    /// closed local tab, for the lifetime of the app.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_worker_reaps_shell_on_disconnect() {
+        use iced::futures::StreamExt;
+
+        let mut stream = Box::pin(local_worker(7));
+        let sender = match stream.next().await {
+            Some(Event::Ready { sender, .. }) => sender,
+            _ => panic!("expected Ready as the first worker event"),
+        };
+        sender
+            .send(Command::Connect(ConnectParams {
+                route: test_route(String::new()),
+                cols: 80,
+                rows: 24,
+                term: "xterm-256color".to_string(),
+            }))
+            .await
+            .unwrap();
+
+        // Drive the stream to Connected (skipping Connecting/Output).
+        loop {
+            match stream.next().await {
+                Some(Event::Connected { .. }) => break,
+                Some(Event::Failed { error, .. }) => panic!("local shell failed: {error}"),
+                Some(_) => continue,
+                None => panic!("worker stream ended before Connected"),
+            }
+        }
+
+        sender.send(Command::Disconnect).await.unwrap();
+        loop {
+            match stream.next().await {
+                Some(Event::Closed { .. }) | None => break,
+                Some(_) => continue,
+            }
+        }
+
+        // The reaper runs on a detached blocking task: SIGHUP, up to 2 s of
+        // grace, then SIGKILL + wait. Poll the process table until no zombie
+        // child of this test process remains.
+        let me = std::process::id().to_string();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+        loop {
+            let out = std::process::Command::new("ps")
+                .args(["-axo", "ppid=,stat="])
+                .output()
+                .expect("run ps");
+            let zombies = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|l| {
+                    let mut it = l.split_whitespace();
+                    it.next() == Some(me.as_str())
+                        && it.next().unwrap_or("").starts_with('Z')
+                })
+                .count();
+            if zombies == 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shell child still a zombie {zombies} after disconnect"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
 
     /// Build a route to the live test server (mirrors openterm-ssh's harness).
     fn test_route(password: String) -> ConnectRoute {
