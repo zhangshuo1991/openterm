@@ -1,9 +1,55 @@
-use alacritty_terminal::event::VoidListener;
+use alacritty_terminal::event::{Event as AlacrittyEvent, EventListener};
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{self, Color, NamedColor, Rgb};
+
+/// Something the terminal emulator asked the host app to do while parsing
+/// remote output. Drained via [`AlacrittyTerminalBuffer::take_events`] after
+/// each `write_remote_output` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalEvent {
+    /// Bytes that must be written back to the PTY: responses to terminal
+    /// queries (cursor position ESC[6n, DECRQM mode reports, DA1, CSI 18t).
+    /// Full-screen TUIs probe these on startup; dropping them makes apps
+    /// mis-detect capabilities (e.g. conclude bracketed paste is unsupported).
+    PtyWrite(Vec<u8>),
+    /// The remote app stored text into the clipboard via OSC 52 — how TUIs
+    /// (opencode, tmux, nvim) implement "copy" over SSH. The host must write
+    /// it to the system clipboard. Loads (clipboard reads) are denied by the
+    /// `Osc52::OnlyCopy` policy so remote output can't exfiltrate the
+    /// clipboard.
+    ClipboardStore(String),
+}
+
+/// `EventListener` that queues the events the app cares about. Alacritty's
+/// `Term` holds one and calls it re-entrantly during `parser.advance`, so the
+/// queue is shared with the buffer through an `Arc<Mutex<_>>`.
+#[derive(Debug, Default, Clone)]
+struct EventQueue(std::sync::Arc<std::sync::Mutex<Vec<TerminalEvent>>>);
+
+/// Cap on undrained events, in case a session stops draining: query responses
+/// are tiny and bursty, never legitimately this many between output chunks.
+const EVENT_QUEUE_CAP: usize = 128;
+
+impl EventListener for EventQueue {
+    fn send_event(&self, event: AlacrittyEvent) {
+        let mapped = match event {
+            AlacrittyEvent::PtyWrite(text) => TerminalEvent::PtyWrite(text.into_bytes()),
+            // macOS has a single clipboard; treat "primary selection" stores
+            // the same as clipboard stores.
+            AlacrittyEvent::ClipboardStore(_, text) => TerminalEvent::ClipboardStore(text),
+            // Title/Bell/ColorRequest/… are intentionally ignored for now.
+            _ => return,
+        };
+        if let Ok(mut queue) = self.0.lock() {
+            if queue.len() < EVENT_QUEUE_CAP {
+                queue.push(mapped);
+            }
+        }
+    }
+}
 
 /// Mouse-reporting state a remote app has requested via DECSET private modes.
 /// When `report` is set, the UI must forward mouse events to the PTY as escape
@@ -122,8 +168,10 @@ pub trait TerminalEngine {
 
 pub struct AlacrittyTerminalBuffer {
     size: TerminalSize,
-    term: Term<VoidListener>,
+    term: Term<EventQueue>,
     parser: ansi::Processor,
+    /// Shared with the `Term`'s event listener; drained via `take_events`.
+    events: EventQueue,
     /// Bumped on every mutation that changes what a snapshot would render
     /// (output, resize, scroll). Consumers cache the last snapshot keyed on
     /// this so an idle frame doesn't re-materialize the whole grid.
@@ -133,13 +181,39 @@ pub struct AlacrittyTerminalBuffer {
 impl AlacrittyTerminalBuffer {
     pub fn new(size: TerminalSize) -> Self {
         let term_size = TermSize::new(usize::from(size.cols), usize::from(size.rows));
-        let term = Term::new(Config::default(), &term_size, VoidListener);
+        // Config::default() gives us the two settings we rely on, pinned here
+        // as documentation: `osc52: OnlyCopy` (remote apps may STORE to the
+        // clipboard — how TUIs copy over SSH — but never read it back) and
+        // `kitty_keyboard: false` (we don't encode kitty-protocol keys, so the
+        // Term must not answer ESC[?u capability probes on our behalf).
+        let events = EventQueue::default();
+        let term = Term::new(Config::default(), &term_size, events.clone());
         Self {
             size,
             term,
             parser: ansi::Processor::new(),
+            events,
             generation: 0,
         }
+    }
+
+    /// Drain the events queued while parsing remote output (query responses
+    /// to write back to the PTY, OSC 52 clipboard stores). Call after every
+    /// `write_remote_output`.
+    pub fn take_events(&self) -> Vec<TerminalEvent> {
+        self.events
+            .0
+            .lock()
+            .map(|mut queue| std::mem::take(&mut *queue))
+            .unwrap_or_default()
+    }
+
+    /// Whether the remote app enabled bracketed paste (DECSET 2004). When set,
+    /// pasted text must be wrapped in ESC[200~ … ESC[201~ so the app can tell
+    /// a paste from typed input; when clear, the markers would leak through as
+    /// literal garbage and must be omitted.
+    pub fn bracketed_paste(&self) -> bool {
+        self.term.mode().contains(TermMode::BRACKETED_PASTE)
     }
 
     /// Monotonic counter identifying the current grid state. See `generation`.
@@ -616,6 +690,60 @@ mod tests {
         assert!(snapshot.cells[0][1].wide_spacer);
         assert_eq!(snapshot.cells[0][2].ch, 'a');
         assert_eq!(snapshot.render_plain_text(), "中a\n█");
+    }
+
+    #[test]
+    fn cursor_position_query_response_is_queued() {
+        let mut buffer = AlacrittyTerminalBuffer::new(TerminalSize { cols: 20, rows: 4 });
+        // Move the cursor, then send DSR 6 (cursor position report) — what
+        // ink/bubbletea TUIs probe on startup.
+        buffer.write_remote_output(b"\x1b[2;4H\x1b[6n").unwrap();
+        let events = buffer.take_events();
+        assert_eq!(events, vec![TerminalEvent::PtyWrite(b"\x1b[2;4R".to_vec())]);
+        // Drained: a second take returns nothing.
+        assert!(buffer.take_events().is_empty());
+    }
+
+    #[test]
+    fn decrqm_reports_bracketed_paste_supported() {
+        let mut buffer = AlacrittyTerminalBuffer::new(TerminalSize { cols: 20, rows: 4 });
+        // Enable 2004 then query it (DECRQM); the reply must say "set" (;1).
+        buffer.write_remote_output(b"\x1b[?2004h\x1b[?2004$p").unwrap();
+        let events = buffer.take_events();
+        assert_eq!(
+            events,
+            vec![TerminalEvent::PtyWrite(b"\x1b[?2004;1$y".to_vec())]
+        );
+    }
+
+    #[test]
+    fn osc52_store_yields_clipboard_event() {
+        let mut buffer = AlacrittyTerminalBuffer::new(TerminalSize { cols: 20, rows: 4 });
+        // OSC 52 store of base64("hello") — how opencode/tmux/nvim copy over SSH.
+        buffer.write_remote_output(b"\x1b]52;c;aGVsbG8=\x07").unwrap();
+        assert_eq!(
+            buffer.take_events(),
+            vec![TerminalEvent::ClipboardStore("hello".to_string())]
+        );
+    }
+
+    #[test]
+    fn osc52_load_is_denied() {
+        let mut buffer = AlacrittyTerminalBuffer::new(TerminalSize { cols: 20, rows: 4 });
+        // OSC 52 query ("?") asks to READ the clipboard — denied by the
+        // OnlyCopy policy so remote output can't exfiltrate clipboard content.
+        buffer.write_remote_output(b"\x1b]52;c;?\x07").unwrap();
+        assert!(buffer.take_events().is_empty());
+    }
+
+    #[test]
+    fn bracketed_paste_tracks_mode_2004() {
+        let mut buffer = AlacrittyTerminalBuffer::new(TerminalSize { cols: 20, rows: 4 });
+        assert!(!buffer.bracketed_paste());
+        buffer.write_remote_output(b"\x1b[?2004h").unwrap();
+        assert!(buffer.bracketed_paste());
+        buffer.write_remote_output(b"\x1b[?2004l").unwrap();
+        assert!(!buffer.bracketed_paste());
     }
 
     #[test]

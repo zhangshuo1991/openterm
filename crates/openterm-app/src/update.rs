@@ -342,9 +342,15 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             }
         }
         Message::PasteReady(Some(text)) => {
-            if let Some(session) = app.active_session() {
+            if let Some(session) = app.active_session_mut() {
                 if let Some(tx) = &session.cmd_tx {
-                    let _ = tx.try_send(Command::Write(crate::keys::bracketed_paste(&text)));
+                    // Honor the remote app's bracketed-paste mode (2004):
+                    // wrap for TUIs/shells that requested it, plain bytes
+                    // (with \n → \r) otherwise.
+                    let bracketed = session.terminal.bracketed_paste();
+                    let _ = tx.try_send(Command::Write(crate::keys::paste_bytes(&text, bracketed)));
+                    // Pasting is input: snap back to the live bottom.
+                    session.terminal.scroll_to_bottom();
                 }
             }
             Task::none()
@@ -2184,10 +2190,13 @@ fn apply_grid(app: &mut App) -> Task<Message> {
 }
 
 fn sftp_refresh(app: &mut App) -> Task<Message> {
-    if let Some(session) = app.active_session() {
+    if let Some(session) = app.active_session_mut() {
         if session.sftp_open && session.phase == Phase::Connected {
             if let Some(tx) = &session.cmd_tx {
                 let _ = tx.try_send(Command::SftpList(session.remote_path.clone()));
+                // Immediate feedback: mid-transfer a listing can take a while
+                // (the link is saturated), so show the click registered.
+                session.sftp_status = format!("Loading {} …", session.remote_path);
             }
         }
     }
@@ -2637,6 +2646,27 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
         ConnEvent::Output { bytes, .. } => {
             let prev_len = session.command_history.len();
             session.write_output(&bytes);
+            // Answer what the emulator queued while parsing this chunk:
+            // query responses (cursor position, DECRQM, DA — TUIs probe these
+            // on startup) go back to the PTY; OSC 52 stores (how opencode/
+            // tmux/nvim "copy" over SSH) go to the system clipboard.
+            for ev in session.terminal.take_events() {
+                match ev {
+                    openterm_terminal::TerminalEvent::PtyWrite(reply) => {
+                        if let Some(tx) = &session.cmd_tx {
+                            let _ = tx.try_send(Command::Write(reply));
+                        }
+                    }
+                    openterm_terminal::TerminalEvent::ClipboardStore(text) => {
+                        let chars = text.chars().count();
+                        toast = Some((
+                            crate::ui::toasts::ToastKind::Success,
+                            format!("Copied {chars} chars (remote)"),
+                        ));
+                        extra_tasks.push(clipboard::write(text));
+                    }
+                }
+            }
             let new_entry = if session.command_history.len() > prev_len {
                 // Backfill the previous in-memory entry with its now-captured output.
                 let committed = std::mem::take(&mut session.committed_output);

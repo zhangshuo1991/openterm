@@ -65,6 +65,11 @@ pub enum SshError {
 /// (frozen disk, cgroup freeze), not to police slow-but-alive links.
 const OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// How many bulk transfers (uploads/downloads) may run at once. Must stay
+/// strictly below the channel semaphore's 6 so directory listings and other
+/// interactive ops always have channel permits available mid-transfer.
+const MAX_BULK_TRANSFERS: usize = 3;
+
 /// Bulk-content bound (whole-file read/write, recursive deletes): more
 /// generous, since legitimately large payloads on slow links take a while.
 const CONTENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -290,6 +295,7 @@ impl RusshBackend {
             jump_handle: None,
             remote_forward_sender,
             channel_sem: Arc::new(tokio::sync::Semaphore::new(6)),
+            bulk_sem: Arc::new(tokio::sync::Semaphore::new(MAX_BULK_TRANSFERS)),
         })
     }
 
@@ -363,6 +369,7 @@ impl RusshBackend {
             jump_handle: Some(jump.handle),
             remote_forward_sender,
             channel_sem: Arc::new(tokio::sync::Semaphore::new(6)),
+            bulk_sem: Arc::new(tokio::sync::Semaphore::new(MAX_BULK_TRANSFERS)),
         })
     }
 
@@ -721,6 +728,13 @@ pub struct RusshSession {
     /// MaxSessions cap (OpenSSH default = 10). Every method that opens a
     /// channel acquires a permit for the channel's lifetime.
     channel_sem: Arc<tokio::sync::Semaphore>,
+    /// Caps concurrent *bulk transfers* (upload/download), strictly below the
+    /// channel budget. Transfers hold a channel for minutes; without this cap a
+    /// multi-file batch drains `channel_sem` completely and — because tokio
+    /// semaphores are FIFO — a directory listing then queues behind every
+    /// pending transfer, freezing SFTP navigation for the whole batch. Queued
+    /// transfers wait HERE instead, leaving channel permits for interactive ops.
+    bulk_sem: Arc<tokio::sync::Semaphore>,
 }
 
 /// An SFTP session paired with the channel semaphore permit that guards it.
@@ -1161,6 +1175,15 @@ impl RusshSession {
         const CHUNK: u64 = 256 * 1024;
         const WINDOW: usize = 16;
 
+        // Queue behind other bulk transfers FIRST (see `bulk_sem`): waiting
+        // here keeps channel permits free for interactive SFTP navigation.
+        let _bulk_permit = self
+            .bulk_sem
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("bulk semaphore closed");
+
         // Acquire a channel slot before opening the raw SFTP subsystem.
         let _chan_permit = self
             .channel_sem
@@ -1304,6 +1327,14 @@ impl RusshSession {
         stop: Arc<std::sync::atomic::AtomicU8>,
     ) -> Result<u64, SshError> {
         use std::sync::atomic::Ordering;
+        // Queue behind other bulk transfers FIRST (see `bulk_sem`): waiting
+        // here keeps channel permits free for interactive SFTP navigation.
+        let _bulk_permit = self
+            .bulk_sem
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("bulk semaphore closed");
         let sftp = self.open_sftp_guarded().await?;
         let result: Result<u64, SshError> = async {
             let total = tokio::fs::metadata(local_path).await.map(|m| m.len()).unwrap_or(0);

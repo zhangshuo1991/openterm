@@ -377,6 +377,20 @@ impl canvas::Program<Message> for TerminalCanvas<'_> {
         let shift = state.modifiers.shift();
         let alt = state.modifiers.alt();
         let ctrl = state.modifiers.control();
+
+        // Right-click always opens the local context menu (Copy / Paste / …),
+        // even while the remote app is reading the mouse: inside full-screen
+        // TUIs (opencode, claude code, tmux) the menu is the one discoverable
+        // copy/paste entry point. Matching iTerm2, the right button is never
+        // forwarded to the remote app.
+        if let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) = event {
+            if let Some(pos) = cursor.position_in(bounds) {
+                return Some(
+                    Action::publish(Message::TerminalOpenMenu(pos.x, pos.y)).and_capture(),
+                );
+            }
+        }
+
         // When the remote app is reading the mouse and Shift is NOT held, we
         // forward events to the PTY instead of doing local selection.
         let report_to_remote = self.mouse.report && !shift;
@@ -387,7 +401,7 @@ impl canvas::Program<Message> for TerminalCanvas<'_> {
                 match b {
                     mouse::Button::Left => Some(0),
                     mouse::Button::Middle => Some(1),
-                    mouse::Button::Right => Some(2),
+                    // Right is reserved for the local context menu (above).
                     _ => None,
                 }
             };
@@ -584,13 +598,6 @@ impl canvas::Program<Message> for TerminalCanvas<'_> {
                         return None;
                     }
                     return Some(Action::publish(Message::TerminalScroll(lines)));
-                }
-            }
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
-                if let Some(pos) = cursor.position_in(bounds) {
-                    return Some(
-                        Action::publish(Message::TerminalOpenMenu(pos.x, pos.y)).and_capture(),
-                    );
                 }
             }
             _ => {}

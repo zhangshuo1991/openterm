@@ -96,14 +96,26 @@ fn cursor_seq(app_cursor: bool, final_byte: u8) -> Vec<u8> {
     }
 }
 
-/// Wrap pasted text in bracketed-paste markers so the remote shell treats it
-/// as a single literal block.
-pub fn bracketed_paste(contents: &str) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(contents.len() + 12);
-    bytes.extend_from_slice(b"\x1b[200~");
-    bytes.extend_from_slice(contents.as_bytes());
-    bytes.extend_from_slice(b"\x1b[201~");
-    bytes
+/// Encode clipboard text for the PTY, honoring the remote app's bracketed
+/// paste mode (DECSET 2004).
+///
+/// - **Bracketed** (TUIs: opencode, claude code, modern shells): wrap in
+///   ESC[200~ … ESC[201~ so the app treats it as one literal paste. Any
+///   end-marker embedded in the clipboard itself is stripped, so a crafted
+///   clipboard can't break out of the bracket and inject keystrokes.
+/// - **Plain**: send the text as-is but convert line endings to `\r` — Enter
+///   is CR on a terminal, and a literal `\n` confuses line-oriented input.
+pub fn paste_bytes(contents: &str, bracketed: bool) -> Vec<u8> {
+    if bracketed {
+        let sanitized = contents.replace("\x1b[201~", "");
+        let mut bytes = Vec::with_capacity(sanitized.len() + 12);
+        bytes.extend_from_slice(b"\x1b[200~");
+        bytes.extend_from_slice(sanitized.as_bytes());
+        bytes.extend_from_slice(b"\x1b[201~");
+        bytes
+    } else {
+        contents.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
+    }
 }
 
 #[cfg(test)]
@@ -175,5 +187,25 @@ mod tests {
             encode_key(Key::Named(key::Named::F12), Modifiers::empty(), None, false),
             Some(b"\x1b[24~".to_vec())
         );
+    }
+
+    #[test]
+    fn paste_wraps_when_bracketed_and_strips_injected_end_marker() {
+        assert_eq!(
+            paste_bytes("echo ok", true),
+            b"\x1b[200~echo ok\x1b[201~".to_vec()
+        );
+        // An end-marker inside the clipboard must not terminate the bracket
+        // early (that would let a webpage-crafted clipboard inject commands).
+        assert_eq!(
+            paste_bytes("safe\x1b[201~rm -rf /", true),
+            b"\x1b[200~saferm -rf /\x1b[201~".to_vec()
+        );
+    }
+
+    #[test]
+    fn plain_paste_converts_newlines_to_carriage_returns() {
+        assert_eq!(paste_bytes("a\r\nb\nc", false), b"a\rb\rc".to_vec());
+        assert_eq!(paste_bytes("no newline", false), b"no newline".to_vec());
     }
 }
