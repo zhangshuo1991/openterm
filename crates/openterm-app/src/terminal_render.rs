@@ -40,9 +40,15 @@ pub fn metrics(font_size: u16) -> Metrics {
     let font_size = f32::from(font_size);
     let mult = LINE_HEIGHT_MULT.with(|c| c.get());
     let spacing = LETTER_SPACING.with(|c| c.get());
+    // Snap cell metrics to whole logical pixels. Fractional advances (14px ×
+    // 0.62 = 8.68) put every column at a different subpixel phase, so glyph
+    // anti-aliasing smears and box-drawing lines shimmer — text reads as
+    // "blurry / pixels not aligned". Integer cells land on pixel boundaries
+    // on both 1x and 2x (Retina) displays. The remote content is untouched;
+    // only where each received character gets painted changes.
     Metrics {
-        cell_width: (font_size * 0.62).max(6.0) + spacing,
-        line_height: (font_size * mult).max(14.0),
+        cell_width: ((font_size * 0.62).max(6.0) + spacing).round().max(6.0),
+        line_height: (font_size * mult).max(14.0).round(),
     }
 }
 
@@ -91,6 +97,150 @@ fn font_for(ch: char, bold: bool) -> Font {
 
 fn color_to_iced(color: TerminalColor) -> Color {
     Color::from_rgb8(color.r, color.g, color.b)
+}
+
+/// How a box-drawing / block-element char should be painted by the renderer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum BoxGlyph {
+    /// Line segments radiating from the cell center: left/right/up/down arms,
+    /// with double-strut and heavy-stroke variants.
+    Lines { l: bool, r: bool, u: bool, d: bool, double: bool, heavy: bool },
+    /// A solid fill covering a fraction of the cell from one edge.
+    /// (x, y, w, h) as fractions of the cell rect.
+    Fill { x: f32, y: f32, w: f32, h: f32 },
+    /// Whole-cell shade at the given opacity (░ ▒ ▓).
+    Shade(f32),
+}
+
+/// Classify chars we draw as crisp vectors instead of font glyphs. Font
+/// glyphs only cover the em box — with a 1.32× line height that leaves gaps
+/// between vertical bars and hairline, half-toned horizontals, so TUI tables
+/// (opencode / claude code) look broken and "misaligned". Returns `None` for
+/// anything the font should render.
+fn box_glyph(ch: char) -> Option<BoxGlyph> {
+    use BoxGlyph::*;
+    let lines = |l, r, u, d, double, heavy| Some(Lines { l, r, u, d, double, heavy });
+    match ch {
+        // Light lines (plus dashed + rounded variants, drawn solid/square).
+        '─' | '╌' | '┄' | '┈' => lines(true, true, false, false, false, false),
+        '│' | '╎' | '┆' | '┊' => lines(false, false, true, true, false, false),
+        '┌' | '╭' => lines(false, true, false, true, false, false),
+        '┐' | '╮' => lines(true, false, false, true, false, false),
+        '└' | '╰' => lines(false, true, true, false, false, false),
+        '┘' | '╯' => lines(true, false, true, false, false, false),
+        '├' => lines(false, true, true, true, false, false),
+        '┤' => lines(true, false, true, true, false, false),
+        '┬' => lines(true, true, false, true, false, false),
+        '┴' => lines(true, true, true, false, false, false),
+        '┼' => lines(true, true, true, true, false, false),
+        '╴' => lines(true, false, false, false, false, false),
+        '╵' => lines(false, false, true, false, false, false),
+        '╶' => lines(false, true, false, false, false, false),
+        '╷' => lines(false, false, false, true, false, false),
+        // Heavy lines.
+        '━' | '╍' | '┅' | '┉' => lines(true, true, false, false, false, true),
+        '┃' | '╏' | '┇' | '┋' => lines(false, false, true, true, false, true),
+        '┏' => lines(false, true, false, true, false, true),
+        '┓' => lines(true, false, false, true, false, true),
+        '┗' => lines(false, true, true, false, false, true),
+        '┛' => lines(true, false, true, false, false, true),
+        '┣' => lines(false, true, true, true, false, true),
+        '┫' => lines(true, false, true, true, false, true),
+        '┳' => lines(true, true, false, true, false, true),
+        '┻' => lines(true, true, true, false, false, true),
+        '╋' => lines(true, true, true, true, false, true),
+        // Double lines (mixed single/double forms approximated as double).
+        '═' | '╤' | '╧' | '╪' => match ch {
+            '═' => lines(true, true, false, false, true, false),
+            '╤' => lines(true, true, false, true, true, false),
+            '╧' => lines(true, true, true, false, true, false),
+            _ => lines(true, true, true, true, true, false),
+        },
+        '║' | '╟' | '╢' | '╫' => match ch {
+            '║' => lines(false, false, true, true, true, false),
+            '╟' => lines(false, true, true, true, true, false),
+            '╢' => lines(true, false, true, true, true, false),
+            _ => lines(true, true, true, true, true, false),
+        },
+        '╔' | '╒' | '╓' => lines(false, true, false, true, true, false),
+        '╗' | '╕' | '╖' => lines(true, false, false, true, true, false),
+        '╚' | '╘' | '╙' => lines(false, true, true, false, true, false),
+        '╝' | '╛' | '╜' => lines(true, false, true, false, true, false),
+        '╠' | '╞' => lines(false, true, true, true, true, false),
+        '╣' | '╡' => lines(true, false, true, true, true, false),
+        '╦' => lines(true, true, false, true, true, false),
+        '╩' => lines(true, true, true, false, true, false),
+        '╬' => lines(true, true, true, true, true, false),
+        // Block elements: full/partial fills (progress bars, separators).
+        '█' => Some(Fill { x: 0.0, y: 0.0, w: 1.0, h: 1.0 }),
+        '▉' => Some(Fill { x: 0.0, y: 0.0, w: 0.875, h: 1.0 }),
+        '▊' => Some(Fill { x: 0.0, y: 0.0, w: 0.75, h: 1.0 }),
+        '▋' => Some(Fill { x: 0.0, y: 0.0, w: 0.625, h: 1.0 }),
+        '▌' => Some(Fill { x: 0.0, y: 0.0, w: 0.5, h: 1.0 }),
+        '▍' => Some(Fill { x: 0.0, y: 0.0, w: 0.375, h: 1.0 }),
+        '▎' => Some(Fill { x: 0.0, y: 0.0, w: 0.25, h: 1.0 }),
+        '▏' => Some(Fill { x: 0.0, y: 0.0, w: 0.125, h: 1.0 }),
+        '▐' => Some(Fill { x: 0.5, y: 0.0, w: 0.5, h: 1.0 }),
+        '▀' => Some(Fill { x: 0.0, y: 0.0, w: 1.0, h: 0.5 }),
+        '▄' => Some(Fill { x: 0.0, y: 0.5, w: 1.0, h: 0.5 }),
+        '▁' => Some(Fill { x: 0.0, y: 0.875, w: 1.0, h: 0.125 }),
+        '▂' => Some(Fill { x: 0.0, y: 0.75, w: 1.0, h: 0.25 }),
+        '▃' => Some(Fill { x: 0.0, y: 0.625, w: 1.0, h: 0.375 }),
+        '▅' => Some(Fill { x: 0.0, y: 0.375, w: 1.0, h: 0.625 }),
+        '▆' => Some(Fill { x: 0.0, y: 0.25, w: 1.0, h: 0.75 }),
+        '▇' => Some(Fill { x: 0.0, y: 0.125, w: 1.0, h: 0.875 }),
+        '░' => Some(Shade(0.25)),
+        '▒' => Some(Shade(0.5)),
+        '▓' => Some(Shade(0.75)),
+        _ => None,
+    }
+}
+
+/// Paint a classified box glyph as pixel-aligned rectangles spanning the FULL
+/// cell rect, so adjacent cells' lines connect seamlessly. Returns true when
+/// painted (caller skips the font).
+fn draw_box_glyph(frame: &mut Frame, ch: char, x: f32, y: f32, w: f32, h: f32, color: Color) -> bool {
+    let Some(glyph) = box_glyph(ch) else { return false };
+    match glyph {
+        BoxGlyph::Fill { x: fx, y: fy, w: fw, h: fh } => {
+            frame.fill_rectangle(
+                Point::new(x + fx * w, y + fy * h),
+                Size::new(fw * w, fh * h),
+                color,
+            );
+        }
+        BoxGlyph::Shade(alpha) => {
+            frame.fill_rectangle(
+                Point::new(x, y),
+                Size::new(w, h),
+                Color { a: alpha, ..color },
+            );
+        }
+        BoxGlyph::Lines { l, r, u, d, double, heavy } => {
+            let t = if heavy { 2.0 } else { 1.0 };
+            // Center the strut on whole pixels so a run of '─' cells forms one
+            // continuous unbroken line.
+            let cx = x + (w / 2.0).floor();
+            let cy = y + (h / 2.0).floor();
+            // Double struts sit 2px either side of the center line.
+            let offsets: &[f32] = if double { &[-2.0, 2.0] } else { &[0.0] };
+            for &o in offsets {
+                if l {
+                    frame.fill_rectangle(Point::new(x, cy + o), Size::new(cx - x + t, t), color);
+                }
+                if r {
+                    frame.fill_rectangle(Point::new(cx, cy + o), Size::new(x + w - cx, t), color);
+                }
+                if u {
+                    frame.fill_rectangle(Point::new(cx + o, y), Size::new(t, cy - y + t), color);
+                }
+                if d {
+                    frame.fill_rectangle(Point::new(cx + o, cy), Size::new(t, y + h - cy), color);
+                }
+            }
+        }
+    }
+    true
 }
 
 /// Convert a canvas-local pixel position to a (col, row) cell coordinate.
@@ -836,6 +986,12 @@ impl TerminalCanvas<'_> {
                     cell.foreground.map(color_to_iced).unwrap_or(theme::text_high())
                 };
 
+                // Box-drawing / block chars: crisp full-cell vectors, not font
+                // glyphs (see `box_glyph` — fixes broken/fuzzy TUI table lines).
+                if draw_box_glyph(frame, cell.ch, x, y, cell_draw_width(cell, m), m.line_height, fg) {
+                    continue;
+                }
+
                 frame.fill_text(Text {
                     content: cell.ch.to_string(),
                     position: Point::new(x, y),
@@ -864,6 +1020,30 @@ impl TerminalCanvas<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn box_glyphs_cover_table_and_progress_chars() {
+        // Everything opencode/claude-code tables and progress bars emit must
+        // take the vector path, not the font path.
+        for ch in "─│┌┐└┘├┤┬┴┼═║╔╗╚╝╠╣╦╩╬╭╮╯╰━┃█▀▄▌▐░▒▓▁▇".chars() {
+            assert!(box_glyph(ch).is_some(), "{ch} should be vector-drawn");
+        }
+        // Ordinary text must stay on the font path.
+        for ch in "aA9汉、.|-_=+".chars() {
+            assert!(box_glyph(ch).is_none(), "{ch} should be font-drawn");
+        }
+    }
+
+    #[test]
+    fn metrics_land_on_whole_pixels() {
+        // Fractional cell metrics put every column/row at a different subpixel
+        // phase — glyphs blur and box-drawing tables shimmer (user report).
+        for fs in [10u16, 12, 13, 14, 15, 16, 18, 20, 24] {
+            let m = metrics(fs);
+            assert_eq!(m.cell_width.fract(), 0.0, "cell_width for {fs}px");
+            assert_eq!(m.line_height.fract(), 0.0, "line_height for {fs}px");
+        }
+    }
 
     #[test]
     fn grid_grows_with_viewport() {
