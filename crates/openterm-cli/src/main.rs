@@ -635,6 +635,8 @@ fn ssh_options(
             trust_unknown_host_keys,
             host_key_policy: cli_host_key_policy(trust_unknown_host_keys),
             timeout: Duration::from_secs(10),
+            keepalive_interval: Some(ConnectOptions::DEFAULT_KEEPALIVE_INTERVAL),
+            keepalive_max: ConnectOptions::DEFAULT_KEEPALIVE_MAX,
         },
     ))
 }

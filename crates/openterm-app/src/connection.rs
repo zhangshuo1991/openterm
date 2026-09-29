@@ -21,9 +21,11 @@ use std::sync::Arc;
 use iced::futures::{SinkExt, Stream};
 use openterm_ssh::{
     ConnectRoute, HostKeyChallenge, PtyEvent, PtyInput, PtySize, RemoteFileEntry, RemoteFileKind,
-    RusshBackend, RusshSession, ShellOptions, SshError,
+    RusshSession, ShellOptions, SshError,
 };
 use tokio::sync::mpsc;
+
+use crate::session_connection::{ConnectionConfig, SessionConnection};
 
 /// Parameters needed to open a shell on a route.
 #[derive(Debug, Clone)]
@@ -307,34 +309,64 @@ async fn run_connection(
 ) -> ControlFlow<()> {
     let _ = out.send(Event::Connecting { session_id }).await;
 
-    let session = match RusshBackend.connect_with_route(params.route.clone()).await {
-        Ok(session) => Arc::new(session),
-        Err(SshError::HostKeyVerificationRequired(challenge)) => {
-            let _ = out
-                .send(Event::HostKeyRequired {
-                    session_id,
-                    challenge,
-                })
-                .await;
-            return ControlFlow::Continue(());
+    // Primary connection + data-connection pool for bulk transfers.
+    let conn_config = ConnectionConfig::default();
+    let session_conn = if conn_config.enable_pool {
+        match SessionConnection::new_pooled(params.route.clone(), conn_config.pool_config).await {
+            Ok(conn) => conn,
+            Err(SshError::HostKeyVerificationRequired(challenge)) => {
+                let _ = out
+                    .send(Event::HostKeyRequired {
+                        session_id,
+                        challenge,
+                    })
+                    .await;
+                return ControlFlow::Continue(());
+            }
+            Err(error) => {
+                let _ = out
+                    .send(Event::Failed {
+                        session_id,
+                        error: error.to_string(),
+                    })
+                    .await;
+                return ControlFlow::Continue(());
+            }
         }
-        Err(error) => {
-            let _ = out
-                .send(Event::Failed {
-                    session_id,
-                    error: error.to_string(),
-                })
-                .await;
-            return ControlFlow::Continue(());
+    } else {
+        match SessionConnection::new_legacy(params.route.clone()).await {
+            Ok(conn) => conn,
+            Err(SshError::HostKeyVerificationRequired(challenge)) => {
+                let _ = out
+                    .send(Event::HostKeyRequired {
+                        session_id,
+                        challenge,
+                    })
+                    .await;
+                return ControlFlow::Continue(());
+            }
+            Err(error) => {
+                let _ = out
+                    .send(Event::Failed {
+                        session_id,
+                        error: error.to_string(),
+                    })
+                    .await;
+                return ControlFlow::Continue(());
+            }
         }
     };
 
+    let session_conn = Arc::new(session_conn);
+
     let _ = out.send(Event::Connected { session_id }).await;
+
+    // Terminal 使用主连接
+    let shell_session = session_conn.terminal_session();
 
     // Spawn the shell pump on its own task so SFTP work never stalls it.
     let (pty_in_tx, mut pty_in_rx) = mpsc::channel::<PtyInput>(256);
     let (pty_ev_tx, mut pty_ev_rx) = mpsc::channel::<PtyEvent>(256);
-    let shell_session = session.clone();
     let shell_opts = ShellOptions {
         term: params.term.clone(),
         size: PtySize {
@@ -375,7 +407,9 @@ async fn run_connection(
                     // Already connected; ignore duplicate connects.
                 }
                 Some(Command::SftpList(path)) => {
-                    bg_tasks.push(spawn_sftp_list(session_id, session.clone(), out.clone(), path));
+                    // 快速 SFTP 操作使用主连接
+                    let session = session_conn.quick_sftp_session();
+                    bg_tasks.push(spawn_sftp_list(session_id, session, out.clone(), path));
                 }
                 Some(Command::SftpDownload { id, name, remote, local, size, is_dir }) => {
                     let mode = Arc::new(std::sync::atomic::AtomicU8::new(0));
@@ -389,9 +423,11 @@ async fn run_connection(
                         local: local.clone(),
                         direction: Direction::Download,
                     });
+                    // Bulk transfers run on the pool's data connection, never on
+                    // the terminal's.
                     bg_tasks.push(spawn_transfer(
                         session_id,
-                        session.clone(),
+                        session_conn.clone(),
                         out.clone(),
                         Transfer { id, name, direction: Direction::Download, remote, local, size, is_dir },
                         mode,
@@ -411,9 +447,11 @@ async fn run_connection(
                         local: local.clone(),
                         direction: Direction::Upload,
                     });
+                    // Bulk transfers run on the pool's data connection, never on
+                    // the terminal's.
                     bg_tasks.push(spawn_transfer(
                         session_id,
-                        session.clone(),
+                        session_conn.clone(),
                         out.clone(),
                         Transfer { id, name, direction: Direction::Upload, remote, local, size, is_dir },
                         mode,
@@ -453,7 +491,9 @@ async fn run_connection(
                                 std::path::PathBuf::from(&ctl.local),
                                 0u64,
                             )];
-                            let (sess, mut o, dir) = (session.clone(), out.clone(), ctl.direction);
+                            let sess = session_conn.quick_sftp_session();
+                            let mut o = out.clone();
+                            let dir = ctl.direction;
                             bg_tasks.push(tokio::spawn(async move {
                                 cleanup_part_files(&sess, &files, dir).await;
                                 let _ = o.send(Event::TransferCanceled { session_id, id }).await;
@@ -462,40 +502,50 @@ async fn run_connection(
                     }
                 }
                 Some(Command::SftpMkdir(path)) => {
-                    bg_tasks.push(spawn_sftp_simple(session_id, session.clone(), out.clone(),
+                    let session = session_conn.quick_sftp_session();
+                    bg_tasks.push(spawn_sftp_simple(session_id, session, out.clone(),
                         SftpOp::Mkdir(path)));
                 }
                 Some(Command::SftpRemove { path, is_dir }) => {
-                    bg_tasks.push(spawn_sftp_simple(session_id, session.clone(), out.clone(),
+                    let session = session_conn.quick_sftp_session();
+                    bg_tasks.push(spawn_sftp_simple(session_id, session, out.clone(),
                         SftpOp::Remove { path, is_dir }));
                 }
                 Some(Command::SftpRename { from, to }) => {
-                    bg_tasks.push(spawn_sftp_simple(session_id, session.clone(), out.clone(),
+                    let session = session_conn.quick_sftp_session();
+                    bg_tasks.push(spawn_sftp_simple(session_id, session, out.clone(),
                         SftpOp::Rename { from, to }));
                 }
                 Some(Command::SftpChmod { path, mode }) => {
-                    bg_tasks.push(spawn_sftp_simple(session_id, session.clone(), out.clone(),
+                    let session = session_conn.quick_sftp_session();
+                    bg_tasks.push(spawn_sftp_simple(session_id, session, out.clone(),
                         SftpOp::Chmod { path, mode }));
                 }
                 Some(Command::SampleMetrics) => {
-                    bg_tasks.push(spawn_metrics(session_id, session.clone(), out.clone()));
+                    let session = session_conn.quick_sftp_session();
+                    bg_tasks.push(spawn_metrics(session_id, session, out.clone()));
                 }
                 Some(Command::SampleProcesses) => {
-                    bg_tasks.push(spawn_processes(session_id, session.clone(), out.clone()));
+                    let session = session_conn.quick_sftp_session();
+                    bg_tasks.push(spawn_processes(session_id, session, out.clone()));
                 }
                 Some(Command::SamplePorts) => {
-                    bg_tasks.push(spawn_ports(session_id, session.clone(), out.clone()));
+                    let session = session_conn.quick_sftp_session();
+                    bg_tasks.push(spawn_ports(session_id, session, out.clone()));
                 }
                 Some(Command::ReadFileRange { path, offset, len }) => {
-                    bg_tasks.push(spawn_read_file(session_id, session.clone(), out.clone(), path, offset, len));
+                    let session = session_conn.quick_sftp_session();
+                    bg_tasks.push(spawn_read_file(session_id, session, out.clone(), path, offset, len));
                 }
                 Some(Command::WriteFile { path, data }) => {
-                    bg_tasks.push(spawn_write_file(session_id, session.clone(), out.clone(), path, data));
+                    let session = session_conn.quick_sftp_session();
+                    bg_tasks.push(spawn_write_file(session_id, session, out.clone(), path, data));
                 }
                 Some(Command::Disconnect) => break ShellOutcome::Disconnected,
                 Some(Command::ExecQuery { command, tag }) => {
+                    let session = session_conn.quick_sftp_session();
                     bg_tasks.push(spawn_suggestion_query(
-                        session_id, session.clone(), out.clone(), command, tag,
+                        session_id, session, out.clone(), command, tag,
                     ));
                 }
                 None => break ShellOutcome::WorkerDropped,
@@ -535,10 +585,16 @@ async fn run_connection(
         }
     };
 
-    // Tear down this connection.
-    let _ = session.disconnect().await;
+    // Tear down this connection. Abort the background work first so no task is
+    // still using a borrowed data connection, then close explicitly: dropping
+    // the pool would only close sockets, leaving the server to log an aborted
+    // connection per tab instead of an SSH disconnect.
     shell_task.abort();
-    for h in bg_tasks { h.abort(); }
+    for h in bg_tasks {
+        h.abort();
+    }
+    session_conn.shutdown().await;
+    drop(session_conn);
 
     match outcome {
         ShellOutcome::WorkerDropped => ControlFlow::Break(()),
@@ -567,7 +623,12 @@ enum SftpOp {
 
 type OutSink = iced::futures::channel::mpsc::Sender<Event>;
 
-fn spawn_sftp_list(session_id: u64, session: Arc<RusshSession>, mut out: OutSink, path: String) -> tokio::task::JoinHandle<()> {
+fn spawn_sftp_list(
+    session_id: u64,
+    session: Arc<RusshSession>,
+    mut out: OutSink,
+    path: String,
+) -> tokio::task::JoinHandle<()> {
     return tokio::spawn(async move {
         // Resolve + list over a single SFTP channel. `list_dir_resolved` only
         // canonicalizes relative paths (e.g. "." on connect), so ordinary
@@ -623,7 +684,7 @@ struct TransferCtl {
 /// folder appears as one transfer with one aggregate progress bar.
 fn spawn_transfer(
     session_id: u64,
-    session: Arc<RusshSession>,
+    conn: Arc<SessionConnection>,
     mut out: OutSink,
     t: Transfer,
     stop: Arc<std::sync::atomic::AtomicU8>,
@@ -631,13 +692,48 @@ fn spawn_transfer(
     finalized: Arc<std::sync::atomic::AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
     return tokio::spawn(async move {
+        // Borrow a dedicated connection for this transfer. Done here rather than
+        // in the worker's select loop: dialling can take seconds (handshake,
+        // auth) and would otherwise stall the terminal's own I/O. The connection
+        // is returned to the pool when `transfer` drops at the end of this task,
+        // and because it is not the terminal's connection, a transfer that dies
+        // cannot take the interactive session with it.
+        let transfer = match conn.acquire_transfer_connection().await {
+            Ok(transfer) => transfer,
+            Err(error) => {
+                let _ = out
+                    .send(Event::TransferStarted {
+                        session_id,
+                        id: t.id,
+                        name: t.name.clone(),
+                        direction: t.direction,
+                        total: 0,
+                        remote: t.remote.clone(),
+                        local: t.local.clone(),
+                        is_dir: t.is_dir,
+                    })
+                    .await;
+                let _ = out
+                    .send(Event::TransferFinished {
+                        session_id,
+                        id: t.id,
+                        result: Err(error.to_string()),
+                    })
+                    .await;
+                running.store(false, std::sync::atomic::Ordering::SeqCst);
+                return;
+            }
+        };
+        let session = transfer.session().clone();
+
         // Build the work list of (remote, local, size) and the overall total.
         // A directory is expanded into its files (creating the destination
         // directory skeleton as a side effect); a single file is its own list.
         let (files, total): (Vec<(String, std::path::PathBuf, u64)>, u64) = if t.is_dir {
             let walked = match t.direction {
                 Direction::Download => {
-                    collect_remote_tree(&session, &t.remote, std::path::PathBuf::from(&t.local)).await
+                    collect_remote_tree(&session, &t.remote, std::path::PathBuf::from(&t.local))
+                        .await
                 }
                 Direction::Upload => {
                     collect_local_tree(&session, std::path::Path::new(&t.local), &t.remote).await
@@ -726,7 +822,11 @@ fn spawn_transfer(
                         0.0
                     };
                     // EMA α=0.25: smooth enough to stop flickering, fast enough to track real changes.
-                    ema_speed = if ema_speed == 0.0 { instant } else { 0.25 * instant + 0.75 * ema_speed };
+                    ema_speed = if ema_speed == 0.0 {
+                        instant
+                    } else {
+                        0.25 * instant + 0.75 * ema_speed
+                    };
                     let _ = progress_out
                         .send(Event::TransferProgress {
                             session_id,
@@ -785,7 +885,10 @@ fn spawn_transfer(
         if mode == 2 {
             cleanup_part_files(&session, &files, t.direction).await;
             let _ = out
-                .send(Event::TransferCanceled { session_id, id: t.id })
+                .send(Event::TransferCanceled {
+                    session_id,
+                    id: t.id,
+                })
                 .await;
             return;
         }
@@ -854,7 +957,11 @@ async fn transfer_files(
             }
         });
         let one = match direction {
-            Direction::Download => session.download_file(remote, local, fptx, stop.clone()).await,
+            Direction::Download => {
+                session
+                    .download_file(remote, local, fptx, stop.clone())
+                    .await
+            }
             Direction::Upload => session.upload_file(local, remote, fptx, stop.clone()).await,
         };
         // fptx dropped → inner forwarder ends.
@@ -945,7 +1052,12 @@ fn join_remote(base: &str, name: &str) -> String {
     }
 }
 
-fn spawn_sftp_simple(session_id: u64, session: Arc<RusshSession>, mut out: OutSink, op: SftpOp) -> tokio::task::JoinHandle<()> {
+fn spawn_sftp_simple(
+    session_id: u64,
+    session: Arc<RusshSession>,
+    mut out: OutSink,
+    op: SftpOp,
+) -> tokio::task::JoinHandle<()> {
     return tokio::spawn(async move {
         let message = match op {
             SftpOp::Mkdir(path) => session
@@ -988,7 +1100,11 @@ fn spawn_sftp_simple(session_id: u64, session: Arc<RusshSession>, mut out: OutSi
 /// Sample remote resource usage in one round-trip and ship the raw stdout to
 /// the UI, which parses it (see `metrics.rs`). Errors are swallowed: a failed
 /// sample just means the monitor keeps its last values until the next tick.
-fn spawn_metrics(session_id: u64, session: Arc<RusshSession>, mut out: OutSink) -> tokio::task::JoinHandle<()> {
+fn spawn_metrics(
+    session_id: u64,
+    session: Arc<RusshSession>,
+    mut out: OutSink,
+) -> tokio::task::JoinHandle<()> {
     return tokio::spawn(async move {
         if let Ok(output) = session.exec_capture(crate::metrics::SAMPLE_COMMAND).await {
             let raw = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -999,7 +1115,11 @@ fn spawn_metrics(session_id: u64, session: Arc<RusshSession>, mut out: OutSink) 
 
 /// Sample the remote process list (`ps`) for the monitor's drill-down. Errors
 /// are swallowed: a failed sample keeps the last list until the next tick.
-fn spawn_processes(session_id: u64, session: Arc<RusshSession>, mut out: OutSink) -> tokio::task::JoinHandle<()> {
+fn spawn_processes(
+    session_id: u64,
+    session: Arc<RusshSession>,
+    mut out: OutSink,
+) -> tokio::task::JoinHandle<()> {
     return tokio::spawn(async move {
         if let Ok(output) = session.exec_capture(crate::metrics::PROCESS_COMMAND).await {
             let raw = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -1008,30 +1128,69 @@ fn spawn_processes(session_id: u64, session: Arc<RusshSession>, mut out: OutSink
     });
 }
 
-fn spawn_read_file(session_id: u64, session: Arc<RusshSession>, mut out: OutSink, path: String, offset: u64, len: u64) -> tokio::task::JoinHandle<()> {
+fn spawn_read_file(
+    session_id: u64,
+    session: Arc<RusshSession>,
+    mut out: OutSink,
+    path: String,
+    offset: u64,
+    len: u64,
+) -> tokio::task::JoinHandle<()> {
     return tokio::spawn(async move {
         match session.read_file_range(&path, offset, len).await {
             Ok((data, total)) => {
-                let _ = out.send(Event::FileChunk { session_id, path, offset, data, total }).await;
+                let _ = out
+                    .send(Event::FileChunk {
+                        session_id,
+                        path,
+                        offset,
+                        data,
+                        total,
+                    })
+                    .await;
             }
             Err(e) => {
-                let _ = out.send(Event::FileChunk {
-                    session_id, path, offset, data: Vec::new(), total: 0,
-                }).await;
-                let _ = out.send(Event::FileSaved { session_id, result: Err(e.to_string()) }).await;
+                let _ = out
+                    .send(Event::FileChunk {
+                        session_id,
+                        path,
+                        offset,
+                        data: Vec::new(),
+                        total: 0,
+                    })
+                    .await;
+                let _ = out
+                    .send(Event::FileSaved {
+                        session_id,
+                        result: Err(e.to_string()),
+                    })
+                    .await;
             }
         }
     });
 }
 
-fn spawn_write_file(session_id: u64, session: Arc<RusshSession>, mut out: OutSink, path: String, data: Vec<u8>) -> tokio::task::JoinHandle<()> {
+fn spawn_write_file(
+    session_id: u64,
+    session: Arc<RusshSession>,
+    mut out: OutSink,
+    path: String,
+    data: Vec<u8>,
+) -> tokio::task::JoinHandle<()> {
     return tokio::spawn(async move {
-        let result = session.write_file(&path, data).await.map_err(|e| e.to_string());
+        let result = session
+            .write_file(&path, data)
+            .await
+            .map_err(|e| e.to_string());
         let _ = out.send(Event::FileSaved { session_id, result }).await;
     });
 }
 
-fn spawn_ports(session_id: u64, session: Arc<RusshSession>, mut out: OutSink) -> tokio::task::JoinHandle<()> {
+fn spawn_ports(
+    session_id: u64,
+    session: Arc<RusshSession>,
+    mut out: OutSink,
+) -> tokio::task::JoinHandle<()> {
     return tokio::spawn(async move {
         if let Ok(output) = session.exec_capture(crate::metrics::PORT_COMMAND).await {
             let raw = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -1075,7 +1234,14 @@ fn spawn_suggestion_query(
 pub fn local_worker(session_id: u64) -> impl iced::futures::Stream<Item = Event> {
     iced::stream::channel(256, move |mut out: OutSink| async move {
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<Command>(256);
-        if out.send(Event::Ready { session_id, sender: cmd_tx }).await.is_err() {
+        if out
+            .send(Event::Ready {
+                session_id,
+                sender: cmd_tx,
+            })
+            .await
+            .is_err()
+        {
             return;
         }
 
@@ -1093,7 +1259,12 @@ pub fn local_worker(session_id: u64) -> impl iced::futures::Stream<Item = Event>
         let (master_fd, mut child) = match spawn_pty_shell(params.cols, params.rows) {
             Ok(x) => x,
             Err(e) => {
-                let _ = out.send(Event::Failed { session_id, error: e.to_string() }).await;
+                let _ = out
+                    .send(Event::Failed {
+                        session_id,
+                        error: e.to_string(),
+                    })
+                    .await;
                 return;
             }
         };
@@ -1105,9 +1276,15 @@ pub fn local_worker(session_id: u64) -> impl iced::futures::Stream<Item = Event>
         std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
             loop {
-                let n = unsafe { libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-                if n <= 0 { break; }
-                if pty_tx.blocking_send(buf[..n as usize].to_vec()).is_err() { break; }
+                let n = unsafe {
+                    libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                };
+                if n <= 0 {
+                    break;
+                }
+                if pty_tx.blocking_send(buf[..n as usize].to_vec()).is_err() {
+                    break;
+                }
             }
         });
 
@@ -1181,7 +1358,9 @@ pub fn local_worker(session_id: u64) -> impl iced::futures::Stream<Item = Event>
         // Closed event goes out immediately.
         tokio::task::spawn_blocking(move || {
             let pid = child.id() as libc::pid_t;
-            unsafe { libc::kill(pid, libc::SIGHUP); }
+            unsafe {
+                libc::kill(pid, libc::SIGHUP);
+            }
             for _ in 0..40 {
                 match child.try_wait() {
                     Ok(Some(_)) => return,
@@ -1189,7 +1368,9 @@ pub fn local_worker(session_id: u64) -> impl iced::futures::Stream<Item = Event>
                     Err(_) => return,
                 }
             }
-            unsafe { libc::kill(pid, libc::SIGKILL); }
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
             let _ = child.wait();
         });
         let _ = out.send(Event::Closed { session_id }).await;
@@ -1209,9 +1390,16 @@ fn spawn_pty_shell(cols: u16, rows: u16) -> std::io::Result<(libc::c_int, std::p
     let mut slave: libc::c_int = -1;
     let rc = unsafe {
         libc::openpty(
-            &mut master, &mut slave,
-            std::ptr::null_mut(), std::ptr::null_mut(),
-            &mut libc::winsize { ws_col: cols, ws_row: rows, ws_xpixel: 0, ws_ypixel: 0 },
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut libc::winsize {
+                ws_col: cols,
+                ws_row: rows,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            },
         )
     };
     if rc != 0 {
@@ -1222,13 +1410,15 @@ fn spawn_pty_shell(cols: u16, rows: u16) -> std::io::Result<(libc::c_int, std::p
 
     // Dup slave so each stdio slot gets its own fd (File takes ownership).
     let (s1, s2) = unsafe { (libc::dup(slave), libc::dup(slave)) };
-    let stdin  = unsafe { std::fs::File::from_raw_fd(slave) };
+    let stdin = unsafe { std::fs::File::from_raw_fd(slave) };
     let stdout = unsafe { std::fs::File::from_raw_fd(s1) };
     let stderr = unsafe { std::fs::File::from_raw_fd(s2) };
 
     let mut cmd = std::process::Command::new(&shell);
     cmd.arg("-l")
-        .stdin(stdin).stdout(stdout).stderr(stderr)
+        .stdin(stdin)
+        .stdout(stdout)
+        .stderr(stderr)
         .env("TERM", "xterm-256color")
         .env("COLORTERM", "truecolor");
 
@@ -1250,6 +1440,347 @@ fn spawn_pty_shell(cols: u16, rows: u16) -> std::io::Result<(libc::c_int, std::p
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The end-to-end transfer tests below dial a real server, so they need the
+    // backend entry point as well as the session type the outer module imports.
+    use openterm_ssh::RusshBackend;
+
+    /// Whether this environment can allocate a PTY at all.
+    ///
+    /// A sandbox that denies `openpty` (the DSH file sandbox does: EPERM) cannot
+    /// run the local-shell test, and that is an environment fact rather than a
+    /// product regression. Checked directly so the skip cannot mask a real
+    /// failure in the worker itself.
+    #[cfg(unix)]
+    fn pty_available() -> Result<(), String> {
+        let (mut master, mut slave) = (-1, -1);
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        unsafe {
+            libc::close(master);
+            libc::close(slave);
+        }
+        Ok(())
+    }
+
+    /// (length, FNV-1a hash) — cheap end-to-end integrity check for a transfer.
+    fn fingerprint_file(path: &std::path::Path) -> (u64, u64) {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path).expect("open for fingerprint");
+        let mut buf = vec![0u8; 1 << 20];
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        let mut len = 0_u64;
+        loop {
+            let read = file.read(&mut buf).expect("read for fingerprint");
+            if read == 0 {
+                break;
+            }
+            len += read as u64;
+            for byte in &buf[..read] {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        (len, hash)
+    }
+
+    /// Write `len` bytes of deterministic, position-dependent content.
+    fn write_probe_file(path: &std::path::Path, len: u64) {
+        use std::io::Write;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create probe dir");
+        }
+        let file = std::fs::File::create(path).expect("create probe file");
+        let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
+        let mut block = vec![0u8; 64 * 1024];
+        let mut written = 0_u64;
+        let mut index = 0_u64;
+        while written < len {
+            for (i, byte) in block.iter_mut().enumerate() {
+                *byte = ((index as usize + i) % 251) as u8;
+            }
+            let take = ((len - written) as usize).min(block.len());
+            writer.write_all(&block[..take]).expect("write probe file");
+            written += take as u64;
+            index += 1;
+        }
+        writer.flush().expect("flush probe file");
+    }
+
+    /// End-to-end verification against a **real server with a saved host**,
+    /// driving the same path the GUI does: the pooled `SessionConnection`, a
+    /// dedicated transfer connection, and the real network. No password is typed
+    /// into the test — it is read from the saved host's stored secret.
+    ///
+    /// ```sh
+    /// cargo test -p openterm-app --bin openterm-app real_server -- --ignored --nocapture
+    ///
+    /// # optional overrides
+    /// OPENTERM_REAL_DB=/path/to/openterm.redb   (default: the app's own database)
+    /// OPENTERM_REAL_HOST=82.157.57.178          (default)
+    /// OPENTERM_REAL_MB=64                       (payload size, default 48)
+    /// OPENTERM_REAL_IDLE_SECS=180               (idle window to survive, default 120)
+    /// ```
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "dials a real server; needs a saved host with a stored password"]
+    async fn real_server_transfer_through_the_pool() {
+        use openterm_core::AuthRef;
+        use openterm_crypto::{LocalVault, VaultConfig};
+        use openterm_ssh::{AuthMethod, ConnectOptions, ConnectRoute, HostKeyPolicy, PoolConfig};
+        use openterm_storage::WorkspaceStore;
+
+        let db = std::env::var("OPENTERM_REAL_DB")
+            .unwrap_or_else(|_| openterm_ui::default_db_path().display().to_string());
+        let wanted =
+            std::env::var("OPENTERM_REAL_HOST").unwrap_or_else(|_| "82.157.57.178".to_string());
+        let megabytes: u64 = std::env::var("OPENTERM_REAL_MB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(48);
+        let idle_secs: u64 = std::env::var("OPENTERM_REAL_IDLE_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(120);
+
+        let store = WorkspaceStore::open(&db).expect("open workspace database");
+        let settings = store.get_ui_settings().ok().flatten().unwrap_or_default();
+        assert!(
+            !settings.vault_enabled,
+            "the vault is enabled, so the saved password cannot be read without the master \
+             password; unlock it in the GUI or disable the vault first"
+        );
+        let host = store
+            .list_hosts()
+            .expect("list hosts")
+            .into_iter()
+            .find(|host| host.host == wanted || host.name == wanted)
+            .unwrap_or_else(|| panic!("no saved host matching {wanted}"));
+        let username = host.username.clone().expect("saved host has a username");
+        let password = match &host.auth {
+            AuthRef::PasswordSecret(id) => {
+                let secret = store
+                    .get_secret(*id)
+                    .expect("secret lookup")
+                    .expect("saved password secret");
+                let vault = LocalVault::new(VaultConfig::default());
+                String::from_utf8(
+                    vault
+                        .decrypt_secret(crate::VAULT_DEFAULT_KEY, &secret)
+                        .expect("decrypt saved password"),
+                )
+                .expect("password is utf-8")
+            }
+            other => panic!("saved host {wanted} has no stored password ({other:?})"),
+        };
+        eprintln!(
+            "connecting to {}@{wanted} (password from saved host)",
+            username
+        );
+
+        let route = ConnectRoute {
+            target: host.clone(),
+            target_options: ConnectOptions {
+                username: username.clone(),
+                auth: AuthMethod::Password(password),
+                trust_unknown_host_keys: false,
+                host_key_policy: HostKeyPolicy::AcceptNew {
+                    known_hosts: crate::default_known_hosts_path(),
+                },
+                timeout: std::time::Duration::from_secs(20),
+                keepalive_interval: Some(ConnectOptions::DEFAULT_KEEPALIVE_INTERVAL),
+                keepalive_max: ConnectOptions::DEFAULT_KEEPALIVE_MAX,
+            },
+            jump: None,
+        };
+
+        let started = std::time::Instant::now();
+        let conn = SessionConnection::new_pooled(route, PoolConfig::default())
+            .await
+            .expect("connect through SessionConnection");
+        eprintln!("connected in {:.1}s", started.elapsed().as_secs_f64());
+        let primary = conn.terminal_session();
+
+        // --- terminal on the primary connection -----------------------------
+        let (in_tx, mut in_rx) = mpsc::channel::<PtyInput>(64);
+        let (ev_tx, mut ev_rx) = mpsc::channel::<PtyEvent>(256);
+        let shell_session = primary.clone();
+        let mut shell = tokio::spawn(async move {
+            shell_session
+                .event_shell(
+                    ShellOptions {
+                        term: "xterm-256color".to_string(),
+                        size: PtySize {
+                            cols: 100,
+                            rows: 30,
+                        },
+                    },
+                    &mut in_rx,
+                    ev_tx,
+                )
+                .await
+        });
+        let marker = format!("OPENTERM_REAL_{}", std::process::id());
+        in_tx
+            .send(PtyInput::Write(
+                format!("echo {marker}; hostname\n").into_bytes(),
+            ))
+            .await
+            .expect("write to shell");
+        let mut output = String::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !output.contains(&marker) && tokio::time::Instant::now() < deadline {
+            if let Ok(Some(PtyEvent::Output(bytes))) =
+                tokio::time::timeout(std::time::Duration::from_secs(3), ev_rx.recv()).await
+            {
+                output.push_str(&String::from_utf8_lossy(&bytes));
+            }
+        }
+        assert!(output.contains(&marker), "shell never answered: {output:?}");
+        eprintln!("terminal answered on the primary connection");
+
+        // --- a bulk transfer uses its own connection ------------------------
+        let transfer = conn
+            .acquire_transfer_connection()
+            .await
+            .expect("acquire transfer connection");
+        assert!(
+            !Arc::ptr_eq(&primary, transfer.session()),
+            "a bulk transfer must not run on the terminal's connection"
+        );
+        let tsession = transfer.session().clone();
+
+        let dir = std::env::temp_dir().join(format!("openterm-real-{}", std::process::id()));
+        let source = dir.join("real-source.bin");
+        let downloaded = dir.join("real-downloaded.bin");
+        write_probe_file(&source, megabytes * 1024 * 1024);
+        let expected = fingerprint_file(&source);
+        let remote = format!("/tmp/openterm-real-{}.bin", std::process::id());
+
+        let (utx, mut urx) = mpsc::channel::<u64>(64);
+        let up_progress = tokio::spawn(async move {
+            let mut last = 0;
+            while let Some(n) = urx.recv().await {
+                last = n;
+            }
+            last
+        });
+        let started = std::time::Instant::now();
+        let uploaded = tsession
+            .upload_file(
+                &source,
+                &remote,
+                utx,
+                Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("upload of {megabytes} MiB failed: {error}"));
+        let up_secs = started.elapsed().as_secs_f64();
+        let _ = up_progress.await;
+        assert_eq!(uploaded, expected.0, "uploaded byte count");
+        assert_eq!(
+            tsession
+                .remote_file_size(&remote)
+                .await
+                .expect("remote size"),
+            expected.0,
+            "remote file size differs from the source"
+        );
+        eprintln!(
+            "upload OK: {} bytes in {:.1}s ({:.0} KiB/s)",
+            uploaded,
+            up_secs,
+            uploaded as f64 / 1024.0 / up_secs.max(1e-9)
+        );
+
+        let (dtx, mut drx) = mpsc::channel::<u64>(64);
+        let down_progress = tokio::spawn(async move {
+            let mut last = 0;
+            while let Some(n) = drx.recv().await {
+                last = n;
+            }
+            last
+        });
+        let started = std::time::Instant::now();
+        let downloaded_bytes = tsession
+            .download_file(
+                &remote,
+                &downloaded,
+                dtx,
+                Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("download of {megabytes} MiB failed: {error}"));
+        let down_secs = started.elapsed().as_secs_f64();
+        let _ = down_progress.await;
+        assert_eq!(downloaded_bytes, expected.0);
+        assert_eq!(
+            fingerprint_file(&downloaded),
+            expected,
+            "downloaded bytes differ from the uploaded source"
+        );
+        eprintln!(
+            "download OK: {} bytes in {:.1}s ({:.0} KiB/s), bytes verified",
+            downloaded_bytes,
+            down_secs,
+            downloaded_bytes as f64 / 1024.0 / down_secs.max(1e-9)
+        );
+
+        // --- the reported symptom: an idle terminal must stay usable --------
+        if idle_secs > 0 {
+            eprintln!("idling {idle_secs}s to test the reported keepalive drop ...");
+            in_tx
+                .send(PtyInput::Write(format!("echo BEFORE_IDLE\n").into_bytes()))
+                .await
+                .expect("write before idle");
+            let before = std::time::Instant::now();
+            match tokio::time::timeout(std::time::Duration::from_secs(idle_secs), &mut shell).await
+            {
+                Ok(joined) => panic!(
+                    "session died after {:.1}s idle (shell returned {joined:?})",
+                    before.elapsed().as_secs_f64()
+                ),
+                Err(_) => eprintln!("still connected after {idle_secs}s idle"),
+            }
+            in_tx
+                .send(PtyInput::Write(format!("echo AFTER_IDLE\n").into_bytes()))
+                .await
+                .expect("write after idle");
+            let mut after = String::new();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !after.contains("AFTER_IDLE") && tokio::time::Instant::now() < deadline {
+                if let Ok(Some(PtyEvent::Output(bytes))) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), ev_rx.recv()).await
+                {
+                    after.push_str(&String::from_utf8_lossy(&bytes));
+                }
+            }
+            assert!(
+                after.contains("AFTER_IDLE"),
+                "shell stopped responding after idle"
+            );
+            eprintln!("terminal still usable after {idle_secs}s idle");
+        }
+
+        // --- the transfer connection survived too ---------------------------
+        assert!(
+            tsession.is_alive().await,
+            "the transfer connection died during the run"
+        );
+
+        let _ = tsession.remove_path(&remote, RemoteFileKind::File).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = conn.shutdown().await;
+        shell.abort();
+    }
 
     /// The local PTY worker must reap its shell after Disconnect — the old
     /// `std::mem::forget(child)` path left one zombie process behind per
@@ -1258,6 +1789,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn local_worker_reaps_shell_on_disconnect() {
         use iced::futures::StreamExt;
+
+        if let Err(error) = pty_available() {
+            eprintln!("skipping: this environment cannot allocate a PTY ({error})");
+            return;
+        }
 
         let mut stream = Box::pin(local_worker(7));
         let sender = match stream.next().await {
@@ -1306,8 +1842,7 @@ mod tests {
                 .lines()
                 .filter(|l| {
                     let mut it = l.split_whitespace();
-                    it.next() == Some(me.as_str())
-                        && it.next().unwrap_or("").starts_with('Z')
+                    it.next() == Some(me.as_str()) && it.next().unwrap_or("").starts_with('Z')
                 })
                 .count();
             if zombies == 0 {
@@ -1336,6 +1871,8 @@ mod tests {
                 trust_unknown_host_keys: true,
                 host_key_policy: HostKeyPolicy::TrustAll,
                 timeout: std::time::Duration::from_secs(15),
+                keepalive_interval: Some(ConnectOptions::DEFAULT_KEEPALIVE_INTERVAL),
+                keepalive_max: ConnectOptions::DEFAULT_KEEPALIVE_MAX,
             },
             jump: None,
         }
@@ -1386,9 +1923,15 @@ mod tests {
             }
             (last, monotonic)
         });
-        let uploaded = transfer_files(&session, Direction::Upload, &up_files, uptx, Arc::new(std::sync::atomic::AtomicU8::new(0)))
-            .await
-            .expect("upload tree");
+        let uploaded = transfer_files(
+            &session,
+            Direction::Upload,
+            &up_files,
+            uptx,
+            Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        )
+        .await
+        .expect("upload tree");
         let (up_last, up_monotonic) = up_progress.await.unwrap();
         assert_eq!(uploaded, expected_total, "uploaded byte total");
         assert_eq!(up_last, expected_total, "final progress reached the total");
@@ -1396,7 +1939,10 @@ mod tests {
 
         // Confirm the remote tree exists.
         let listed = session.list_dir(&remote_dir).await.expect("list remote");
-        assert!(listed.iter().any(|e| e.name == "top.txt"), "top.txt missing");
+        assert!(
+            listed.iter().any(|e| e.name == "top.txt"),
+            "top.txt missing"
+        );
         assert!(
             listed
                 .iter()
@@ -1419,9 +1965,15 @@ mod tests {
             }
             last
         });
-        let downloaded = transfer_files(&session, Direction::Download, &down_files, dntx, Arc::new(std::sync::atomic::AtomicU8::new(0)))
-            .await
-            .expect("download tree");
+        let downloaded = transfer_files(
+            &session,
+            Direction::Download,
+            &down_files,
+            dntx,
+            Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        )
+        .await
+        .expect("download tree");
         let dn_last = dn_progress.await.unwrap();
         assert_eq!(downloaded, expected_total, "downloaded byte total");
         assert_eq!(dn_last, expected_total);
@@ -1431,7 +1983,9 @@ mod tests {
             .await
             .expect("read inner");
         assert_eq!(inner, vec![7u8; 4096], "nested file bytes differ");
-        let top = tokio::fs::read(dst.join("top.txt")).await.expect("read top");
+        let top = tokio::fs::read(dst.join("top.txt"))
+            .await
+            .expect("read top");
         assert_eq!(top, b"top-level\n", "top file bytes differ");
 
         // Clean up remote tree + local temp dirs.

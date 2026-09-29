@@ -126,6 +126,10 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                             trust_unknown_host_keys: false,
                             host_key_policy: openterm_ssh::HostKeyPolicy::TrustAll,
                             timeout: std::time::Duration::from_secs(5),
+                            // Never dialled: this route only carries the grid size
+                            // to the local PTY worker.
+                            keepalive_interval: None,
+                            keepalive_max: openterm_ssh::ConnectOptions::DEFAULT_KEEPALIVE_MAX,
                         },
                         jump: None,
                     },
@@ -324,7 +328,11 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 let (c1, r1, c2, r2) = s.selection?;
                 let snap = s.render.snapshot(&s.terminal);
                 let t = crate::terminal_render::selected_text(&snap, (c1, r1), (c2, r2));
-                if t.is_empty() { None } else { Some(t) }
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(t)
+                }
             });
             if let Some(t) = text {
                 let chars = t.chars().count();
@@ -334,8 +342,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 );
                 // Brief selection flash for visual confirmation.
                 app.now = std::time::Instant::now();
-                app.copy_flash_until =
-                    Some(app.now + std::time::Duration::from_millis(450));
+                app.copy_flash_until = Some(app.now + std::time::Duration::from_millis(450));
                 clipboard::write(t)
             } else {
                 Task::none()
@@ -630,7 +637,11 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                     }
                 }
             }
-            transfer_control(app, id, crate::connection::Command::SftpPauseTransfer { id });
+            transfer_control(
+                app,
+                id,
+                crate::connection::Command::SftpPauseTransfer { id },
+            );
             Task::none()
         }
         Message::TransferCancel(id) => {
@@ -640,7 +651,11 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             if let Some(session) = app.active_session_mut() {
                 session.transfers.retain(|t| t.id != id);
             }
-            transfer_control(app, id, crate::connection::Command::SftpCancelTransfer { id });
+            transfer_control(
+                app,
+                id,
+                crate::connection::Command::SftpCancelTransfer { id },
+            );
             Task::none()
         }
         Message::TransferResume(id) => {
@@ -879,6 +894,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::SettingsServerAliveInterval(v) => {
             app.server_alive_interval = v;
+            app.persist_settings();
             Task::none()
         }
         Message::SettingsOnDisconnect(v) => {
@@ -1115,13 +1131,19 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                                 _ => None,
                             }
                         },
-                        move |latency_ms| Message::PingResult { host_id, latency_ms },
+                        move |latency_ms| Message::PingResult {
+                            host_id,
+                            latency_ms,
+                        },
                     )
                 })
                 .collect();
             Task::batch(tasks)
         }
-        Message::PingResult { host_id, latency_ms } => {
+        Message::PingResult {
+            host_id,
+            latency_ms,
+        } => {
             app.ping_results.insert(host_id, latency_ms);
             // Keep a short rolling history per host for the footer sparkline.
             // Unreachable samples record as 0 so gaps still show on the chart.
@@ -1173,10 +1195,16 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         // --- File viewer ---
         Message::OpenFileViewer(path) => open_file_viewer(app, path),
         Message::FileViewerClose => {
-            if let Some(s) = app.active_session_mut() { s.file_viewer = None; }
+            if let Some(s) = app.active_session_mut() {
+                s.file_viewer = None;
+            }
             Task::none()
         }
-        Message::FileViewerChunk { offset, data, total } => file_viewer_chunk(app, offset, data, total),
+        Message::FileViewerChunk {
+            offset,
+            data,
+            total,
+        } => file_viewer_chunk(app, offset, data, total),
         Message::FileViewerToggleEdit => {
             if let Some(s) = app.active_session_mut() {
                 if let Some(fv) = &mut s.file_viewer {
@@ -1207,7 +1235,9 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 if let Some(fv) = &mut s.file_viewer {
                     let is_edit = matches!(action, iced::widget::text_editor::Action::Edit(_));
                     fv.editor.perform(action);
-                    if is_edit { fv.dirty = true; }
+                    if is_edit {
+                        fv.dirty = true;
+                    }
                 }
             }
             Task::none()
@@ -1224,7 +1254,9 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::FileViewerReplaceChanged(r) => {
             if let Some(s) = app.active_session_mut() {
-                if let Some(fv) = &mut s.file_viewer { fv.replace = r; }
+                if let Some(fv) = &mut s.file_viewer {
+                    fv.replace = r;
+                }
             }
             Task::none()
         }
@@ -1289,7 +1321,9 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             if let Some(s) = app.active_session_mut() {
                 if let Some(fv) = &mut s.file_viewer {
                     fv.saving = false;
-                    if result.is_ok() { fv.dirty = false; }
+                    if result.is_ok() {
+                        fv.dirty = false;
+                    }
                 }
             }
             Task::none()
@@ -1298,7 +1332,9 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::FileViewerPrevPage => file_viewer_page(app, false),
         Message::FileViewerScroll(v) => {
             if let Some(s) = app.active_session_mut() {
-                if let Some(fv) = &mut s.file_viewer { fv.scroll = v; }
+                if let Some(fv) = &mut s.file_viewer {
+                    fv.scroll = v;
+                }
             }
             Task::none()
         }
@@ -1416,7 +1452,11 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                     return Task::perform(
                         async move {
                             tokio::task::spawn_blocking(move || {
-                                reencrypt_all_secrets(&store, crate::VAULT_DEFAULT_KEY, master.as_bytes())
+                                reencrypt_all_secrets(
+                                    &store,
+                                    crate::VAULT_DEFAULT_KEY,
+                                    master.as_bytes(),
+                                )
                             })
                             .await
                             .unwrap_or_else(|e| Err(e.to_string()))
@@ -1547,7 +1587,8 @@ fn vault_submit(app: &mut App) -> Task<Message> {
                         .get_master_canary()
                         .map_err(|e| e.to_string())?
                         .ok_or_else(|| "No master password set.".to_string())?;
-                    let vault = openterm_crypto::LocalVault::new(openterm_crypto::VaultConfig::default());
+                    let vault =
+                        openterm_crypto::LocalVault::new(openterm_crypto::VaultConfig::default());
                     match vault.decrypt_secret(pw.as_bytes(), &canary) {
                         Ok(plain) if plain == VAULT_CANARY_PLAINTEXT => Ok(pw),
                         _ => Err("Incorrect master password.".to_string()),
@@ -1572,11 +1613,14 @@ fn vault_submit(app: &mut App) -> Task<Message> {
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    let vault = openterm_crypto::LocalVault::new(openterm_crypto::VaultConfig::default());
+                    let vault =
+                        openterm_crypto::LocalVault::new(openterm_crypto::VaultConfig::default());
                     let canary = vault
                         .encrypt_secret(pw.as_bytes(), VAULT_CANARY_PLAINTEXT)
                         .map_err(|e| e.to_string())?;
-                    store.set_master_canary(&canary).map_err(|e| e.to_string())?;
+                    store
+                        .set_master_canary(&canary)
+                        .map_err(|e| e.to_string())?;
                     Ok(pw)
                 })
                 .await
@@ -1612,7 +1656,9 @@ fn reencrypt_all_secrets(
         re.id = secret.id;
         migrated.push(re);
     }
-    store.put_secrets_batch(&migrated).map_err(|e| e.to_string())?;
+    store
+        .put_secrets_batch(&migrated)
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -1665,7 +1711,11 @@ fn terminal_input(app: &mut App, bytes: Vec<u8>) -> Task<Message> {
 
     // 2) Accept the inline ghost suggestion: Right-arrow or Tab when one exists.
     let is_right = bytes == b"\x1b[C";
-    if (is_right || is_tab) && app.active_session().is_some_and(|s| s.inline_suggestion.is_some()) {
+    if (is_right || is_tab)
+        && app
+            .active_session()
+            .is_some_and(|s| s.inline_suggestion.is_some())
+    {
         let suffix = app
             .active_session_mut()
             .and_then(|s| s.inline_suggestion.take());
@@ -1734,8 +1784,11 @@ fn recompute_active_suggestion(app: &mut App) {
         {
             if typed_char == suggest_first {
                 let trimmed: String = existing.chars().skip(1).collect();
-                app.sessions[index].inline_suggestion =
-                    if trimmed.is_empty() { None } else { Some(trimmed) };
+                app.sessions[index].inline_suggestion = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                };
                 return;
             }
         }
@@ -1763,11 +1816,12 @@ fn recompute_active_suggestion(app: &mut App) {
                 .map(String::as_str);
             crate::session::suggestion_suffix(segment, session_hist).or_else(|| {
                 let learned = app.sessions[index].token_model.command_candidates(segment);
-                crate::session::match_suffix(segment, learned.iter().map(String::as_str))
-                    .or_else(|| {
+                crate::session::match_suffix(segment, learned.iter().map(String::as_str)).or_else(
+                    || {
                         let empty: [&str; 0] = [];
                         crate::session::command_name_suggestion(segment, empty.iter().copied())
-                    })
+                    },
+                )
             })
         };
         app.sessions[index].inline_suggestion = suffix;
@@ -1787,16 +1841,19 @@ fn recompute_active_suggestion(app: &mut App) {
     // First extending match wins. On a total miss for an unknown command,
     // fire a one-shot `--help` scrape so future keystrokes have data.
     if cur_token.starts_with('-') {
-        let mut candidates: Vec<String> =
-            app.sessions[index].token_model.token_candidates(&cmd, cur_token);
+        let mut candidates: Vec<String> = app.sessions[index]
+            .token_model
+            .token_candidates(&cmd, cur_token);
         for f in crate::session::flags_for(&cmd) {
             if !candidates.iter().any(|c| c == f) {
                 candidates.push((*f).to_string());
             }
         }
         let help_key = format!("help:{cmd}");
-        if let Some((cached, fetched_at)) =
-            app.sessions[index].suggestion_state.remote_caches.get(&help_key)
+        if let Some((cached, fetched_at)) = app.sessions[index]
+            .suggestion_state
+            .remote_caches
+            .get(&help_key)
         {
             if fetched_at.elapsed().as_millis() < 1_800_000 {
                 for f in cached {
@@ -1831,15 +1888,17 @@ fn recompute_active_suggestion(app: &mut App) {
 
     // Strategies that need cached data or a remote query.
     let tag = crate::session::strategy_tag(&strategy);
-    let (query_cmd, ttl_ms) = crate::session::strategy_query(&strategy)
-        .unwrap_or(("", 10_000));
+    let (query_cmd, ttl_ms) = crate::session::strategy_query(&strategy).unwrap_or(("", 10_000));
 
     // Check cache freshness and produce a suggestion if data is available.
     let cached_suffix = match &strategy {
         crate::session::SuggestStrategy::Files => {
             if let Some(cache) = &app.sessions[index].suggestion_state.dir_cache {
                 if cache.is_fresh(ttl_ms) {
-                    crate::session::match_suffix(cur_token, cache.all_entries.iter().map(String::as_str))
+                    crate::session::match_suffix(
+                        cur_token,
+                        cache.all_entries.iter().map(String::as_str),
+                    )
                 } else {
                     None
                 }
@@ -1926,9 +1985,15 @@ fn recompute_active_suggestion(app: &mut App) {
     }
 
     // Cache miss: trigger a remote query (unless one is already in flight).
-    let tag_string = if tag.is_empty() { cmd.clone() } else { tag.to_string() };
+    let tag_string = if tag.is_empty() {
+        cmd.clone()
+    } else {
+        tag.to_string()
+    };
     if !app.sessions[index].suggestion_state.is_pending(&tag_string) {
-        app.sessions[index].suggestion_state.mark_pending(&tag_string);
+        app.sessions[index]
+            .suggestion_state
+            .mark_pending(&tag_string);
         if let Some(tx) = &app.sessions[index].cmd_tx {
             let _ = tx.try_send(Command::ExecQuery {
                 command: query_cmd.to_string(),
@@ -2020,13 +2085,14 @@ fn connect_in_new_or_active(app: &mut App, config: SessionConfig) -> Task<Messag
 /// Connect the active session.
 fn connect_active(app: &mut App) -> Task<Message> {
     let (cols, rows) = app.current_grid();
+    let keepalive = app.keepalive_interval();
     let Some(session) = app.active_session_mut() else {
         return Task::none();
     };
     if session.phase.is_active() {
         return Task::none();
     }
-    let route = match App::build_route(&session.config) {
+    let route = match App::build_route(&session.config, keepalive) {
         Ok(route) => route,
         Err(error) => {
             session.phase = Phase::Failed(error.clone());
@@ -2059,6 +2125,7 @@ fn connect_active(app: &mut App) -> Task<Message> {
 
 fn accept_host_key(app: &mut App) -> Task<Message> {
     let (cols, rows) = app.current_grid();
+    let keepalive = app.keepalive_interval();
     let Some(session) = app.active_session_mut() else {
         return Task::none();
     };
@@ -2071,7 +2138,7 @@ fn accept_host_key(app: &mut App) -> Task<Message> {
         return Task::none();
     }
     // Re-attempt the connection now that the key is trusted.
-    let route = match App::build_route(&session.config) {
+    let route = match App::build_route(&session.config, keepalive) {
         Ok(route) => route,
         Err(error) => {
             session.phase = Phase::Failed(error.clone());
@@ -2680,7 +2747,8 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
                             async move {
                                 let _ = tokio::task::spawn_blocking(move || {
                                     let _ = store.update_last_history_output(&committed);
-                                }).await;
+                                })
+                                .await;
                             },
                             |_| Message::Noop,
                         ));
@@ -2710,7 +2778,8 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
                         async move {
                             let _ = tokio::task::spawn_blocking(move || {
                                 let _ = store.append_history(&e2);
-                            }).await;
+                            })
+                            .await;
                         },
                         |_| Message::Noop,
                     ));
@@ -2839,7 +2908,9 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
             session.refresh_local(sort, sort_asc);
             return sftp_refresh(app);
         }
-        ConnEvent::TransferPaused { id, transferred, .. } => {
+        ConnEvent::TransferPaused {
+            id, transferred, ..
+        } => {
             if let Some(t) = session.transfers.iter_mut().find(|t| t.id == id) {
                 t.transferred = transferred;
                 t.speed_bps = 0.0;
@@ -2885,7 +2956,13 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
         ConnEvent::Exit { code, .. } => {
             session.status = format!("Process exited ({code})");
         }
-        ConnEvent::FileChunk { path, offset, data, total, .. } => {
+        ConnEvent::FileChunk {
+            path,
+            offset,
+            data,
+            total,
+            ..
+        } => {
             if let Some(fv) = &mut session.file_viewer {
                 if fv.path == path {
                     let text = String::from_utf8_lossy(&data).into_owned();
@@ -2908,7 +2985,9 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
         ConnEvent::FileSaved { result, .. } => {
             if let Some(fv) = &mut session.file_viewer {
                 fv.saving = false;
-                if result.is_ok() { fv.dirty = false; }
+                if result.is_ok() {
+                    fv.dirty = false;
+                }
             }
         }
         ConnEvent::Closed { .. } => {
@@ -2938,7 +3017,9 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
             regrid_after = true;
             toast = Some((crate::ui::toasts::ToastKind::Error, error));
         }
-        ConnEvent::SuggestionData { tag, candidates, .. } => {
+        ConnEvent::SuggestionData {
+            tag, candidates, ..
+        } => {
             // Store the query result into the session's suggestion cache.
             session.suggestion_state.clear_pending(&tag);
             match tag.as_str() {
@@ -2948,13 +3029,11 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
                         .filter(|c| c.ends_with('/'))
                         .cloned()
                         .collect();
-                    session.suggestion_state.dir_cache = Some(
-                        crate::session::DirCache {
-                            all_entries: candidates,
-                            dirs,
-                            fetched_at: std::time::Instant::now(),
-                        },
-                    );
+                    session.suggestion_state.dir_cache = Some(crate::session::DirCache {
+                        all_entries: candidates,
+                        dirs,
+                        fetched_at: std::time::Instant::now(),
+                    });
                 }
                 "kill" | "pkill" | "killall" => {
                     session.suggestion_state.pid_cache =
@@ -2965,20 +3044,18 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
                     // (only the dirs field is populated for cd-strategy).
                     let dirs = candidates.clone();
                     let all = dirs.clone();
-                    session.suggestion_state.dir_cache = Some(
-                        crate::session::DirCache {
-                            all_entries: all,
-                            dirs,
-                            fetched_at: std::time::Instant::now(),
-                        },
-                    );
+                    session.suggestion_state.dir_cache = Some(crate::session::DirCache {
+                        all_entries: all,
+                        dirs,
+                        fetched_at: std::time::Instant::now(),
+                    });
                 }
                 _ => {
                     // Custom Remote-strategy cache.
-                    session.suggestion_state.remote_caches.insert(
-                        tag,
-                        (candidates, std::time::Instant::now()),
-                    );
+                    session
+                        .suggestion_state
+                        .remote_caches
+                        .insert(tag, (candidates, std::time::Instant::now()));
                 }
             }
             // Mark that we need to recompute the suggestion after the borrow.
@@ -3031,7 +3108,11 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
         app.smoke_open_menu = false;
         app.sftp_menu = Some((crate::session::SftpSide::Remote, 0));
     }
-    if extra_tasks.is_empty() { Task::none() } else { Task::batch(extra_tasks) }
+    if extra_tasks.is_empty() {
+        Task::none()
+    } else {
+        Task::batch(extra_tasks)
+    }
 }
 
 // --- remote path helpers ---
@@ -3059,9 +3140,13 @@ fn join_local(base: &str, name: &str) -> String {
 
 fn open_file_viewer(app: &mut App, path: String) -> Task<Message> {
     use crate::session::FileViewerState;
-    let Some(session) = app.active_session_mut() else { return Task::none(); };
+    let Some(session) = app.active_session_mut() else {
+        return Task::none();
+    };
     session.file_viewer = Some(FileViewerState::new_loading(path.clone()));
-    let Some(tx) = session.cmd_tx.clone() else { return Task::none(); };
+    let Some(tx) = session.cmd_tx.clone() else {
+        return Task::none();
+    };
     let _ = tx.try_send(Command::ReadFileRange {
         path,
         offset: 0,
@@ -3079,8 +3164,12 @@ fn file_viewer_chunk(app: &mut App, offset: u64, data: Vec<u8>, total: u64) -> T
 }
 
 fn file_viewer_save(app: &mut App) -> Task<Message> {
-    let Some(session) = app.active_session_mut() else { return Task::none(); };
-    let Some(fv) = session.file_viewer.as_mut() else { return Task::none(); };
+    let Some(session) = app.active_session_mut() else {
+        return Task::none();
+    };
+    let Some(fv) = session.file_viewer.as_mut() else {
+        return Task::none();
+    };
     // In edit mode, the source of truth is the text_editor; otherwise use loaded content.
     let data = if fv.mode == crate::session::ViewerMode::Edit {
         fv.editor.text().into_bytes()
@@ -3092,27 +3181,45 @@ fn file_viewer_save(app: &mut App) -> Task<Message> {
     };
     let path = fv.path.clone();
     fv.saving = true;
-    let Some(tx) = session.cmd_tx.clone() else { return Task::none(); };
+    let Some(tx) = session.cmd_tx.clone() else {
+        return Task::none();
+    };
     let _ = tx.try_send(Command::WriteFile { path, data });
     Task::none()
 }
 
-fn file_viewer_page(app: &mut App, next: bool) -> Task<Message> {    use crate::session::{FileViewerState, ViewerContent};
-    let Some(session) = app.active_session_mut() else { return Task::none(); };
-    let Some(fv) = session.file_viewer.as_mut() else { return Task::none(); };
+fn file_viewer_page(app: &mut App, next: bool) -> Task<Message> {
+    use crate::session::{FileViewerState, ViewerContent};
+    let Some(session) = app.active_session_mut() else {
+        return Task::none();
+    };
+    let Some(fv) = session.file_viewer.as_mut() else {
+        return Task::none();
+    };
     let (page_offset, total, path) = match &fv.content {
-        ViewerContent::Streaming { page_offset, total, .. } => (*page_offset, *total, fv.path.clone()),
+        ViewerContent::Streaming {
+            page_offset, total, ..
+        } => (*page_offset, *total, fv.path.clone()),
         _ => return Task::none(),
     };
     let new_offset = if next {
-        (page_offset + FileViewerState::PAGE_SIZE).min(total.saturating_sub(FileViewerState::PAGE_SIZE))
+        (page_offset + FileViewerState::PAGE_SIZE)
+            .min(total.saturating_sub(FileViewerState::PAGE_SIZE))
     } else {
         page_offset.saturating_sub(FileViewerState::PAGE_SIZE)
     };
-    if new_offset == page_offset { return Task::none(); }
+    if new_offset == page_offset {
+        return Task::none();
+    }
     fv.content = ViewerContent::Loading;
-    let Some(tx) = session.cmd_tx.clone() else { return Task::none(); };
-    let _ = tx.try_send(Command::ReadFileRange { path, offset: new_offset, len: FileViewerState::PAGE_SIZE });
+    let Some(tx) = session.cmd_tx.clone() else {
+        return Task::none();
+    };
+    let _ = tx.try_send(Command::ReadFileRange {
+        path,
+        offset: new_offset,
+        len: FileViewerState::PAGE_SIZE,
+    });
     Task::none()
 }
 

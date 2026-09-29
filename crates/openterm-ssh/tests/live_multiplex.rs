@@ -30,6 +30,8 @@ fn route(password: String) -> ConnectRoute {
             trust_unknown_host_keys: true,
             host_key_policy: HostKeyPolicy::TrustAll,
             timeout: Duration::from_secs(15),
+            keepalive_interval: Some(ConnectOptions::DEFAULT_KEEPALIVE_INTERVAL),
+            keepalive_max: ConnectOptions::DEFAULT_KEEPALIVE_MAX,
         },
         jump: None,
     }
@@ -197,7 +199,12 @@ async fn streaming_transfer_reports_progress() {
         samples
     });
     let sent = up_session
-        .upload_file(&local_up, &remote, ptx, Arc::new(std::sync::atomic::AtomicU8::new(0)))
+        .upload_file(
+            &local_up,
+            &remote,
+            ptx,
+            Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        )
         .await
         .expect("upload");
     let up_samples = collect.await.unwrap();
@@ -219,7 +226,12 @@ async fn streaming_transfer_reports_progress() {
         last
     });
     let got = session
-        .download_file(&remote, &local_down, dtx, Arc::new(std::sync::atomic::AtomicU8::new(0)))
+        .download_file(
+            &remote,
+            &local_down,
+            dtx,
+            Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        )
         .await
         .expect("download");
     let last_down = collect.await.unwrap();
@@ -404,7 +416,15 @@ async fn recursive_remote_dir_delete() {
         tokio::fs::write(&tmp, payload).await.unwrap();
         let (tx, mut rx) = mpsc::channel::<u64>(8);
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
-        session.upload_file(&tmp, &path, tx, Arc::new(std::sync::atomic::AtomicU8::new(0))).await.expect("upload");
+        session
+            .upload_file(
+                &tmp,
+                &path,
+                tx,
+                Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            )
+            .await
+            .expect("upload");
         let _ = tokio::fs::remove_file(&tmp).await;
     }
 
@@ -471,7 +491,12 @@ async fn resumable_download_resumes_from_partial() {
     let (tx, rx) = mpsc::channel::<u64>(256);
     let collect = tokio::spawn(drain_progress(rx));
     let got = session
-        .download_file(&remote, &local, tx, Arc::new(std::sync::atomic::AtomicU8::new(0)))
+        .download_file(
+            &remote,
+            &local,
+            tx,
+            Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        )
         .await
         .expect("download");
     let (first, last, monotonic) = collect.await.unwrap();
@@ -526,7 +551,12 @@ async fn resumable_upload_resumes_from_partial() {
     let (tx, rx) = mpsc::channel::<u64>(256);
     let collect = tokio::spawn(drain_progress(rx));
     let sent = session
-        .upload_file(&local, &remote, tx, Arc::new(std::sync::atomic::AtomicU8::new(0)))
+        .upload_file(
+            &local,
+            &remote,
+            tx,
+            Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        )
         .await
         .expect("upload");
     let (first, last, monotonic) = collect.await.unwrap();
@@ -578,12 +608,19 @@ async fn pipelined_download_large_file() {
 
     let local = std::env::temp_dir().join(format!("openterm_bigdl_{pid}.bin"));
     let _ = tokio::fs::remove_file(&local).await;
-    let _ = tokio::fs::remove_file(std::env::temp_dir().join(format!("openterm_bigdl_{pid}.bin.part"))).await;
+    let _ =
+        tokio::fs::remove_file(std::env::temp_dir().join(format!("openterm_bigdl_{pid}.bin.part")))
+            .await;
 
     let (tx, rx) = mpsc::channel::<u64>(256);
     let collect = tokio::spawn(drain_progress(rx));
     let got = session
-        .download_file(&remote, &local, tx, Arc::new(std::sync::atomic::AtomicU8::new(0)))
+        .download_file(
+            &remote,
+            &local,
+            tx,
+            Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        )
         .await
         .expect("download");
     let (_first, last, monotonic) = collect.await.unwrap();

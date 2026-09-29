@@ -8,8 +8,18 @@ rust-version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+# `log` is a real dependency (keepalive/socket diagnostics the app can surface)
+# and is also listed under dev-dependencies, since integration tests are separate
+# crates and cannot see it otherwise.
+libc.workspace = true
+log = "0.4"
 openterm-core = { path = "../openterm-core" }
 russh.workspace = true
 russh-sftp.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+# The stability probes install a stderr logger so russh's own keepalive /
+# disconnect / SFTP diagnostics are visible while reproducing field reports.
+log = "0.4"

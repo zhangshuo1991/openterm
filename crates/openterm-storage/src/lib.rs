@@ -67,6 +67,17 @@ pub struct UiSettings {
     /// Optional accent color override as "#rrggbb". Empty = use scheme default.
     #[serde(default)]
     pub accent_hex: String,
+    /// ServerAliveInterval: seconds between SSH keepalives, 0 = disabled.
+    ///
+    /// Persisted because it is a per-network setting users tune to stop idle
+    /// sessions from being dropped (a NAT that forgets idle flows wants a shorter
+    /// interval than a well-behaved server does).
+    #[serde(default = "default_server_alive_interval")]
+    pub server_alive_interval: u16,
+}
+
+fn default_server_alive_interval() -> u16 {
+    60
 }
 
 fn default_line_height() -> f32 {
@@ -95,6 +106,7 @@ impl Default for UiSettings {
             letter_spacing: 0.0,
             cursor_shape: default_cursor_shape(),
             accent_hex: String::new(),
+            server_alive_interval: default_server_alive_interval(),
         }
     }
 }
@@ -254,7 +266,10 @@ impl WorkspaceStore {
 
     /// Store the master-password verification canary (an EncryptedSecret whose
     /// plaintext is a known sentinel; used to verify the password on unlock).
-    pub fn set_master_canary(&self, secret: &openterm_core::EncryptedSecret) -> Result<(), StorageError> {
+    pub fn set_master_canary(
+        &self,
+        secret: &openterm_core::EncryptedSecret,
+    ) -> Result<(), StorageError> {
         let bytes = serde_json::to_vec(secret)?;
         let txn = self.db.begin_write()?;
         {
@@ -265,10 +280,16 @@ impl WorkspaceStore {
         Ok(())
     }
 
-    pub fn get_master_canary(&self) -> Result<Option<openterm_core::EncryptedSecret>, StorageError> {
+    pub fn get_master_canary(
+        &self,
+    ) -> Result<Option<openterm_core::EncryptedSecret>, StorageError> {
         let txn = self.db.begin_read()?;
-        let Ok(table) = txn.open_table(VAULT) else { return Ok(None); };
-        let Some(value) = table.get(VAULT_CANARY_KEY)? else { return Ok(None); };
+        let Ok(table) = txn.open_table(VAULT) else {
+            return Ok(None);
+        };
+        let Some(value) = table.get(VAULT_CANARY_KEY)? else {
+            return Ok(None);
+        };
         Ok(Some(serde_json::from_slice(value.value())?))
     }
 
@@ -464,10 +485,16 @@ mod tests {
 
         assert!(store.list_snippets().unwrap().is_empty());
         store
-            .save_snippet(&Snippet { abbr: "gp".into(), expansion: "git push origin HEAD".into() })
+            .save_snippet(&Snippet {
+                abbr: "gp".into(),
+                expansion: "git push origin HEAD".into(),
+            })
             .unwrap();
         store
-            .save_snippet(&Snippet { abbr: "ll".into(), expansion: "ls -la".into() })
+            .save_snippet(&Snippet {
+                abbr: "ll".into(),
+                expansion: "ls -la".into(),
+            })
             .unwrap();
 
         let all = store.list_snippets().unwrap();

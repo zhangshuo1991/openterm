@@ -15,6 +15,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 
+pub mod connection_pool;
+
+pub use connection_pool::{DataConnection, PoolConfig, PoolStats, SshConnectionPool};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PtySize {
     pub cols: u16,
@@ -59,6 +63,26 @@ pub enum SshError {
     Timeout,
 }
 
+impl SshError {
+    /// Whether re-running the same operation could plausibly succeed.
+    ///
+    /// Drives transfer retries: a timeout or a dropped transport on a congested
+    /// link is worth another attempt (the `.part` prefix makes it cheap), while
+    /// a server status reply ("no such file", "permission denied") is a verdict
+    /// that another attempt cannot change.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            SshError::Timeout | SshError::Io(_) | SshError::Protocol(_) => true,
+            SshError::Sftp(error) => !matches!(
+                error,
+                russh_sftp::client::error::Error::Status(_)
+                    | russh_sftp::client::error::Error::Limited(_)
+            ),
+            _ => false,
+        }
+    }
+}
+
 /// Upper bound for short remote operations (exec samples, SFTP metadata,
 /// directory listings). Chosen well above normal round-trip times: its job is
 /// to release the channel-semaphore permit when a server stops responding
@@ -73,6 +97,48 @@ const MAX_BULK_TRANSFERS: usize = 3;
 /// Bulk-content bound (whole-file read/write, recursive deletes): more
 /// generous, since legitimately large payloads on slow links take a while.
 const CONTENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Read size for one positioned read in a bulk download.
+const TRANSFER_CHUNK: u64 = 256 * 1024;
+
+/// How many [`TRANSFER_CHUNK`] reads may be in flight at once. The window is
+/// sized from measured throughput between these bounds rather than fixed: a
+/// deep window on a slow link is what queues a request behind tens of seconds
+/// of data (see [`TRANSFER_TAIL_TARGET`]), and a shallow one caps throughput on
+/// a fast link.
+const TRANSFER_WINDOW_MIN: usize = 2;
+const TRANSFER_WINDOW_MAX: usize = 16;
+
+/// Largest queueing delay we are willing to create for the deepest in-flight
+/// read, at the currently measured rate. The window is derived from this, so a
+/// slow link shrinks it automatically instead of building an unservable queue.
+const TRANSFER_TAIL_TARGET: Duration = Duration::from_secs(8);
+
+/// Per-request deadline for bulk SFTP traffic.
+///
+/// `russh-sftp` defaults to **10 s**, which is not a timeout for the *request*
+/// so much as a budget for the *whole queue in front of it*: a deep read window
+/// on a link slower than `window_bytes / 10 s` times out the tail of every
+/// window. The request is then dropped from the dispatch table, its late reply
+/// is discarded ("packet for unknown recipient" — the bytes are pulled off the
+/// wire and thrown away), and the transfer aborts with `SFTP error: Timeout`
+/// while the server keeps streaming. Measured on a 100 KiB/s link: a 4 MiB
+/// transfer died after 20 s, losing everything it had fetched.
+///
+/// Bulk transfers therefore get a deadline generous enough that only a genuinely
+/// stalled peer trips it; the adaptive window above is what keeps real latency
+/// far away from it. Interactive operations keep the tight default, so a hung
+/// server still fails `ls`/`stat` quickly.
+const TRANSFER_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// In-flight writes `russh-sftp` keeps queued for a bulk upload.
+const TRANSFER_WRITE_WINDOW: usize = 4;
+
+/// Attempts for one bulk transfer. Every attempt after the first resumes from
+/// the `.part` prefix, so a retry costs one backoff instead of the whole file.
+const TRANSFER_ATTEMPTS: usize = 4;
+const TRANSFER_RETRY_BACKOFF: Duration = Duration::from_millis(750);
+const TRANSFER_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(8);
 
 /// Run `fut` with a deadline, mapping expiry to [`SshError::Timeout`]. On
 /// timeout the in-flight future is dropped, which closes its channel and
@@ -104,6 +170,33 @@ pub struct ConnectOptions {
     pub trust_unknown_host_keys: bool,
     pub host_key_policy: HostKeyPolicy,
     pub timeout: Duration,
+    /// How often to send an SSH keepalive while the link is otherwise quiet.
+    /// `None` disables SSH-level keepalives; TCP keepalives stay enabled
+    /// regardless, because they are the ones that survive a throttled app.
+    pub keepalive_interval: Option<Duration>,
+    /// Unanswered keepalives tolerated before the session is declared dead.
+    pub keepalive_max: usize,
+}
+
+/// Idle time before the kernel starts TCP keepalive probes.
+///
+/// Applies whenever SSH-level keepalives are disabled or late, which is the
+/// point: these probes are sent by the kernel, so a throttled or descheduled
+/// app cannot stop them.
+const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+
+impl ConnectOptions {
+    /// Default SSH keepalive interval.
+    pub const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+    /// Unanswered keepalives tolerated before the session is declared dead.
+    ///
+    /// Looser than russh's default of 3 on purpose. At a 30s interval that
+    /// default gives a session only ~2 minutes of grace, which a throttled app
+    /// (macOS App Nap) or a badly congested link can exceed while the session is
+    /// perfectly healthy — and killing a live session is far worse than noticing
+    /// a dead one a minute later. TCP keepalives still detect a truly dead peer.
+    pub const DEFAULT_KEEPALIVE_MAX: usize = 5;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -260,11 +353,12 @@ impl RusshBackend {
         options: ConnectOptions,
     ) -> Result<RusshSession, SshError> {
         let config = Arc::new(client::Config {
-            // No inactivity timeout: an idle terminal must not drop the
-            // session. Liveness is handled by keepalives (every 30s, dead peer
-            // declared after `keepalive_max` unanswered pings ~= 90s).
+            // No inactivity timeout: an idle terminal must not drop the session.
+            // Liveness is handled by the caller's keepalive policy, backed by TCP
+            // keepalives on the socket below.
             inactivity_timeout: None,
-            keepalive_interval: Some(Duration::from_secs(30)),
+            keepalive_interval: options.keepalive_interval,
+            keepalive_max: options.keepalive_max,
             nodelay: true,
             ..Default::default()
         });
@@ -276,9 +370,28 @@ impl RusshBackend {
             remote_forward_sender: remote_forward_sender.clone(),
         };
         // `options.timeout` guards the initial connect only, not the live session.
+        //
+        // `client::connect` would build its own socket with `nodelay` and nothing
+        // else — no TCP keepalives — so the socket is built here instead and
+        // handed to `client::connect_stream`.
+        let stream = tokio::time::timeout(
+            options.timeout,
+            tokio::net::TcpStream::connect((profile.host.as_str(), profile.port)),
+        )
+        .await
+        .map_err(|_| SshError::Connection("connection timed out".to_string()))??;
+        if let Err(error) = stream.set_nodelay(true) {
+            log::warn!("could not disable Nagle on {}: {error}", profile.host);
+        }
+        if let Err(error) = configure_tcp_keepalive(&stream) {
+            log::warn!(
+                "could not enable TCP keepalives for {} (idle SSH sessions may drop): {error}",
+                profile.host
+            );
+        }
         let mut handle = tokio::time::timeout(
             options.timeout,
-            client::connect(config, (profile.host.as_str(), profile.port), handler),
+            client::connect_stream(config, stream, handler),
         )
         .await
         .map_err(|_| SshError::Connection("connection timed out".to_string()))?
@@ -338,9 +451,12 @@ impl RusshBackend {
             .await?;
 
         let config = Arc::new(client::Config {
-            // See `connect_with_options`: idle sessions stay alive via keepalives.
+            // See `connect_with_options`: idle sessions stay alive via the
+            // caller's keepalive policy (the outer connection's TCP keepalives
+            // already cover the tunnel itself).
             inactivity_timeout: None,
-            keepalive_interval: Some(Duration::from_secs(30)),
+            keepalive_interval: target_options.keepalive_interval,
+            keepalive_max: target_options.keepalive_max,
             nodelay: true,
             ..Default::default()
         });
@@ -714,6 +830,8 @@ impl SshBackend for RusshBackend {
             trust_unknown_host_keys: true,
             host_key_policy: HostKeyPolicy::TrustAll,
             timeout: Duration::from_secs(10),
+            keepalive_interval: Some(ConnectOptions::DEFAULT_KEEPALIVE_INTERVAL),
+            keepalive_max: ConnectOptions::DEFAULT_KEEPALIVE_MAX,
         };
         let session = self.connect_with_options(profile, options).await?;
         Ok(Box::new(session))
@@ -833,15 +951,35 @@ impl RusshSession {
         let timeout = std::time::Duration::from_secs(5);
         let _ = tokio::time::timeout(
             timeout,
-            self.handle.disconnect(Disconnect::ByApplication, "", "English"),
-        ).await;
+            self.handle
+                .disconnect(Disconnect::ByApplication, "", "English"),
+        )
+        .await;
         if let Some(jump_handle) = &self.jump_handle {
             let _ = tokio::time::timeout(
                 timeout,
                 jump_handle.disconnect(Disconnect::ByApplication, "", "English"),
-            ).await;
+            )
+            .await;
         }
         Ok(())
+    }
+
+    /// Check if the connection is still alive (used by the pool's health checks).
+    ///
+    /// Sends one SSH global-request ping and returns true if the server answers
+    /// within a short timeout.
+    pub async fn is_alive(&self) -> bool {
+        // A global-request ping: one round trip, no channel opened, and the
+        // reply is resolved by the session loop itself. The earlier `echo 1`
+        // probe opened an exec channel and could therefore be refused by the
+        // channel semaphore while a transfer was running — reporting a healthy
+        // connection as dead, and (through the pool's health check) throwing the
+        // connection away.
+        let probe_timeout = std::time::Duration::from_secs(5);
+        tokio::time::timeout(probe_timeout, self.handle.send_ping())
+            .await
+            .is_ok_and(|result| result.is_ok())
     }
 
     /// Run a command and capture its output through a shared reference. Opens a
@@ -1004,6 +1142,17 @@ impl RusshSession {
     /// channel semaphore. The permit is released when the returned `SftpHandle` is
     /// dropped (or closed), so callers MUST call `.close()` or let it drop when done.
     async fn open_sftp_guarded(&self) -> Result<SftpHandle, SshError> {
+        self.open_sftp_guarded_with(russh_sftp::client::Config::default())
+            .await
+    }
+
+    /// Same as [`Self::open_sftp_guarded`] but with explicit protocol settings,
+    /// so bulk transfers can trade the interactive request deadline for one that
+    /// a slow link cannot trip (see [`TRANSFER_REQUEST_TIMEOUT`]).
+    async fn open_sftp_guarded_with(
+        &self,
+        config: russh_sftp::client::Config,
+    ) -> Result<SftpHandle, SshError> {
         let _permit = self
             .channel_sem
             .clone()
@@ -1012,8 +1161,17 @@ impl RusshSession {
             .expect("channel semaphore closed");
         let channel = self.handle.channel_open_session().await?;
         channel.request_subsystem(true, "sftp").await?;
-        let inner = SftpSession::new(channel.into_stream()).await?;
+        let inner = SftpSession::new_with_config(channel.into_stream(), config).await?;
         Ok(SftpHandle { inner, _permit })
+    }
+
+    /// Protocol settings for bulk SFTP traffic.
+    fn transfer_sftp_config() -> russh_sftp::client::Config {
+        russh_sftp::client::Config {
+            request_timeout_secs: TRANSFER_REQUEST_TIMEOUT.as_secs(),
+            max_concurrent_writes: TRANSFER_WRITE_WINDOW,
+            ..Default::default()
+        }
     }
 
     /// Public entry point kept for external users (e.g. tests). Internally
@@ -1052,39 +1210,42 @@ impl RusshSession {
         path: &str,
     ) -> Result<(String, Vec<RemoteFileEntry>), SshError> {
         bounded(OP_TIMEOUT, async {
-        let sftp = self.open_sftp_guarded().await?;
-        let result: Result<(String, Vec<RemoteFileEntry>), SshError> = async {
-            // Absolute paths are already resolved; only relative ones (".",
-            // "..", "foo/bar") need a canonicalize round-trip.
-            let resolved = if path.starts_with('/') {
-                path.to_string()
-            } else {
-                sftp.canonicalize(path).await.unwrap_or_else(|_| path.to_string())
-            };
-            let mut entries = sftp
-                .read_dir(&resolved)
-                .await?
-                .map(|entry| {
-                    let metadata = entry.metadata();
-                    RemoteFileEntry {
-                        name: entry.file_name(),
-                        path: entry.path(),
-                        kind: remote_file_kind(metadata.file_type()),
-                        size: metadata.size,
-                        permissions: metadata.permissions,
-                        modified: metadata.mtime,
-                    }
-                })
-                .collect::<Vec<_>>();
-            entries.sort_by(|a, b| {
-                let a_dir = matches!(a.kind, RemoteFileKind::Directory);
-                let b_dir = matches!(b.kind, RemoteFileKind::Directory);
-                b_dir.cmp(&a_dir).then_with(|| a.name.cmp(&b.name))
-            });
-            Ok((resolved, entries))
-        }.await;
-        let _ = sftp.close().await;
-        result
+            let sftp = self.open_sftp_guarded().await?;
+            let result: Result<(String, Vec<RemoteFileEntry>), SshError> = async {
+                // Absolute paths are already resolved; only relative ones (".",
+                // "..", "foo/bar") need a canonicalize round-trip.
+                let resolved = if path.starts_with('/') {
+                    path.to_string()
+                } else {
+                    sftp.canonicalize(path)
+                        .await
+                        .unwrap_or_else(|_| path.to_string())
+                };
+                let mut entries = sftp
+                    .read_dir(&resolved)
+                    .await?
+                    .map(|entry| {
+                        let metadata = entry.metadata();
+                        RemoteFileEntry {
+                            name: entry.file_name(),
+                            path: entry.path(),
+                            kind: remote_file_kind(metadata.file_type()),
+                            size: metadata.size,
+                            permissions: metadata.permissions,
+                            modified: metadata.mtime,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                entries.sort_by(|a, b| {
+                    let a_dir = matches!(a.kind, RemoteFileKind::Directory);
+                    let b_dir = matches!(b.kind, RemoteFileKind::Directory);
+                    b_dir.cmp(&a_dir).then_with(|| a.name.cmp(&b.name))
+                });
+                Ok((resolved, entries))
+            }
+            .await;
+            let _ = sftp.close().await;
+            result
         })
         .await
     }
@@ -1100,26 +1261,34 @@ impl RusshSession {
     }
 
     /// Read `len` bytes starting at `offset` from a remote file.
-    pub async fn read_file_range(&self, remote_path: &str, offset: u64, len: u64) -> Result<(Vec<u8>, u64), SshError> {
+    pub async fn read_file_range(
+        &self,
+        remote_path: &str,
+        offset: u64,
+        len: u64,
+    ) -> Result<(Vec<u8>, u64), SshError> {
         bounded(OP_TIMEOUT, async {
-        let sftp = self.open_sftp_guarded().await?;
-        let result: Result<(Vec<u8>, u64), SshError> = async {
-            let total = sftp.metadata(remote_path).await?.size.unwrap_or(0);
-            let mut file = sftp.open(remote_path).await?;
-            file.seek(std::io::SeekFrom::Start(offset)).await?;
-            let cap = len.min(total.saturating_sub(offset)) as usize;
-            let mut buf = vec![0u8; cap];
-            let mut pos = 0;
-            while pos < cap {
-                let n = file.read(&mut buf[pos..]).await?;
-                if n == 0 { break; }
-                pos += n;
+            let sftp = self.open_sftp_guarded().await?;
+            let result: Result<(Vec<u8>, u64), SshError> = async {
+                let total = sftp.metadata(remote_path).await?.size.unwrap_or(0);
+                let mut file = sftp.open(remote_path).await?;
+                file.seek(std::io::SeekFrom::Start(offset)).await?;
+                let cap = len.min(total.saturating_sub(offset)) as usize;
+                let mut buf = vec![0u8; cap];
+                let mut pos = 0;
+                while pos < cap {
+                    let n = file.read(&mut buf[pos..]).await?;
+                    if n == 0 {
+                        break;
+                    }
+                    pos += n;
+                }
+                buf.truncate(pos);
+                Ok((buf, total))
             }
-            buf.truncate(pos);
-            Ok((buf, total))
-        }.await;
-        let _ = sftp.close().await;
-        result
+            .await;
+            let _ = sftp.close().await;
+            result
         })
         .await
     }
@@ -1132,7 +1301,8 @@ impl RusshSession {
                 file.write_all(&bytes).await?;
                 file.shutdown().await?;
                 Ok(())
-            }.await;
+            }
+            .await;
             let _ = sftp.close().await;
             result
         })
@@ -1143,26 +1313,58 @@ impl RusshSession {
     pub async fn remote_file_size(&self, remote_path: &str) -> Result<u64, SshError> {
         bounded(OP_TIMEOUT, async {
             let sftp = self.open_sftp_guarded().await?;
-            let result = sftp.metadata(remote_path).await.map(|m| m.size.unwrap_or(0)).map_err(SshError::from);
+            let result = sftp
+                .metadata(remote_path)
+                .await
+                .map(|m| m.size.unwrap_or(0))
+                .map_err(SshError::from);
             let _ = sftp.close().await;
             result
         })
         .await
     }
 
-    /// Download a remote file to a local path, streaming in chunks and reporting
-    /// cumulative bytes transferred over `progress`. Returns the total bytes
-    /// written. The same live SSH connection is reused (no redial).
-    /// Download a remote file to a local path, resumably and with pipelining.
+    /// Download a remote file to a local path, resumably, with an adaptive read
+    /// window and automatic retry.
     ///
     /// Bytes land in `<local>.part`; on success it is renamed over `<local>`.
-    /// If a `.part` already exists, the transfer **resumes** from its length.
-    /// Reads are pipelined: up to `WINDOW` positioned `read(offset,len)` requests
-    /// are in flight at once (each carries its own absolute offset), and every
-    /// chunk is written to the local file at its offset — so throughput scales
-    /// with bandwidth, not round-trip latency. Cumulative bytes (including any
-    /// resumed prefix) are reported over `progress`. Returns the file size.
+    /// A `.part` that is a valid prefix is resumed rather than restarted, and so
+    /// is every retry — a link that breaks mid-file costs one backoff instead of
+    /// the whole transfer. Cumulative bytes (including any resumed prefix) are
+    /// reported over `progress`. Returns the file size.
     pub async fn download_file(
+        &self,
+        remote_path: &str,
+        local_path: &std::path::Path,
+        progress: mpsc::Sender<u64>,
+        stop: Arc<std::sync::atomic::AtomicU8>,
+    ) -> Result<u64, SshError> {
+        let mut attempt = 0;
+        let mut backoff = TRANSFER_RETRY_BACKOFF;
+        loop {
+            attempt += 1;
+            let outcome = self
+                .download_attempt(remote_path, local_path, progress.clone(), stop.clone())
+                .await;
+            let error = match outcome {
+                Ok(bytes) => return Ok(bytes),
+                Err(error) => error,
+            };
+            let cancelled = stop.load(std::sync::atomic::Ordering::Relaxed) != 0;
+            if cancelled || !error.is_transient() || attempt >= TRANSFER_ATTEMPTS {
+                return Err(error);
+            }
+            // `download_attempt` left the `.part` as a contiguous prefix, so the
+            // next attempt continues from a file that is exactly right.
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(TRANSFER_RETRY_BACKOFF_MAX);
+        }
+    }
+
+    /// One pass of [`Self::download_file`]: stream `[resume, total)` into the
+    /// `.part` file, then either promote it or cut it back to the longest
+    /// *contiguous* completed prefix so a later resume can never skip a hole.
+    async fn download_attempt(
         &self,
         remote_path: &str,
         local_path: &std::path::Path,
@@ -1171,9 +1373,6 @@ impl RusshSession {
     ) -> Result<u64, SshError> {
         use std::os::unix::fs::FileExt;
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
-        const CHUNK: u64 = 256 * 1024;
-        const WINDOW: usize = 16;
 
         // Queue behind other bulk transfers FIRST (see `bulk_sem`): waiting
         // here keeps channel permits free for interactive SFTP navigation.
@@ -1192,10 +1391,14 @@ impl RusshSession {
             .await
             .expect("channel semaphore closed");
 
-        // A dedicated SFTP channel as a RawSftpSession for positioned reads.
+        // A dedicated SFTP channel as a RawSftpSession for positioned reads,
+        // carrying the bulk request deadline rather than the interactive default.
         let channel = self.handle.channel_open_session().await?;
         channel.request_subsystem(true, "sftp").await?;
-        let raw = Arc::new(RawSftpSession::new(channel.into_stream()));
+        let raw = Arc::new(RawSftpSession::new_with_config(
+            channel.into_stream(),
+            Self::transfer_sftp_config(),
+        ));
         raw.init().await?;
 
         let total = raw.stat(remote_path).await?.attrs.size.unwrap_or(0);
@@ -1203,8 +1406,15 @@ impl RusshSession {
         // Resume from an existing `.part` when it is a valid prefix; otherwise
         // start fresh (a stale/oversized `.part` is truncated).
         let part = part_path(local_path);
-        let existing = tokio::fs::metadata(&part).await.map(|m| m.len()).unwrap_or(0);
-        let resume = if existing > 0 && existing <= total { existing } else { 0 };
+        let existing = tokio::fs::metadata(&part)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let resume = if existing > 0 && existing <= total {
+            existing
+        } else {
+            0
+        };
 
         let file = Arc::new(
             std::fs::OpenOptions::new()
@@ -1237,89 +1447,193 @@ impl RusshSession {
             })
         };
 
-        // The highest contiguous offset we've finished spawning work for. When
-        // a stop is requested we drain the in-flight window, so everything in
-        // `[resume, contiguous_end)` is guaranteed written — the `.part` is
-        // then truncated to that watermark so a later resume starts clean
-        // (windowed writes could otherwise leave holes past this point).
-        let mut contiguous_end = resume;
-        let mut stopped = false;
+        // One flag per chunk records what is *known* written. Windowed writes
+        // land at absolute offsets and finish out of order, so the file length
+        // alone would let a later resume skip a hole and silently corrupt the
+        // file; the flags give the longest prefix that is genuinely contiguous.
+        let remaining = total - resume;
+        let chunk_count = remaining.div_ceil(TRANSFER_CHUNK) as usize;
+        let completed: Arc<Vec<AtomicBool>> =
+            Arc::new((0..chunk_count).map(|_| AtomicBool::new(false)).collect());
+        let watermark = |completed: &[AtomicBool]| -> u64 {
+            let mut contiguous = 0_usize;
+            while contiguous < completed.len() && completed[contiguous].load(Ordering::Acquire) {
+                contiguous += 1;
+            }
+            resume + (contiguous as u64 * TRANSFER_CHUNK).min(remaining)
+        };
 
-        let outcome: Result<(), SshError> = async {
-            if total > resume {
-                let sem = Arc::new(tokio::sync::Semaphore::new(WINDOW));
-                let mut set = tokio::task::JoinSet::new();
-                let mut off = resume;
-                while off < total {
-                    // Cooperative stop: quit spawning new chunks, then fall
-                    // through to drain whatever is already in flight. A nonzero
-                    // stop token means pause or cancel (both stop here; the
-                    // caller decides what to do with the `.part`).
-                    if stop.load(Ordering::Relaxed) != 0 {
-                        stopped = true;
-                        break;
-                    }
-                    let end = (off + CHUNK).min(total);
-                    let permit = sem.clone().acquire_owned().await.expect("semaphore");
-                    let (raw, handle, file, counter) =
-                        (raw.clone(), handle.clone(), file.clone(), counter.clone());
-                    set.spawn(async move {
-                        let _permit = permit;
-                        let mut cur = off;
-                        while cur < end {
-                            let want = (end - cur) as u32;
-                            let data = raw.read(handle.clone(), cur, want).await?;
-                            if data.data.is_empty() {
-                                break; // unexpected early EOF
-                            }
-                            let n = data.data.len();
-                            file.write_all_at(&data.data, cur)?;
-                            cur += n as u64;
-                            counter.fetch_add(n as u64, Ordering::Relaxed);
+        let mut stopped = false;
+        let mut failure: Option<SshError> = None;
+        let mut offset = resume;
+        // Start shallow: the first window has no measured rate to size it from,
+        // and guessing deep is precisely what queues an unservable backlog on a
+        // slow link.
+        let mut window = TRANSFER_WINDOW_MIN;
+
+        while offset < total {
+            // Cooperative stop: quit spawning new chunks, then fall through to
+            // drain whatever is already in flight. A nonzero stop token means
+            // pause or cancel (both stop here; the caller decides what to do with
+            // the `.part`).
+            if stop.load(Ordering::Relaxed) != 0 {
+                stopped = true;
+                break;
+            }
+
+            let batch_start = offset;
+            let batch_end = (offset + window as u64 * TRANSFER_CHUNK).min(total);
+            let started = std::time::Instant::now();
+            let mut set = tokio::task::JoinSet::new();
+            let mut index = ((offset - resume) / TRANSFER_CHUNK) as usize;
+            while offset < batch_end {
+                let end = (offset + TRANSFER_CHUNK).min(total);
+                let chunk_start = offset;
+                let chunk_index = index;
+                let (raw, handle, file, counter, completed) = (
+                    raw.clone(),
+                    handle.clone(),
+                    file.clone(),
+                    counter.clone(),
+                    completed.clone(),
+                );
+                set.spawn(async move {
+                    let mut cur = chunk_start;
+                    while cur < end {
+                        let want = (end - cur) as u32;
+                        let data = raw.read(handle.clone(), cur, want).await?;
+                        if data.data.is_empty() {
+                            break; // unexpected early EOF
                         }
-                        Ok::<(), SshError>(())
-                    });
-                    off = end;
-                    contiguous_end = off;
-                }
-                while let Some(joined) = set.join_next().await {
-                    joined.map_err(|e| std::io::Error::other(format!("download task failed: {e}")))??;
+                        let read = data.data.len();
+                        file.write_all_at(&data.data, cur)?;
+                        cur += read as u64;
+                        counter.fetch_add(read as u64, Ordering::Relaxed);
+                    }
+                    // Only a fully fetched chunk is safe to resume past.
+                    completed[chunk_index].store(true, Ordering::Release);
+                    Ok::<(), SshError>(())
+                });
+                offset = end;
+                index += 1;
+            }
+
+            let mut aborted = false;
+            while let Some(joined) = set.join_next().await {
+                match joined {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        if failure.is_none() {
+                            failure = Some(error);
+                        }
+                        set.abort_all();
+                    }
+                    // Aborted or panicked chunk: it never set its flag, so the
+                    // watermark stays before it.
+                    Err(_) => aborted = true,
                 }
             }
-            Ok(())
+            if failure.is_some() {
+                break;
+            }
+            if aborted {
+                if stop.load(Ordering::Relaxed) != 0 {
+                    stopped = true;
+                    break;
+                }
+                // A chunk vanished without reporting an error. The bytes it owed
+                // are missing, so this must not be treated as a finished file:
+                // fail (and let the retry resume from the watermark) rather than
+                // promote a `.part` with a hole in it.
+                failure = Some(SshError::Io(std::io::Error::other(
+                    "download chunk ended without completing",
+                )));
+                break;
+            }
+
+            // Size the next window from what this one actually achieved: keep the
+            // deepest queued read inside `TRANSFER_TAIL_TARGET`. Shrink at once
+            // (safety), grow at most 2x per window (stability).
+            let elapsed = started.elapsed().as_secs_f64();
+            if elapsed > 0.0 {
+                let bytes_per_sec = (batch_end - batch_start) as f64 / elapsed;
+                let affordable = (bytes_per_sec * TRANSFER_TAIL_TARGET.as_secs_f64()
+                    / TRANSFER_CHUNK as f64) as usize;
+                window = affordable
+                    .clamp(TRANSFER_WINDOW_MIN, TRANSFER_WINDOW_MAX)
+                    .min(window.saturating_mul(2));
+            }
         }
-        .await;
 
         done.store(true, Ordering::Relaxed);
         let _ = reporter.await;
-        let _ = raw.close(handle).await;
+        // Bounded teardown: on an unresponsive session a plain `close` would wait
+        // out the bulk request deadline before returning.
+        let _ = bounded(OP_TIMEOUT, async {
+            let _ = raw.close(handle).await;
+            Ok::<(), SshError>(())
+        })
+        .await;
         let _ = raw.close_session();
-        outcome?;
 
-        if stopped {
-            // Paused/cancelled: keep the `.part` as a clean resumable prefix
-            // (truncate off any holes past the contiguous watermark). Do NOT
-            // promote to the final name.
-            file.set_len(contiguous_end)?;
+        if failure.is_none() && !stopped {
+            // Flush to disk and promote `.part` → final (overwriting any old file).
             file.sync_all()?;
             drop(file);
-            return Ok(contiguous_end);
+            tokio::fs::rename(&part, local_path).await?;
+            return Ok(total);
         }
 
-        // Flush to disk and promote `.part` → final (overwriting any old file).
+        // Paused, cancelled or failed: keep the `.part` as a clean resumable
+        // prefix, truncated to the watermark so no hole survives.
+        let keep = watermark(&completed[..]);
+        file.set_len(keep)?;
         file.sync_all()?;
         drop(file);
-        tokio::fs::rename(&part, local_path).await?;
-        Ok(total)
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(keep),
+        }
     }
 
-    /// Upload a local file to a remote path, resumably. Bytes land in
-    /// `<remote>.part`; on success it is renamed over `<remote>`. If a remote
-    /// `.part` already exists, the transfer **resumes** from its length. Writes
-    /// are already pipelined by russh-sftp's `File` (it keeps up to
-    /// `max_concurrent_writes` WRITE packets in flight), so this streams with a
-    /// large buffer. Reports cumulative bytes (including any resumed prefix).
+    /// Upload a local file to a remote path, resumably and with automatic retry.
+    ///
+    /// Bytes land in `<remote>.part`; on success it is renamed over `<remote>`.
+    /// A remote `.part` that is a valid prefix is resumed rather than restarted,
+    /// and so is every retry. Writes are pipelined by russh-sftp's `File` (up to
+    /// [`TRANSFER_WRITE_WINDOW`] WRITE packets in flight) under the bulk request
+    /// deadline. Reports cumulative bytes (including any resumed prefix).
     pub async fn upload_file(
+        &self,
+        local_path: &std::path::Path,
+        remote_path: &str,
+        progress: mpsc::Sender<u64>,
+        stop: Arc<std::sync::atomic::AtomicU8>,
+    ) -> Result<u64, SshError> {
+        let mut attempt = 0;
+        let mut backoff = TRANSFER_RETRY_BACKOFF;
+        loop {
+            attempt += 1;
+            let outcome = self
+                .upload_attempt(local_path, remote_path, progress.clone(), stop.clone())
+                .await;
+            let error = match outcome {
+                Ok(bytes) => return Ok(bytes),
+                Err(error) => error,
+            };
+            let cancelled = stop.load(std::sync::atomic::Ordering::Relaxed) != 0;
+            if cancelled || !error.is_transient() || attempt >= TRANSFER_ATTEMPTS {
+                return Err(error);
+            }
+            // The remote `.part` size is authoritative, so the next attempt
+            // continues from exactly the bytes the server acknowledged.
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(TRANSFER_RETRY_BACKOFF_MAX);
+        }
+    }
+
+    /// One pass of [`Self::upload_file`].
+    async fn upload_attempt(
         &self,
         local_path: &std::path::Path,
         remote_path: &str,
@@ -1335,23 +1649,38 @@ impl RusshSession {
             .acquire_owned()
             .await
             .expect("bulk semaphore closed");
-        let sftp = self.open_sftp_guarded().await?;
+        let sftp = self
+            .open_sftp_guarded_with(Self::transfer_sftp_config())
+            .await?;
         let result: Result<u64, SshError> = async {
-            let total = tokio::fs::metadata(local_path).await.map(|m| m.len()).unwrap_or(0);
+            let total = tokio::fs::metadata(local_path)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0);
             let part = format!("{remote_path}.part");
             let existing = match sftp.metadata(&part).await {
                 Ok(m) => m.size.unwrap_or(0),
                 Err(_) => 0,
             };
-            let resume = if existing > 0 && existing <= total { existing } else { 0 };
+            let resume = if existing > 0 && existing <= total {
+                existing
+            } else {
+                0
+            };
             let mut local = tokio::fs::File::open(local_path).await?;
             let mut remote = if resume > 0 {
-                let mut f = sftp.open_with_flags(&part, OpenFlags::WRITE | OpenFlags::CREATE).await?;
+                let mut f = sftp
+                    .open_with_flags(&part, OpenFlags::WRITE | OpenFlags::CREATE)
+                    .await?;
                 local.seek(std::io::SeekFrom::Start(resume)).await?;
                 f.seek(std::io::SeekFrom::Start(resume)).await?;
                 f
             } else {
-                sftp.open_with_flags(&part, OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE).await?
+                sftp.open_with_flags(
+                    &part,
+                    OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE,
+                )
+                .await?
             };
             let mut transferred = resume;
             let _ = progress.send(transferred).await;
@@ -1366,13 +1695,24 @@ impl RusshSession {
                     break;
                 }
                 let read = local.read(&mut buffer).await?;
-                if read == 0 { break; }
+                if read == 0 {
+                    break;
+                }
                 remote.write_all(&buffer[..read]).await?;
                 transferred += read as u64;
                 let _ = progress.send(transferred).await;
             }
-            remote.flush().await?;
-            remote.shutdown().await?;
+            // Bounded, but NOT ignored: promoting the `.part` is only safe once
+            // the server acknowledged every write, so a failed or stalled flush
+            // must fail the attempt (the retry then resumes from the remote
+            // `.part` size) instead of renaming a short file into place. Bounding
+            // it keeps a dead session from waiting out the bulk deadline.
+            bounded(OP_TIMEOUT, async {
+                remote.flush().await?;
+                remote.shutdown().await?;
+                Ok::<(), SshError>(())
+            })
+            .await?;
             if stopped {
                 // Leave `.part` in place for resume; don't promote to final.
                 return Ok(transferred);
@@ -1380,7 +1720,8 @@ impl RusshSession {
             let _ = sftp.remove_file(remote_path).await;
             sftp.rename(&part, remote_path).await?;
             Ok(transferred)
-        }.await;
+        }
+        .await;
         let _ = sftp.close().await;
         result
     }
@@ -1417,7 +1758,10 @@ impl RusshSession {
     pub async fn rename_path(&self, old_path: &str, new_path: &str) -> Result<(), SshError> {
         bounded(OP_TIMEOUT, async {
             let sftp = self.open_sftp_guarded().await?;
-            let result = sftp.rename(old_path, new_path).await.map_err(SshError::from);
+            let result = sftp
+                .rename(old_path, new_path)
+                .await
+                .map_err(SshError::from);
             let _ = sftp.close().await;
             result
         })
@@ -1933,6 +2277,74 @@ impl client::Handler for ClientHandler {
     }
 }
 
+/// Turn on TCP keepalives for a freshly connected socket.
+///
+/// The SSH keepalive is a *user-space* timer. If the app's timers are throttled
+/// (macOS App Nap once the window is left alone) or the process is descheduled,
+/// they stop firing, and a stateful firewall or NAT on the path is then free to
+/// forget the idle flow — which is exactly the "left the terminal alone and SSH
+/// dropped by itself" report. TCP keepalives are emitted by the kernel, so they
+/// keep that flow warm no matter what the app does.
+///
+/// The platform defaults cannot be relied on: `SO_KEEPALIVE` is off unless it is
+/// set explicitly, and macOS' idle time defaults to two hours.
+#[cfg(unix)]
+fn configure_tcp_keepalive(stream: &tokio::net::TcpStream) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    unsafe fn set(
+        fd: libc::c_int,
+        level: libc::c_int,
+        name: libc::c_int,
+        value: libc::c_int,
+    ) -> std::io::Result<()> {
+        // SAFETY: `fd` is a live socket owned by `stream` for the duration of the
+        // call, and `value` is a correctly sized `c_int` for these options.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                name,
+                std::ptr::addr_of!(value).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    let fd = stream.as_raw_fd();
+    unsafe {
+        set(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)?;
+        // Only macOS and Linux name the idle-time knob in libc; elsewhere
+        // `SO_KEEPALIVE` alone is still better than nothing.
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+        {
+            #[cfg(target_os = "macos")]
+            let idle_option = libc::TCP_KEEPALIVE;
+            #[cfg(not(target_os = "macos"))]
+            let idle_option = libc::TCP_KEEPIDLE;
+            set(
+                fd,
+                libc::IPPROTO_TCP,
+                idle_option,
+                TCP_KEEPALIVE_IDLE.as_secs() as libc::c_int,
+            )?;
+            set(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 15)?;
+            set(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT, 4)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn configure_tcp_keepalive(_stream: &tokio::net::TcpStream) -> std::io::Result<()> {
+    Ok(())
+}
+
 fn map_handler_error(error: ClientHandlerError) -> SshError {
     match error {
         ClientHandlerError::Russh(error) => SshError::Connection(error.to_string()),
@@ -2044,6 +2456,127 @@ async fn authenticate_agent(
 mod tests {
     use super::*;
 
+    /// Read an integer socket option back from a live socket.
+    #[cfg(unix)]
+    fn socket_option(
+        stream: &tokio::net::TcpStream,
+        level: libc::c_int,
+        name: libc::c_int,
+    ) -> libc::c_int {
+        use std::os::unix::io::AsRawFd;
+        let mut value: libc::c_int = -1;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: `value`/`len` describe a `c_int` buffer that `getsockopt`
+        // fills in, and the fd is live for the duration of the call.
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                level,
+                name,
+                std::ptr::addr_of_mut!(value).cast(),
+                &mut len,
+            )
+        };
+        assert_eq!(
+            rc,
+            0,
+            "getsockopt failed: {}",
+            std::io::Error::last_os_error()
+        );
+        value
+    }
+
+    /// The kernel has to be what keeps an idle connection warm, because the SSH
+    /// keepalive is a user-space timer that macOS App Nap can throttle once the
+    /// window is left alone. Both settings are off by default (`SO_KEEPALIVE` is
+    /// opt-in and macOS' idle time is two hours), so assert they are really set
+    /// rather than merely intended.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tcp_keepalives_are_enabled_on_the_connect_socket() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let dialing = tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await });
+        let (_server_side, _) = listener.accept().await.expect("accept");
+        let client = dialing
+            .await
+            .expect("join dial task")
+            .expect("connect client socket");
+
+        // BSD reports SO_KEEPALIVE as a bitmask rather than a boolean: off reads
+        // back 0 and on reads back a nonzero bit (8 on macOS), so "changed from
+        // off to on" is the assertion that means something.
+        assert_eq!(
+            socket_option(&client, libc::SOL_SOCKET, libc::SO_KEEPALIVE),
+            0,
+            "a fresh socket must start with keepalives off, or this test proves nothing"
+        );
+        configure_tcp_keepalive(&client).expect("enable TCP keepalives");
+        assert_ne!(
+            socket_option(&client, libc::SOL_SOCKET, libc::SO_KEEPALIVE),
+            0,
+            "SO_KEEPALIVE must be on, otherwise the kernel sends nothing while idle"
+        );
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+        {
+            #[cfg(target_os = "macos")]
+            let idle_option = libc::TCP_KEEPALIVE;
+            #[cfg(not(target_os = "macos"))]
+            let idle_option = libc::TCP_KEEPIDLE;
+            assert_eq!(
+                socket_option(&client, libc::IPPROTO_TCP, idle_option) as u64,
+                TCP_KEEPALIVE_IDLE.as_secs(),
+                "keepalive idle time must be set, not left at the OS default"
+            );
+            assert_eq!(
+                socket_option(&client, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL),
+                15
+            );
+            assert_eq!(
+                socket_option(&client, libc::IPPROTO_TCP, libc::TCP_KEEPCNT),
+                4
+            );
+        }
+    }
+
+    /// A server verdict is final; a broken link is worth another attempt.
+    #[test]
+    fn transient_errors_are_distinguished_from_server_verdicts() {
+        assert!(SshError::Timeout.is_transient());
+        assert!(SshError::Io(std::io::Error::other("reset")).is_transient());
+        assert!(
+            SshError::Sftp(russh_sftp::client::error::Error::Timeout).is_transient(),
+            "an SFTP timeout is what a congested link produces"
+        );
+        assert!(
+            !SshError::Sftp(russh_sftp::client::error::Error::Limited("too big".into()))
+                .is_transient()
+        );
+        assert!(!SshError::Authentication.is_transient());
+    }
+
+    /// The bulk deadline exists because russh-sftp's 10s default is a queue
+    /// budget, not a stall detector: a deep read window on a slow link times out
+    /// the tail of every window and the transfer dies while the server keeps
+    /// streaming. Interactive operations keep the tight default so a hung server
+    /// still fails `ls` quickly.
+    #[test]
+    fn bulk_sftp_traffic_gets_a_deadline_a_slow_link_cannot_trip() {
+        let bulk = RusshSession::transfer_sftp_config();
+        let interactive = russh_sftp::client::Config::default();
+        assert_eq!(
+            bulk.request_timeout_secs,
+            TRANSFER_REQUEST_TIMEOUT.as_secs()
+        );
+        assert!(
+            bulk.request_timeout_secs >= 10 * interactive.request_timeout_secs,
+            "bulk deadline must be far looser than the interactive one"
+        );
+        assert!(bulk.max_concurrent_writes <= TRANSFER_WINDOW_MAX);
+    }
+
     #[test]
     fn exec_output_keeps_stdout_and_stderr_separate() {
         let output = ExecOutput {
@@ -2095,6 +2628,8 @@ mod tests {
                 known_hosts: PathBuf::from("/tmp/known_hosts"),
             },
             timeout: Duration::from_secs(10),
+            keepalive_interval: Some(ConnectOptions::DEFAULT_KEEPALIVE_INTERVAL),
+            keepalive_max: ConnectOptions::DEFAULT_KEEPALIVE_MAX,
         };
 
         assert_eq!(options.effective_host_key_policy(), HostKeyPolicy::TrustAll);

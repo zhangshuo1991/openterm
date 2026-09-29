@@ -13,6 +13,7 @@ mod message;
 mod metrics;
 mod palette;
 mod session;
+mod session_connection;
 mod smoke;
 mod terminal_render;
 mod theme;
@@ -365,7 +366,7 @@ impl App {
             settings_open: false,
             ping_results: HashMap::new(),
             settings_panel: session::SettingsPanel::Terminal,
-            server_alive_interval: "60".to_string(),
+            server_alive_interval: settings.server_alive_interval.to_string(),
             on_disconnect: session::OnDisconnect::AutoReconnect,
             palette_open: false,
             palette_query: String::new(),
@@ -532,11 +533,17 @@ impl App {
         }
     }
 
-    pub fn color_scheme(&self) -> crate::theme::ColorScheme { self.color_scheme }
+    pub fn color_scheme(&self) -> crate::theme::ColorScheme {
+        self.color_scheme
+    }
 
-    pub fn cursor_shape(&self) -> crate::theme::CursorShape { self.cursor_shape }
+    pub fn cursor_shape(&self) -> crate::theme::CursorShape {
+        self.cursor_shape
+    }
 
-    pub fn letter_spacing(&self) -> f32 { self.letter_spacing }
+    pub fn letter_spacing(&self) -> f32 {
+        self.letter_spacing
+    }
 
     /// The latest animation-frame instant (drives interpolation in views).
     pub fn now(&self) -> Instant {
@@ -591,7 +598,9 @@ impl App {
         !self.rail_collapsed
             && self
                 .active_session()
-                .map(|s| s.phase == session::Phase::Connected && s.kind == session::SessionKind::Ssh)
+                .map(|s| {
+                    s.phase == session::Phase::Connected && s.kind == session::SessionKind::Ssh
+                })
                 .unwrap_or(false)
     }
 
@@ -662,7 +671,8 @@ impl App {
 
     /// Visually-rendered sidebar width (0 → full during collapse/expand).
     pub fn sidebar_visual_width(&self) -> f32 {
-        self.sidebar_anim.interpolate(0.0_f32, self.sidebar_width, self.now)
+        self.sidebar_anim
+            .interpolate(0.0_f32, self.sidebar_width, self.now)
     }
 
     /// True while the sidebar slide is in progress (frames still needed).
@@ -672,7 +682,8 @@ impl App {
 
     /// Visually-rendered history panel width (0 → full during open/close).
     pub fn history_visual_width(&self) -> f32 {
-        self.history_anim.interpolate(0.0_f32, self.history_width, self.now)
+        self.history_anim
+            .interpolate(0.0_f32, self.history_width, self.now)
     }
 
     /// True while the history slide is in progress.
@@ -684,7 +695,8 @@ impl App {
     /// fixed content width stays constant; the container clips it as this
     /// shrinks, so the rail appears to slide in/out from the right.
     pub fn rail_visual_width(&self) -> f32 {
-        self.rail_anim.interpolate(0.0_f32, self.rail_width, self.now)
+        self.rail_anim
+            .interpolate(0.0_f32, self.rail_width, self.now)
     }
 
     /// True while the rail slide is in progress (frames still needed).
@@ -803,7 +815,9 @@ impl App {
     }
 
     fn decrypt_secret(&self, id: openterm_core::SecretId) -> Option<String> {
-        if self.vault_locked() { return None; }
+        if self.vault_locked() {
+            return None;
+        }
         let store = self.store()?;
         let secret = store.get_secret(id).ok().flatten()?;
         let bytes = self
@@ -846,8 +860,21 @@ impl App {
         config
     }
 
+    /// SSH keepalive interval from the Settings field, `None` when disabled.
+    ///
+    /// `0` means "no SSH keepalives" (as the settings hint promises; TCP
+    /// keepalives still guard the socket). Unparseable input falls back to the
+    /// default rather than failing the connect — a typo in Settings must not make
+    /// every host unreachable.
+    fn keepalive_interval(&self) -> Option<Duration> {
+        parse_keepalive_interval(&self.server_alive_interval)
+    }
+
     /// Translate a session config into a connect route, validating inputs.
-    fn build_route(config: &SessionConfig) -> Result<ConnectRoute, String> {
+    fn build_route(
+        config: &SessionConfig,
+        keepalive_interval: Option<Duration>,
+    ) -> Result<ConnectRoute, String> {
         let host = config.host.trim();
         if host.is_empty() {
             return Err("Host is required.".to_string());
@@ -909,9 +936,11 @@ impl App {
                 known_hosts: default_known_hosts_path(),
             },
             timeout: CONNECT_TIMEOUT,
+            keepalive_interval,
+            keepalive_max: ConnectOptions::DEFAULT_KEEPALIVE_MAX,
         };
 
-        let jump = parse_jump_host(config.jump_host.trim(), user)?;
+        let jump = parse_jump_host(config.jump_host.trim(), user, keepalive_interval)?;
 
         Ok(ConnectRoute {
             target: profile,
@@ -953,6 +982,7 @@ impl App {
                 letter_spacing: self.letter_spacing,
                 cursor_shape: self.cursor_shape.to_str().to_string(),
                 accent_hex: self.accent_hex.clone(),
+                server_alive_interval: self.server_alive_interval.trim().parse().unwrap_or(60),
             });
         }
     }
@@ -974,7 +1004,7 @@ impl App {
 /// passphrase into the local vault. Returns the host id.
 fn persist_host(app: &App, config: &SessionConfig) -> Result<HostId, String> {
     // Validate by building a route first (re-uses the same checks).
-    App::build_route(config).map_err(|e| e)?;
+    App::build_route(config, app.keepalive_interval()).map_err(|e| e)?;
 
     let store = app
         .store()
@@ -1000,8 +1030,17 @@ fn persist_host(app: &App, config: &SessionConfig) -> Result<HostId, String> {
     profile.host = config.host.trim().to_string();
     profile.port = config.port.trim().parse().unwrap_or(22);
     profile.username = Some(config.user.trim().to_string());
-    profile.group = if config.group.trim().is_empty() { None } else { Some(config.group.trim().to_string()) };
-    profile.tags = config.tags_str.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
+    profile.group = if config.group.trim().is_empty() {
+        None
+    } else {
+        Some(config.group.trim().to_string())
+    };
+    profile.tags = config
+        .tags_str
+        .split(',')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
 
     profile.auth = match config.auth {
         AuthMode::Agent => AuthRef::AgentOrDefault,
@@ -1080,6 +1119,7 @@ fn default_known_hosts_path() -> PathBuf {
 fn parse_jump_host(
     s: &str,
     default_user: &str,
+    keepalive_interval: Option<Duration>,
 ) -> Result<Option<(HostProfile, ConnectOptions)>, String> {
     if s.is_empty() {
         return Ok(None);
@@ -1116,8 +1156,32 @@ fn parse_jump_host(
             known_hosts: default_known_hosts_path(),
         },
         timeout: CONNECT_TIMEOUT,
+        keepalive_interval,
+        keepalive_max: ConnectOptions::DEFAULT_KEEPALIVE_MAX,
     };
     Ok(Some((profile, options)))
+}
+
+/// Shortest keepalive interval the settings field will accept. A keepalive every
+/// second would be pure noise on the wire.
+const MIN_KEEPALIVE_SECS: u64 = 5;
+/// Longest accepted interval: past an hour it stops being a liveness check.
+const MAX_KEEPALIVE_SECS: u64 = 3600;
+
+/// Interpret the ServerAliveInterval field.
+///
+/// `0` disables SSH-level keepalives (as the settings hint promises; the socket's
+/// TCP keepalives stay on either way). Unparseable or empty input falls back to
+/// the default rather than failing the connect — a typo in Settings must not make
+/// every host unreachable.
+fn parse_keepalive_interval(raw: &str) -> Option<Duration> {
+    match raw.trim().parse::<u64>() {
+        Ok(0) => None,
+        Ok(seconds) => Some(Duration::from_secs(
+            seconds.clamp(MIN_KEEPALIVE_SECS, MAX_KEEPALIVE_SECS),
+        )),
+        Err(_) => Some(ConnectOptions::DEFAULT_KEEPALIVE_INTERVAL),
+    }
 }
 
 fn current_timestamp() -> String {
@@ -1126,6 +1190,54 @@ fn current_timestamp() -> String {
         .map(|d| d.as_secs())
         .unwrap_or_default();
     format!("unix:{seconds}")
+}
+
+#[cfg(test)]
+mod keepalive_settings_tests {
+    use super::*;
+
+    /// The settings field is the only way a user can react to idle sessions being
+    /// dropped by their network, so it must mean exactly what the hint says.
+    #[test]
+    fn server_alive_interval_field_is_interpreted_faithfully() {
+        assert_eq!(
+            parse_keepalive_interval("0"),
+            None,
+            "0 must disable keepalives"
+        );
+        assert_eq!(
+            parse_keepalive_interval(" 0 "),
+            None,
+            "whitespace is not a value"
+        );
+        assert_eq!(
+            parse_keepalive_interval("15"),
+            Some(Duration::from_secs(15)),
+            "a value the user typed must be used as-is"
+        );
+        assert_eq!(
+            parse_keepalive_interval("60"),
+            Some(Duration::from_secs(60))
+        );
+        // Junk and empty input must not break connecting.
+        assert_eq!(
+            parse_keepalive_interval("soon"),
+            Some(ConnectOptions::DEFAULT_KEEPALIVE_INTERVAL)
+        );
+        assert_eq!(
+            parse_keepalive_interval(""),
+            Some(ConnectOptions::DEFAULT_KEEPALIVE_INTERVAL)
+        );
+        // Out-of-range values are clamped, not passed through.
+        assert_eq!(
+            parse_keepalive_interval("1"),
+            Some(Duration::from_secs(MIN_KEEPALIVE_SECS))
+        );
+        assert_eq!(
+            parse_keepalive_interval("999999"),
+            Some(Duration::from_secs(MAX_KEEPALIVE_SECS))
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1168,7 +1280,12 @@ mod layout_tests {
     #[test]
     fn grid_never_exceeds_its_area() {
         let window = Size::new(1440.0, 900.0);
-        let area = terminal_area(window, theme::SIDEBAR_WIDTH, ui::RAIL_WIDTH, ui::SUBTAB_HEIGHT);
+        let area = terminal_area(
+            window,
+            theme::SIDEBAR_WIDTH,
+            ui::RAIL_WIDTH,
+            ui::SUBTAB_HEIGHT,
+        );
         let (_, rows) =
             terminal_render::grid_for_viewport(area.width, area.height, theme::DEFAULT_FONT_SIZE);
         let line_height = terminal_render::metrics(theme::DEFAULT_FONT_SIZE).line_height;
