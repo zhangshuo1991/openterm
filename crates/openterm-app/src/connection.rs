@@ -1518,8 +1518,10 @@ mod tests {
 
     /// End-to-end verification against a **real server with a saved host**,
     /// driving the same path the GUI does: the pooled `SessionConnection`, a
-    /// dedicated transfer connection, and the real network. No password is typed
-    /// into the test — it is read from the saved host's stored secret.
+    /// dedicated transfer connection, and the real network. Nothing is typed
+    /// into the test — the auth method comes from the saved host: a stored
+    /// password/passphrase (vault key), a private-key file, or the agent /
+    /// default key (`~/.ssh/id_ed25519`) for key-based login.
     ///
     /// ```sh
     /// cargo test -p openterm-app --bin openterm-app real_server -- --ignored --nocapture
@@ -1531,7 +1533,7 @@ mod tests {
     /// OPENTERM_REAL_IDLE_SECS=180               (idle window to survive, default 120)
     /// ```
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "dials a real server; needs a saved host with a stored password"]
+    #[ignore = "dials a real server; needs a saved host in a workspace database"]
     async fn real_server_transfer_through_the_pool() {
         use openterm_core::AuthRef;
         use openterm_crypto::{LocalVault, VaultConfig};
@@ -1552,12 +1554,6 @@ mod tests {
             .unwrap_or(120);
 
         let store = WorkspaceStore::open(&db).expect("open workspace database");
-        let settings = store.get_ui_settings().ok().flatten().unwrap_or_default();
-        assert!(
-            !settings.vault_enabled,
-            "the vault is enabled, so the saved password cannot be read without the master \
-             password; unlock it in the GUI or disable the vault first"
-        );
         let host = store
             .list_hosts()
             .expect("list hosts")
@@ -1565,32 +1561,65 @@ mod tests {
             .find(|host| host.host == wanted || host.name == wanted)
             .unwrap_or_else(|| panic!("no saved host matching {wanted}"));
         let username = host.username.clone().expect("saved host has a username");
-        let password = match &host.auth {
+        // Decrypting a stored secret requires the vault to be off (the probe
+        // has no master password); key-based hosts don't need the vault.
+        let auth = match &host.auth {
             AuthRef::PasswordSecret(id) => {
+                let settings = store.get_ui_settings().ok().flatten().unwrap_or_default();
+                assert!(
+                    !settings.vault_enabled,
+                    "the vault is enabled, so the saved password cannot be read without the \
+                     master password; unlock it in the GUI or disable the vault first"
+                );
                 let secret = store
                     .get_secret(*id)
                     .expect("secret lookup")
                     .expect("saved password secret");
                 let vault = LocalVault::new(VaultConfig::default());
-                String::from_utf8(
+                let password = String::from_utf8(
                     vault
                         .decrypt_secret(crate::VAULT_DEFAULT_KEY, &secret)
                         .expect("decrypt saved password"),
                 )
-                .expect("password is utf-8")
+                .expect("password is utf-8");
+                AuthMethod::Password(password)
             }
-            other => panic!("saved host {wanted} has no stored password ({other:?})"),
+            AuthRef::PrivateKeyFile { path, passphrase } => {
+                let passphrase = passphrase.map(|id| {
+                    let settings = store.get_ui_settings().ok().flatten().unwrap_or_default();
+                    assert!(
+                        !settings.vault_enabled,
+                        "the vault is enabled, so the saved passphrase cannot be read without \
+                         the master password; unlock it in the GUI or disable the vault first"
+                    );
+                    let secret = store
+                        .get_secret(id)
+                        .expect("secret lookup")
+                        .expect("saved passphrase secret");
+                    let vault = LocalVault::new(VaultConfig::default());
+                    String::from_utf8(
+                        vault
+                            .decrypt_secret(crate::VAULT_DEFAULT_KEY, &secret)
+                            .expect("decrypt saved passphrase"),
+                    )
+                    .expect("passphrase is utf-8")
+                });
+                AuthMethod::PrivateKey {
+                    path: std::path::PathBuf::from(path),
+                    passphrase,
+                }
+            }
+            // Agent identities or the default key (~/.ssh/id_ed25519): plain
+            // key-based login, no stored secret involved.
+            AuthRef::AgentOrDefault | AuthRef::ManagedPrivateKey(_) => AuthMethod::AgentOrDefault,
         };
-        eprintln!(
-            "connecting to {}@{wanted} (password from saved host)",
-            username
-        );
+        eprintln!("connecting to {}@{wanted} (auth from saved host)", username);
 
         let route = ConnectRoute {
             target: host.clone(),
             target_options: ConnectOptions {
                 username: username.clone(),
-                auth: AuthMethod::Password(password),
+                auth,
                 trust_unknown_host_keys: false,
                 host_key_policy: HostKeyPolicy::AcceptNew {
                     known_hosts: crate::default_known_hosts_path(),
@@ -1802,7 +1831,7 @@ mod tests {
         };
         sender
             .send(Command::Connect(ConnectParams {
-                route: test_route(String::new()),
+                route: test_route(),
                 cols: 80,
                 rows: 24,
                 term: "xterm-256color".to_string(),
@@ -1856,10 +1885,32 @@ mod tests {
         }
     }
 
+    /// The SSH key used by the live tests (`OPENTERM_TEST_KEY`, default
+    /// `~/.ssh/id_ed25519`). None when the key file does not exist, so the
+    /// live tests skip loudly instead of failing offline.
+    fn live_test_key() -> Option<std::path::PathBuf> {
+        let path = std::env::var_os("OPENTERM_TEST_KEY")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+                home.unwrap_or_default().join(".ssh").join("id_ed25519")
+            });
+        if path.exists() {
+            Some(path)
+        } else {
+            eprintln!(
+                "skipping: no SSH key at {} (set OPENTERM_TEST_KEY)",
+                path.display()
+            );
+            None
+        }
+    }
+
     /// Build a route to the live test server (mirrors openterm-ssh's harness).
-    fn test_route(password: String) -> ConnectRoute {
+    fn test_route() -> ConnectRoute {
         use openterm_core::HostProfile;
         use openterm_ssh::{AuthMethod, ConnectOptions, HostKeyPolicy};
+        let key = live_test_key().expect("caller checked live_test_key");
         let mut profile = HostProfile::new("live", "82.157.57.178");
         profile.port = 22;
         profile.username = Some("ubuntu".to_string());
@@ -1867,7 +1918,10 @@ mod tests {
             target: profile,
             target_options: ConnectOptions {
                 username: "ubuntu".to_string(),
-                auth: AuthMethod::Password(password),
+                auth: AuthMethod::PrivateKey {
+                    path: key,
+                    passphrase: None,
+                },
                 trust_unknown_host_keys: true,
                 host_key_policy: HostKeyPolicy::TrustAll,
                 timeout: std::time::Duration::from_secs(15),
@@ -1881,15 +1935,14 @@ mod tests {
     /// End-to-end recursive folder transfer: upload a nested local tree, verify
     /// it appears remotely, download it back into a fresh dir, and check the
     /// bytes round-trip. Exercises the exact walk + aggregate-progress path the
-    /// SFTP UI uses when a folder is selected. Gated on OPENTERM_TEST_PASSWORD.
+    /// SFTP UI uses when a folder is selected. Gated on an available SSH key.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn recursive_dir_transfer_round_trip() {
-        let Ok(password) = std::env::var("OPENTERM_TEST_PASSWORD") else {
-            eprintln!("skipping: OPENTERM_TEST_PASSWORD not set");
+        if live_test_key().is_none() {
             return;
-        };
+        }
         let session = RusshBackend
-            .connect_with_route(test_route(password))
+            .connect_with_route(test_route())
             .await
             .expect("connect");
 

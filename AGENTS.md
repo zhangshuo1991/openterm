@@ -154,15 +154,16 @@ SSH 终端软件。所有开发顺序必须服从这个最短真实闭环：
 ## SSH Test Target
 
 For manual SSH smoke tests, use host `82.157.57.178` with user `ubuntu`.
-Do not commit the password. Pass it through an environment variable, password
-manager, or interactive prompt when testing:
+Authenticate with the SSH key at `~/.ssh/id_ed25519` (override with
+`OPENTERM_TEST_KEY`) — do not use password auth for these tests, and never
+commit a password or private key:
 
 ```sh
-cargo run -p openterm-cli -- exec 82.157.57.178 "hostname" --user ubuntu --password-env OPENTERM_TEST_PASSWORD
+cargo run -p openterm-cli -- --db /tmp/openterm-cli-smoke.redb exec 82.157.57.178 "hostname" --user ubuntu --key ~/.ssh/id_ed25519
 ```
 
-If no password environment variable is available, prefer `--password-stdin`
-over `--password` so the secret does not appear in process arguments.
+Pass `--db` with a scratch database when the GUI app is running, because it
+holds the default database lock.
 Use the full real smoke script first, or run individual slices when debugging:
 
 ```sh

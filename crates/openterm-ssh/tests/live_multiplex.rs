@@ -2,8 +2,10 @@
 //! connection actor relies on: hold `Arc<RusshSession>`, run `event_shell`
 //! (now `&self`) while issuing SFTP on the *same* connection concurrently.
 //!
-//! Gated on `OPENTERM_TEST_PASSWORD` so it is skipped in offline CI. Run with:
-//!   OPENTERM_TEST_PASSWORD=… cargo test -p openterm-ssh --test live_multiplex -- --nocapture
+//! Authenticates with the SSH key at `OPENTERM_TEST_KEY` (default
+//! `~/.ssh/id_ed25519`) and skips loudly when that key is absent, so offline
+//! environments skip instead of failing. Run with:
+//!   cargo test -p openterm-ssh --test live_multiplex -- --ignored --nocapture
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,7 +20,27 @@ use tokio::sync::mpsc;
 const HOST: &str = "82.157.57.178";
 const USER: &str = "ubuntu";
 
-fn route(password: String) -> ConnectRoute {
+/// The SSH key used for live tests (`OPENTERM_TEST_KEY`, default `~/.ssh/id_ed25519`).
+fn live_key() -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("OPENTERM_TEST_KEY")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+            home.unwrap_or_default().join(".ssh").join("id_ed25519")
+        });
+    if path.exists() {
+        Some(path)
+    } else {
+        eprintln!(
+            "skipping: no SSH key at {} (set OPENTERM_TEST_KEY)",
+            path.display()
+        );
+        None
+    }
+}
+
+fn route() -> ConnectRoute {
+    let key = live_key().expect("caller checked live_key");
     let mut profile = HostProfile::new("live", HOST);
     profile.port = 22;
     profile.username = Some(USER.to_string());
@@ -26,7 +48,10 @@ fn route(password: String) -> ConnectRoute {
         target: profile,
         target_options: ConnectOptions {
             username: USER.to_string(),
-            auth: AuthMethod::Password(password),
+            auth: AuthMethod::PrivateKey {
+                path: key,
+                passphrase: None,
+            },
             trust_unknown_host_keys: true,
             host_key_policy: HostKeyPolicy::TrustAll,
             timeout: Duration::from_secs(15),
@@ -39,15 +64,14 @@ fn route(password: String) -> ConnectRoute {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shell_and_sftp_multiplex_on_one_connection() {
-    let Ok(password) = std::env::var("OPENTERM_TEST_PASSWORD") else {
-        eprintln!("skipping: OPENTERM_TEST_PASSWORD not set");
+    if live_key().is_none() {
         return;
-    };
+    }
 
     // One connection, shared via Arc — exactly like the app's actor.
     let session = Arc::new(
         RusshBackend
-            .connect_with_route(route(password))
+            .connect_with_route(route())
             .await
             .expect("connect"),
     );
@@ -121,13 +145,12 @@ async fn shell_and_sftp_multiplex_on_one_connection() {
 /// the app's connection actor uses for upload/download/delete.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sftp_round_trip_on_live_connection() {
-    let Ok(password) = std::env::var("OPENTERM_TEST_PASSWORD") else {
-        eprintln!("skipping: OPENTERM_TEST_PASSWORD not set");
+    if live_key().is_none() {
         return;
-    };
+    }
 
     let session = RusshBackend
-        .connect_with_route(route(password))
+        .connect_with_route(route())
         .await
         .expect("connect");
 
@@ -171,13 +194,12 @@ async fn sftp_round_trip_on_live_connection() {
 /// transfer UI uses). Verifies progress is monotonic and bytes round-trip.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn streaming_transfer_reports_progress() {
-    let Ok(password) = std::env::var("OPENTERM_TEST_PASSWORD") else {
-        eprintln!("skipping: OPENTERM_TEST_PASSWORD not set");
+    if live_key().is_none() {
         return;
-    };
+    }
 
     let session = RusshBackend
-        .connect_with_route(route(password))
+        .connect_with_route(route())
         .await
         .expect("connect");
 
@@ -257,12 +279,11 @@ async fn streaming_transfer_reports_progress() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn canonicalize_resolves_relative_path() {
-    let Ok(password) = std::env::var("OPENTERM_TEST_PASSWORD") else {
-        eprintln!("skipping: OPENTERM_TEST_PASSWORD not set");
+    if live_key().is_none() {
         return;
-    };
+    }
     let session = RusshBackend
-        .connect_with_route(route(password))
+        .connect_with_route(route())
         .await
         .expect("connect");
     let abs = session.canonicalize(".").await.expect("canonicalize");
@@ -277,12 +298,11 @@ async fn canonicalize_resolves_relative_path() {
 /// survive well past that window (kept alive by keepalives) and still be usable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn idle_session_survives_past_connect_timeout() {
-    let Ok(password) = std::env::var("OPENTERM_TEST_PASSWORD") else {
-        eprintln!("skipping: OPENTERM_TEST_PASSWORD not set");
+    if live_key().is_none() {
         return;
-    };
+    }
     let session = RusshBackend
-        .connect_with_route(route(password))
+        .connect_with_route(route())
         .await
         .expect("connect");
 
@@ -304,12 +324,11 @@ async fn idle_session_survives_past_connect_timeout() {
 /// connection. Verify `exec_capture` returns the `/proc` sections we parse.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_capture_returns_proc_sections() {
-    let Ok(password) = std::env::var("OPENTERM_TEST_PASSWORD") else {
-        eprintln!("skipping: OPENTERM_TEST_PASSWORD not set");
+    if live_key().is_none() {
         return;
-    };
+    }
     let session = RusshBackend
-        .connect_with_route(route(password))
+        .connect_with_route(route())
         .await
         .expect("connect");
     // Mirror the app's combined sample command (a representative subset).
@@ -331,12 +350,11 @@ async fn exec_capture_returns_proc_sections() {
 /// format matches the parser's assumptions. Eyeball-only; asserts key markers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn full_sample_command_format() {
-    let Ok(password) = std::env::var("OPENTERM_TEST_PASSWORD") else {
-        eprintln!("skipping: OPENTERM_TEST_PASSWORD not set");
+    if live_key().is_none() {
         return;
-    };
+    }
     let session = RusshBackend
-        .connect_with_route(route(password))
+        .connect_with_route(route())
         .await
         .expect("connect");
     // Keep in sync with crate::metrics::SAMPLE_COMMAND in openterm-app.
@@ -362,12 +380,11 @@ echo @@END@@";
 /// the real server returns a parseable table (header + at least the PID 1 row).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ps_process_list_format() {
-    let Ok(password) = std::env::var("OPENTERM_TEST_PASSWORD") else {
-        eprintln!("skipping: OPENTERM_TEST_PASSWORD not set");
+    if live_key().is_none() {
         return;
-    };
+    }
     let session = RusshBackend
-        .connect_with_route(route(password))
+        .connect_with_route(route())
         .await
         .expect("connect");
     // Mirror crate::metrics::PROCESS_COMMAND in openterm-app.
@@ -395,12 +412,11 @@ async fn ps_process_list_format() {
 /// dir with a file and a nested subdir, then remove_path it as a Directory.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recursive_remote_dir_delete() {
-    let Ok(password) = std::env::var("OPENTERM_TEST_PASSWORD") else {
-        eprintln!("skipping: OPENTERM_TEST_PASSWORD not set");
+    if live_key().is_none() {
         return;
-    };
+    }
     let session = RusshBackend
-        .connect_with_route(route(password))
+        .connect_with_route(route())
         .await
         .expect("connect");
 
@@ -465,12 +481,11 @@ async fn drain_progress(mut rx: mpsc::Receiver<u64>) -> (u64, u64, bool) {
 /// that offset (not restart), append the remainder, and rename to the final.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resumable_download_resumes_from_partial() {
-    let Ok(password) = std::env::var("OPENTERM_TEST_PASSWORD") else {
-        eprintln!("skipping: OPENTERM_TEST_PASSWORD not set");
+    if live_key().is_none() {
         return;
-    };
+    }
     let session = RusshBackend
-        .connect_with_route(route(password))
+        .connect_with_route(route())
         .await
         .expect("connect");
 
@@ -525,12 +540,11 @@ async fn resumable_download_resumes_from_partial() {
 /// that offset and produce a correct final file.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resumable_upload_resumes_from_partial() {
-    let Ok(password) = std::env::var("OPENTERM_TEST_PASSWORD") else {
-        eprintln!("skipping: OPENTERM_TEST_PASSWORD not set");
+    if live_key().is_none() {
         return;
-    };
+    }
     let session = RusshBackend
-        .connect_with_route(route(password))
+        .connect_with_route(route())
         .await
         .expect("connect");
 
@@ -588,12 +602,11 @@ async fn resumable_upload_resumes_from_partial() {
 /// of order across the pipelined read window, with monotonic progress.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pipelined_download_large_file() {
-    let Ok(password) = std::env::var("OPENTERM_TEST_PASSWORD") else {
-        eprintln!("skipping: OPENTERM_TEST_PASSWORD not set");
+    if live_key().is_none() {
         return;
-    };
+    }
     let session = RusshBackend
-        .connect_with_route(route(password))
+        .connect_with_route(route())
         .await
         .expect("connect");
 
