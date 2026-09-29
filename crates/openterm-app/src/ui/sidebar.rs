@@ -100,18 +100,14 @@ pub fn view(app: &App) -> Element<'_, Message> {
         .into()
     } else {
         // Group matching indices by their group name (preserve insertion order).
-        let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
-        for &idx in &matching {
-            let g = app.hosts[idx]
-                .group
-                .clone()
-                .unwrap_or_default();
-            if let Some(entry) = groups.iter_mut().find(|(k, _)| k == &g) {
-                entry.1.push(idx);
-            } else {
-                groups.push((g, vec![idx]));
-            }
-        }
+        let pairs: Vec<(usize, String)> = matching
+            .iter()
+            .map(|&idx| {
+                let raw = app.hosts[idx].group.clone().unwrap_or_default();
+                (idx, group_key(&raw))
+            })
+            .collect();
+        let mut groups = bucket_by_group(&pairs);
         // Sort: named groups first (alphabetical), then ungrouped last.
         groups.sort_by(|(a, _), (b, _)| match (a.is_empty(), b.is_empty()) {
             (true, false) => std::cmp::Ordering::Greater,
@@ -238,6 +234,28 @@ fn collapse_button(glyph: &str, on_press: Message) -> Element<'_, Message> {
             }
         })
         .into()
+}
+
+/// Canonical sidebar grouping key: trimmed and case-folded, so hosts saved as
+/// "XJST", "xjst" or "XJST " land in one group. The stored value keeps its
+/// original form; this key drives the bucket, the collapse toggle and the row
+/// color so all three stay consistent. The header displays it uppercased.
+fn group_key(group: &str) -> String {
+    group.trim().to_lowercase()
+}
+
+/// Bucket `(host index, group key)` pairs into groups, preserving first-seen
+/// order of the keys.
+fn bucket_by_group(pairs: &[(usize, String)]) -> Vec<(String, Vec<usize>)> {
+    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+    for (idx, key) in pairs {
+        if let Some(entry) = groups.iter_mut().find(|(k, _)| k == key) {
+            entry.1.push(*idx);
+        } else {
+            groups.push((key.clone(), vec![*idx]));
+        }
+    }
+    groups
 }
 
 /// A clickable group header: a disclosure chevron + the section label. Clicking
@@ -663,4 +681,49 @@ fn confirm_btn(label: &str, msg: Message, danger: bool) -> Element<'_, Message> 
         }
     })
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn group_key_folds_case_and_whitespace() {
+        assert_eq!(group_key("XJST"), group_key("xjst"));
+        assert_eq!(group_key("  XJST "), "xjst");
+        assert_eq!(group_key("   "), "", "a blank group is ungrouped");
+        // The stored value keeps its case; only the key folds.
+        assert_eq!(group_key("Production"), "production");
+    }
+
+    /// The reported defect: hosts whose group differs only by case must land
+    /// in one bucket, with blank groups kept separate as UNGROUPED.
+    #[test]
+    fn buckets_merge_groups_that_differ_only_by_case() {
+        let pairs = vec![
+            (7, group_key("xjst")),
+            (3, group_key("XJST")),
+            (9, group_key("XJST ")),
+            (5, group_key("")),
+        ];
+
+        let groups = bucket_by_group(&pairs);
+
+        assert_eq!(groups.len(), 2, "xjst/XJST/'XJST ' must be one bucket");
+        assert_eq!(groups[0], ("xjst".to_string(), vec![7, 3, 9]));
+        assert_eq!(groups[1], (String::new(), vec![5]));
+    }
+
+    #[test]
+    fn buckets_preserve_first_seen_key_order() {
+        let pairs = vec![
+            (0, group_key("Beta")),
+            (1, group_key("alpha")),
+            (2, group_key("beta")),
+        ];
+
+        let keys: Vec<String> = bucket_by_group(&pairs).into_iter().map(|(k, _)| k).collect();
+
+        assert_eq!(keys, ["beta", "alpha"]);
+    }
 }
