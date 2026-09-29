@@ -290,7 +290,7 @@ fn fmt_ts(ts_ms: u64) -> String {
     let mm = (total_secs % 3600) / 60;
     // Approximate days since epoch → date.
     let days = total_secs / 86400;
-    let (y, mo, d) = days_to_ymd(days);
+    let (_, mo, d) = days_to_ymd(days);
     let _ = dt; // suppress warning
     let months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
     let mo_name = months.get(mo.saturating_sub(1) as usize).unwrap_or(&"?");

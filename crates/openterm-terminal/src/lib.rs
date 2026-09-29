@@ -372,93 +372,6 @@ impl TerminalEngine for AlacrittyTerminalBuffer {
     }
 }
 
-#[derive(Debug)]
-pub struct PlainTerminalBuffer {
-    size: TerminalSize,
-    lines: Vec<TerminalLine>,
-    scrollback_limit: usize,
-}
-
-impl PlainTerminalBuffer {
-    pub fn new(scrollback_limit: usize) -> Self {
-        Self {
-            size: TerminalSize::default(),
-            lines: Vec::new(),
-            scrollback_limit,
-        }
-    }
-
-    pub fn visible_lines(&self) -> &[TerminalLine] {
-        let rows = usize::from(self.size.rows);
-        let start = self.lines.len().saturating_sub(rows);
-        &self.lines[start..]
-    }
-}
-
-impl TerminalEngine for PlainTerminalBuffer {
-    fn resize(&mut self, size: TerminalSize) {
-        self.size = size;
-    }
-
-    fn write_remote_output(&mut self, bytes: &[u8]) -> Result<(), TerminalError> {
-        let text = String::from_utf8_lossy(bytes);
-        for line in text.lines() {
-            self.lines.push(TerminalLine {
-                text: line.to_string(),
-            });
-        }
-        if self.lines.len() > self.scrollback_limit {
-            let excess = self.lines.len() - self.scrollback_limit;
-            self.lines.drain(0..excess);
-        }
-        Ok(())
-    }
-
-    fn snapshot(&self) -> TerminalSnapshot {
-        let rows_count = usize::from(self.size.rows);
-        let cols = usize::from(self.size.cols);
-        let visible = self.visible_lines();
-        let mut cells = Vec::with_capacity(rows_count);
-
-        for row in 0..rows_count {
-            let text = visible
-                .get(row)
-                .map(|line| line.text.as_str())
-                .unwrap_or("");
-            let mut chars = text.chars();
-            cells.push(
-                (0..cols)
-                    .map(|col| TerminalCell {
-                        row,
-                        col,
-                        ch: chars.next().unwrap_or(' '),
-                        wide: false,
-                        wide_spacer: false,
-                        inverse: false,
-                        bold: false,
-                        underline: false,
-                        foreground: None,
-                        background: None,
-                    })
-                    .collect(),
-            );
-        }
-
-        TerminalSnapshot {
-            size: self.size,
-            cursor: TerminalCursor {
-                row: visible
-                    .len()
-                    .saturating_sub(1)
-                    .min(rows_count.saturating_sub(1)),
-                col: 0,
-                visible: false,
-            },
-            cells,
-        }
-    }
-}
-
 fn resolve_terminal_color(
     color: Color,
     palette: &alacritty_terminal::term::color::Colors,
@@ -566,19 +479,6 @@ fn indexed_terminal_color(index: u8) -> TerminalColor {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn caps_scrollback() {
-        let mut buffer = PlainTerminalBuffer::new(2);
-        buffer.write_remote_output(b"one\ntwo\nthree\n").unwrap();
-
-        let lines: Vec<_> = buffer
-            .visible_lines()
-            .iter()
-            .map(|line| line.text.as_str())
-            .collect();
-        assert_eq!(lines, ["two", "three"]);
-    }
 
     #[test]
     fn alacritty_scrollback_reveals_older_lines() {

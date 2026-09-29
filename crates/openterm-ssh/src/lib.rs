@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use openterm_core::HostProfile;
 use russh::client;
 use russh::keys::agent::client::AgentClient;
@@ -7,7 +6,6 @@ use russh::keys::{load_secret_key, PrivateKeyWithHashAlg};
 use russh::{ChannelMsg, Disconnect};
 use russh_sftp::client::{RawSftpSession, SftpSession};
 use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags};
-use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,8 +35,6 @@ pub struct HostKeyChallenge {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SshError {
-    #[error("SSH backend is not implemented yet")]
-    NotImplemented,
     #[error("connection failed: {0}")]
     Connection(String),
     #[error("authentication failed")]
@@ -275,20 +271,6 @@ pub struct LocalForwardOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DynamicForwardOptions {
-    pub bind_host: String,
-    pub bind_port: u16,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RemoteForwardOptions {
-    pub bind_host: String,
-    pub bind_port: u16,
-    pub local_host: String,
-    pub local_port: u16,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForwardEvent {
     Listening { bind_host: String, bind_port: u16 },
     ConnectionAccepted { peer: String },
@@ -325,24 +307,6 @@ pub enum PtyInput {
     Resize(PtySize),
 }
 
-#[async_trait]
-pub trait SshBackend: Send + Sync {
-    async fn connect(&self, profile: HostProfile) -> Result<Box<dyn SshSession>, SshError>;
-}
-
-#[async_trait]
-pub trait SshSession: Send + Sync {
-    async fn open_pty(&self, size: PtySize) -> Result<Box<dyn PtyChannel>, SshError>;
-    async fn exec(&mut self, command: &str) -> Result<ExecOutput, SshError>;
-    async fn close(&mut self) -> Result<(), SshError>;
-}
-
-#[async_trait]
-pub trait PtyChannel: Send + Sync {
-    async fn write(&self, bytes: &[u8]) -> Result<(), SshError>;
-    async fn resize(&self, size: PtySize) -> Result<(), SshError>;
-}
-
 #[derive(Debug, Default)]
 pub struct RusshBackend;
 
@@ -362,12 +326,10 @@ impl RusshBackend {
             nodelay: true,
             ..Default::default()
         });
-        let remote_forward_sender = Arc::new(Mutex::new(None));
         let handler = ClientHandler {
             host: profile.host.clone(),
             port: profile.port,
             policy: options.effective_host_key_policy(),
-            remote_forward_sender: remote_forward_sender.clone(),
         };
         // `options.timeout` guards the initial connect only, not the live session.
         //
@@ -406,7 +368,6 @@ impl RusshBackend {
         Ok(RusshSession {
             handle,
             jump_handle: None,
-            remote_forward_sender,
             channel_sem: Arc::new(tokio::sync::Semaphore::new(6)),
             bulk_sem: Arc::new(tokio::sync::Semaphore::new(MAX_BULK_TRANSFERS)),
         })
@@ -460,12 +421,10 @@ impl RusshBackend {
             nodelay: true,
             ..Default::default()
         });
-        let remote_forward_sender = Arc::new(Mutex::new(None));
         let handler = ClientHandler {
             host: target_profile.host.clone(),
             port: target_profile.port,
             policy: target_options.effective_host_key_policy(),
-            remote_forward_sender: remote_forward_sender.clone(),
         };
         let mut handle = tokio::time::timeout(
             target_options.timeout,
@@ -483,7 +442,6 @@ impl RusshBackend {
         Ok(RusshSession {
             handle,
             jump_handle: Some(jump.handle),
-            remote_forward_sender,
             channel_sem: Arc::new(tokio::sync::Semaphore::new(6)),
             bulk_sem: Arc::new(tokio::sync::Semaphore::new(MAX_BULK_TRANSFERS)),
         })
@@ -534,41 +492,6 @@ impl RusshBackend {
     {
         let mut session = self.connect_with_options(profile, options).await?;
         let exit_status = session.interactive_shell(shell, stdin, stdout).await;
-        let close_result = session.close().await;
-        match (exit_status, close_result) {
-            (Ok(exit_status), Ok(())) => Ok(exit_status),
-            (Err(error), _) => Err(error),
-            (Ok(_), Err(error)) => Err(error),
-        }
-    }
-
-    pub async fn event_shell_with_options(
-        &self,
-        profile: HostProfile,
-        options: ConnectOptions,
-        shell: ShellOptions,
-        mut input: mpsc::Receiver<PtyInput>,
-        events: mpsc::Sender<PtyEvent>,
-    ) -> Result<u32, SshError> {
-        let mut session = self.connect_with_options(profile, options).await?;
-        let exit_status = session.event_shell(shell, &mut input, events).await;
-        let close_result = session.close().await;
-        match (exit_status, close_result) {
-            (Ok(exit_status), Ok(())) => Ok(exit_status),
-            (Err(error), _) => Err(error),
-            (Ok(_), Err(error)) => Err(error),
-        }
-    }
-
-    pub async fn event_shell_with_route(
-        &self,
-        route: ConnectRoute,
-        shell: ShellOptions,
-        mut input: mpsc::Receiver<PtyInput>,
-        events: mpsc::Sender<PtyEvent>,
-    ) -> Result<u32, SshError> {
-        let mut session = self.connect_with_route(route).await?;
-        let exit_status = session.event_shell(shell, &mut input, events).await;
         let close_result = session.close().await;
         match (exit_status, close_result) {
             (Ok(exit_status), Ok(())) => Ok(exit_status),
@@ -780,68 +703,11 @@ impl RusshBackend {
         let session = self.connect_with_options(profile, options).await?;
         session.run_local_forward(forward, events, &mut stop).await
     }
-
-    pub async fn run_local_forward_with_route(
-        &self,
-        route: ConnectRoute,
-        forward: LocalForwardOptions,
-        events: mpsc::Sender<ForwardEvent>,
-        mut stop: mpsc::Receiver<()>,
-    ) -> Result<(), SshError> {
-        let session = self.connect_with_route(route).await?;
-        session.run_local_forward(forward, events, &mut stop).await
-    }
-
-    pub async fn run_dynamic_forward_with_route(
-        &self,
-        route: ConnectRoute,
-        forward: DynamicForwardOptions,
-        events: mpsc::Sender<ForwardEvent>,
-        mut stop: mpsc::Receiver<()>,
-    ) -> Result<(), SshError> {
-        let session = self.connect_with_route(route).await?;
-        session
-            .run_dynamic_forward(forward, events, &mut stop)
-            .await
-    }
-
-    pub async fn run_remote_forward_with_route(
-        &self,
-        route: ConnectRoute,
-        forward: RemoteForwardOptions,
-        events: mpsc::Sender<ForwardEvent>,
-        mut stop: mpsc::Receiver<()>,
-    ) -> Result<(), SshError> {
-        let session = self.connect_with_route(route).await?;
-        session.run_remote_forward(forward, events, &mut stop).await
-    }
-}
-
-#[async_trait]
-impl SshBackend for RusshBackend {
-    async fn connect(&self, profile: HostProfile) -> Result<Box<dyn SshSession>, SshError> {
-        let username = profile.username.clone().ok_or(SshError::MissingUsername)?;
-        let options = ConnectOptions {
-            username,
-            auth: AuthMethod::PrivateKey {
-                path: default_private_key_path(),
-                passphrase: None,
-            },
-            trust_unknown_host_keys: true,
-            host_key_policy: HostKeyPolicy::TrustAll,
-            timeout: Duration::from_secs(10),
-            keepalive_interval: Some(ConnectOptions::DEFAULT_KEEPALIVE_INTERVAL),
-            keepalive_max: ConnectOptions::DEFAULT_KEEPALIVE_MAX,
-        };
-        let session = self.connect_with_options(profile, options).await?;
-        Ok(Box::new(session))
-    }
 }
 
 pub struct RusshSession {
     handle: client::Handle<ClientHandler>,
     jump_handle: Option<client::Handle<ClientHandler>>,
-    remote_forward_sender: Arc<Mutex<Option<mpsc::Sender<RemoteForwardChannel>>>>,
     /// Limits concurrent SSH channels so we never exceed the server's
     /// MaxSessions cap (OpenSSH default = 10). Every method that opens a
     /// channel acquires a permit for the channel's lifetime.
@@ -877,35 +743,10 @@ impl std::ops::Deref for SftpHandle {
     }
 }
 
-pub struct RusshPtyChannel {
-    writer: russh::ChannelWriteHalf<client::Msg>,
-}
-
-struct RemoteForwardChannel {
-    channel: russh::Channel<client::Msg>,
-    peer: String,
-}
-
-#[async_trait]
-impl SshSession for RusshSession {
-    async fn open_pty(&self, size: PtySize) -> Result<Box<dyn PtyChannel>, SshError> {
-        let channel = self.handle.channel_open_session().await?;
-        channel
-            .request_pty(
-                true,
-                "xterm-256color",
-                u32::from(size.cols),
-                u32::from(size.rows),
-                0,
-                0,
-                &[],
-            )
-            .await?;
-        let (_reader, writer) = channel.split();
-        Ok(Box::new(RusshPtyChannel { writer }))
-    }
-
-    async fn exec(&mut self, command: &str) -> Result<ExecOutput, SshError> {
+impl RusshSession {
+    /// Run one command and collect its output over a dedicated exec channel.
+    /// Used by the one-shot backend helpers (connect → exec → close).
+    pub async fn exec(&mut self, command: &str) -> Result<ExecOutput, SshError> {
         let mut channel = self.handle.channel_open_session().await?;
         channel.exec(true, command).await?;
 
@@ -930,7 +771,9 @@ impl SshSession for RusshSession {
         })
     }
 
-    async fn close(&mut self) -> Result<(), SshError> {
+    /// Disconnect and close the session. Unlike [`RusshSession::disconnect`],
+    /// this takes `&mut self` and reclaims the jump-host handle.
+    pub async fn close(&mut self) -> Result<(), SshError> {
         self.handle
             .disconnect(Disconnect::ByApplication, "", "English")
             .await?;
@@ -941,10 +784,8 @@ impl SshSession for RusshSession {
         }
         Ok(())
     }
-}
 
-impl RusshSession {
-    /// Disconnect the session through a shared reference. Unlike [`SshSession::close`],
+    /// Disconnect the session through a shared reference. Unlike [`RusshSession::close`],
     /// this does not require ownership, so an actor holding `Arc<RusshSession>` can tear
     /// the connection down while shell and SFTP channels are multiplexed over it.
     pub async fn disconnect(&self) -> Result<(), SshError> {
@@ -1840,129 +1681,6 @@ impl RusshSession {
         }
     }
 
-    pub async fn run_dynamic_forward(
-        self,
-        forward: DynamicForwardOptions,
-        events: mpsc::Sender<ForwardEvent>,
-        stop: &mut mpsc::Receiver<()>,
-    ) -> Result<(), SshError> {
-        let listener = TcpListener::bind((forward.bind_host.as_str(), forward.bind_port)).await?;
-        let bind_port = listener.local_addr()?.port();
-        let _ = events
-            .send(ForwardEvent::Listening {
-                bind_host: forward.bind_host.clone(),
-                bind_port,
-            })
-            .await;
-
-        let session = Arc::new(Mutex::new(self.handle));
-        loop {
-            tokio::select! {
-                _ = stop.recv() => {
-                    let _ = session.lock().await
-                        .disconnect(Disconnect::ByApplication, "dynamic forward stopped", "English")
-                        .await;
-                    let _ = events.send(ForwardEvent::Stopped).await;
-                    return Ok(());
-                }
-                accepted = listener.accept() => {
-                    let (stream, peer_addr) = accepted?;
-                    let peer = peer_addr.to_string();
-                    let _ = events
-                        .send(ForwardEvent::ConnectionAccepted { peer: peer.clone() })
-                        .await;
-
-                    let session = session.clone();
-                    let events = events.clone();
-                    tokio::spawn(async move {
-                        let result = forward_socks5_stream(session, stream, peer.clone()).await;
-                        match result {
-                            Ok(()) => {
-                                let _ = events.send(ForwardEvent::ConnectionClosed { peer }).await;
-                            }
-                            Err(error) => {
-                                let _ = events.send(ForwardEvent::Failed(error.to_string())).await;
-                            }
-                        }
-                    });
-                }
-            }
-        }
-    }
-
-    pub async fn run_remote_forward(
-        self,
-        forward: RemoteForwardOptions,
-        events: mpsc::Sender<ForwardEvent>,
-        stop: &mut mpsc::Receiver<()>,
-    ) -> Result<(), SshError> {
-        let (remote_sender, mut remote_receiver) = mpsc::channel::<RemoteForwardChannel>(100);
-        *self.remote_forward_sender.lock().await = Some(remote_sender);
-        let allocated_port = self
-            .handle
-            .tcpip_forward(forward.bind_host.clone(), u32::from(forward.bind_port))
-            .await?;
-        let bind_port = if forward.bind_port == 0 {
-            u16::try_from(allocated_port).map_err(|_| {
-                SshError::Connection(format!(
-                    "server returned invalid remote port {allocated_port}"
-                ))
-            })?
-        } else {
-            forward.bind_port
-        };
-        let _ = events
-            .send(ForwardEvent::Listening {
-                bind_host: forward.bind_host.clone(),
-                bind_port,
-            })
-            .await;
-
-        loop {
-            tokio::select! {
-                _ = stop.recv() => {
-                    let _ = self.handle
-                        .cancel_tcpip_forward(forward.bind_host.clone(), u32::from(bind_port))
-                        .await;
-                    *self.remote_forward_sender.lock().await = None;
-                    let _ = self.handle
-                        .disconnect(Disconnect::ByApplication, "remote forward stopped", "English")
-                        .await;
-                    let _ = events.send(ForwardEvent::Stopped).await;
-                    return Ok(());
-                }
-                maybe_channel = remote_receiver.recv() => {
-                    let Some(remote) = maybe_channel else {
-                        let _ = events.send(ForwardEvent::Stopped).await;
-                        return Ok(());
-                    };
-                    let peer = remote.peer.clone();
-                    let _ = events
-                        .send(ForwardEvent::ConnectionAccepted { peer: peer.clone() })
-                        .await;
-                    let events = events.clone();
-                    let local_host = forward.local_host.clone();
-                    let local_port = forward.local_port;
-                    tokio::spawn(async move {
-                        let result = forward_remote_channel(
-                            remote.channel,
-                            local_host,
-                            local_port,
-                        )
-                        .await;
-                        match result {
-                            Ok(()) => {
-                                let _ = events.send(ForwardEvent::ConnectionClosed { peer }).await;
-                            }
-                            Err(error) => {
-                                let _ = events.send(ForwardEvent::Failed(error.to_string())).await;
-                            }
-                        }
-                    });
-                }
-            }
-        }
-    }
 }
 
 async fn forward_tcp_stream(
@@ -2014,125 +1732,6 @@ async fn forward_tcp_stream(
     Ok(())
 }
 
-async fn forward_remote_channel(
-    mut channel: russh::Channel<client::Msg>,
-    local_host: String,
-    local_port: u16,
-) -> Result<(), SshError> {
-    let mut stream = TcpStream::connect((local_host.as_str(), local_port)).await?;
-    let mut stream_closed = false;
-    let mut buffer = vec![0; 64 * 1024];
-    loop {
-        tokio::select! {
-            read = stream.read(&mut buffer), if !stream_closed => {
-                match read {
-                    Ok(0) => {
-                        stream_closed = true;
-                        channel.eof().await?;
-                    }
-                    Ok(n) => channel.data(&buffer[..n]).await?,
-                    Err(error) => return Err(SshError::Io(error)),
-                }
-            }
-            maybe_message = channel.wait() => {
-                match maybe_message {
-                    Some(ChannelMsg::Data { data }) => stream.write_all(&data).await?,
-                    Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
-                    Some(ChannelMsg::WindowAdjusted { .. }) => {}
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-async fn forward_socks5_stream(
-    handle: Arc<Mutex<client::Handle<ClientHandler>>>,
-    mut stream: TcpStream,
-    peer: String,
-) -> Result<(), SshError> {
-    let destination = read_socks5_connect_request(&mut stream).await?;
-    stream
-        .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-        .await?;
-    forward_tcp_stream(handle, stream, peer, destination.host, destination.port).await
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Socks5Destination {
-    host: String,
-    port: u16,
-}
-
-async fn read_socks5_connect_request(
-    stream: &mut TcpStream,
-) -> Result<Socks5Destination, SshError> {
-    let mut greeting = [0u8; 2];
-    stream.read_exact(&mut greeting).await?;
-    if greeting[0] != 0x05 {
-        return Err(SshError::Connection(
-            "SOCKS5 client sent an unsupported version".to_string(),
-        ));
-    }
-    let mut methods = vec![0u8; greeting[1] as usize];
-    stream.read_exact(&mut methods).await?;
-    if !methods.contains(&0x00) {
-        stream.write_all(&[0x05, 0xff]).await?;
-        return Err(SshError::Authentication);
-    }
-    stream.write_all(&[0x05, 0x00]).await?;
-
-    read_socks5_destination(stream).await
-}
-
-async fn read_socks5_destination<R>(reader: &mut R) -> Result<Socks5Destination, SshError>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut request = [0u8; 4];
-    reader.read_exact(&mut request).await?;
-    if request[0] != 0x05 || request[1] != 0x01 {
-        return Err(SshError::Connection(
-            "SOCKS5 only supports CONNECT requests".to_string(),
-        ));
-    }
-
-    let host = match request[3] {
-        0x01 => {
-            let mut bytes = [0u8; 4];
-            reader.read_exact(&mut bytes).await?;
-            Ipv4Addr::from(bytes).to_string()
-        }
-        0x03 => {
-            let mut len = [0u8; 1];
-            reader.read_exact(&mut len).await?;
-            let mut bytes = vec![0u8; len[0] as usize];
-            reader.read_exact(&mut bytes).await?;
-            String::from_utf8(bytes)
-                .map_err(|_| SshError::Connection("SOCKS5 domain is not UTF-8".to_string()))?
-        }
-        0x04 => {
-            let mut bytes = [0u8; 16];
-            reader.read_exact(&mut bytes).await?;
-            Ipv6Addr::from(bytes).to_string()
-        }
-        _ => {
-            return Err(SshError::Connection(
-                "SOCKS5 address type is unsupported".to_string(),
-            ))
-        }
-    };
-    let mut port = [0u8; 2];
-    reader.read_exact(&mut port).await?;
-
-    Ok(Socks5Destination {
-        host,
-        port: u16::from_be_bytes(port),
-    })
-}
-
 fn remote_file_kind(kind: FileType) -> RemoteFileKind {
     match kind {
         FileType::Dir => RemoteFileKind::Directory,
@@ -2177,27 +1776,11 @@ fn remove_dir_recursive<'a>(
     })
 }
 
-#[async_trait]
-impl PtyChannel for RusshPtyChannel {
-    async fn write(&self, bytes: &[u8]) -> Result<(), SshError> {
-        self.writer.data_bytes(bytes.to_vec()).await?;
-        Ok(())
-    }
-
-    async fn resize(&self, size: PtySize) -> Result<(), SshError> {
-        self.writer
-            .window_change(u32::from(size.cols), u32::from(size.rows), 0, 0)
-            .await?;
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone)]
 struct ClientHandler {
     host: String,
     port: u16,
     policy: HostKeyPolicy,
-    remote_forward_sender: Arc<Mutex<Option<mpsc::Sender<RemoteForwardChannel>>>>,
 }
 
 impl client::Handler for ClientHandler {
@@ -2253,27 +1836,6 @@ impl client::Handler for ClientHandler {
                 }
             }
         }
-    }
-
-    async fn server_channel_open_forwarded_tcpip(
-        &mut self,
-        channel: russh::Channel<client::Msg>,
-        _connected_address: &str,
-        _connected_port: u32,
-        originator_address: &str,
-        originator_port: u32,
-        _session: &mut client::Session,
-    ) -> Result<(), Self::Error> {
-        let sender = self.remote_forward_sender.lock().await.clone();
-        if let Some(sender) = sender {
-            let _ = sender
-                .send(RemoteForwardChannel {
-                    channel,
-                    peer: format!("{originator_address}:{originator_port}"),
-                })
-                .await;
-        }
-        Ok(())
     }
 }
 
@@ -2633,38 +2195,5 @@ mod tests {
         };
 
         assert_eq!(options.effective_host_key_policy(), HostKeyPolicy::TrustAll);
-    }
-
-    #[tokio::test]
-    async fn socks5_destination_parses_domain_connect_request() {
-        let mut bytes = &[
-            0x05, 0x01, 0x00, 0x03, 11, b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b'c', b'o',
-            b'm', 0x01, 0xbb,
-        ][..];
-
-        let destination = read_socks5_destination(&mut bytes).await.unwrap();
-
-        assert_eq!(
-            destination,
-            Socks5Destination {
-                host: "example.com".to_string(),
-                port: 443
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn socks5_destination_parses_ipv4_connect_request() {
-        let mut bytes = &[0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0x04, 0x38][..];
-
-        let destination = read_socks5_destination(&mut bytes).await.unwrap();
-
-        assert_eq!(
-            destination,
-            Socks5Destination {
-                host: "127.0.0.1".to_string(),
-                port: 1080
-            }
-        );
     }
 }

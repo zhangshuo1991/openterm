@@ -995,7 +995,6 @@ pub enum ViewerContent {
     Loaded(String),
     /// Streamed view: chunks received so far, total file size, and the current page offset.
     Streaming { text: String, total: u64, page_offset: u64 },
-    Error(String),
 }
 
 /// The right-column file viewer panel in the SFTP workspace.
@@ -1040,15 +1039,6 @@ impl FileViewerState {
             match_idx: 0,
             dirty: false,
             saving: false,
-        }
-    }
-
-    /// Current displayable text (if any).
-    pub fn text(&self) -> Option<&str> {
-        match &self.content {
-            ViewerContent::Loaded(s) => Some(s.as_str()),
-            ViewerContent::Streaming { text, .. } => Some(text.as_str()),
-            _ => None,
         }
     }
 

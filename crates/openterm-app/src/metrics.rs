@@ -37,8 +37,6 @@ pub struct RawSample {
     pub swap_total_kb: u64,
     pub swap_free_kb: u64,
     pub load1: f64,
-    pub load5: f64,
-    pub load15: f64,
     /// Running tasks / total tasks (threads), from /proc/loadavg field 4.
     pub tasks_running: u64,
     pub tasks_total: u64,
@@ -67,8 +65,6 @@ pub struct SessionMetrics {
     pub swap_total_kb: u64,
     pub swap_percent: f32,
     pub load1: f64,
-    pub load5: f64,
-    pub load15: f64,
     pub tasks_running: u64,
     pub tasks_total: u64,
     pub uptime_secs: f64,
@@ -312,8 +308,6 @@ fn parse_load_line(line: &str, sample: &mut RawSample) {
         return;
     }
     sample.load1 = f[0].parse().unwrap_or(0.0);
-    sample.load5 = f[1].parse().unwrap_or(0.0);
-    sample.load15 = f[2].parse().unwrap_or(0.0);
     if let Some((run, total)) = f[3].split_once('/') {
         sample.tasks_running = run.parse().unwrap_or(0);
         sample.tasks_total = total.parse().unwrap_or(0);
@@ -418,8 +412,6 @@ pub fn compute(
         swap_total_kb: curr.swap_total_kb,
         swap_used_kb: curr.swap_total_kb.saturating_sub(curr.swap_free_kb),
         load1: curr.load1,
-        load5: curr.load5,
-        load15: curr.load15,
         tasks_running: curr.tasks_running,
         tasks_total: curr.tasks_total,
         uptime_secs: curr.uptime_secs,

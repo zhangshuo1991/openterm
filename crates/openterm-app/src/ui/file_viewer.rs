@@ -75,12 +75,6 @@ fn content_area(state: &FileViewerState) -> Element<'_, Message> {
         .center_y(Length::Fill)
         .into(),
 
-        ViewerContent::Error(e) => container(
-            text(format!("Error: {e}")).size(13).color(Color::from_rgb(0.9, 0.3, 0.3)),
-        )
-        .padding(16)
-        .into(),
-
         ViewerContent::Loaded(txt) => {
             if state.mode == ViewerMode::Edit {
                 editor_view(state)

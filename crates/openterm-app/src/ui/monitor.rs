@@ -131,38 +131,6 @@ pub fn view(app: &App) -> Element<'_, Message> {
         .into()
 }
 
-// ── Summary row ───────────────────────────────────────────────────────────────
-
-fn summary_card<'a>(
-    label: &'a str,
-    pct: f32,
-    available: bool,
-    color: Color,
-    sub: String,
-) -> Element<'a, Message> {
-    let value_color = if available { metric_color(pct, color) } else { theme::text_dim() };
-    container(
-        column![
-            text(label).size(10).color(theme::text_dim()),
-            if available {
-                text(format!("{pct:.0}%")).size(22).color(value_color)
-            } else {
-                text("—").size(22).color(theme::text_dim())
-            },
-            text(sub).size(10).color(theme::text_muted()),
-        ]
-        .spacing(2),
-    )
-    .padding([8, 10])
-    .width(Length::FillPortion(1))
-    .style(move |_| container::Style {
-        background: Some(theme::surface_2().into()),
-        border: Border { radius: 8.0.into(), color: theme::border_subtle(), width: 1.0 },
-        ..Default::default()
-    })
-    .into()
-}
-
 // ── Metric blocks ─────────────────────────────────────────────────────────────
 
 /// CPU / Memory: colored dot + label + big %, progress bar, sparkline, subtitle.

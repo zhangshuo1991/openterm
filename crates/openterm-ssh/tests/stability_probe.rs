@@ -657,7 +657,7 @@ async fn transfer_connection_is_separate_and_its_death_spares_the_terminal() {
     let (in_tx, mut in_rx) = mpsc::channel::<PtyInput>(64);
     let (ev_tx, mut ev_rx) = mpsc::channel::<PtyEvent>(256);
     let shell_session = primary.clone();
-    let mut shell = tokio::spawn(async move {
+    let shell = tokio::spawn(async move {
         shell_session
             .event_shell(
                 ShellOptions {

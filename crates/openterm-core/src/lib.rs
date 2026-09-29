@@ -44,21 +44,6 @@ impl fmt::Display for SecretId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct SessionId(Uuid);
-
-impl SessionId {
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-}
-
-impl Default for SessionId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostProfile {
     pub id: HostId,
@@ -69,10 +54,6 @@ pub struct HostProfile {
     pub group: Option<String>,
     pub tags: Vec<String>,
     pub auth: AuthRef,
-    pub jump: Option<JumpConfig>,
-    pub terminal: TerminalProfile,
-    pub startup_command: Option<String>,
-    pub sftp_root: Option<String>,
     #[serde(default)]
     pub last_connected_at: Option<String>,
 }
@@ -88,10 +69,6 @@ impl HostProfile {
             group: None,
             tags: Vec::new(),
             auth: AuthRef::AgentOrDefault,
-            jump: None,
-            terminal: TerminalProfile::default(),
-            startup_command: None,
-            sftp_root: None,
             last_connected_at: None,
         }
     }
@@ -122,31 +99,6 @@ pub enum AuthRef {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct JumpConfig {
-    pub host_id: HostId,
-    pub username: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TerminalProfile {
-    pub theme: String,
-    pub font_family: String,
-    pub font_size: u16,
-    pub scrollback_lines: usize,
-}
-
-impl Default for TerminalProfile {
-    fn default() -> Self {
-        Self {
-            theme: "Dark".to_string(),
-            font_family: "system-monospace".to_string(),
-            font_size: 13,
-            scrollback_lines: 10_000,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EncryptedSecret {
     pub id: SecretId,
     pub version: u32,
@@ -162,76 +114,6 @@ pub struct KdfParams {
     pub memory_cost_kib: u32,
     pub time_cost: u32,
     pub parallelism: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TunnelProfile {
-    pub id: Uuid,
-    pub name: String,
-    pub host_id: HostId,
-    pub kind: TunnelKind,
-    pub bind_addr: String,
-    pub bind_port: u16,
-    pub target_host: Option<String>,
-    pub target_port: Option<u16>,
-    pub auto_start: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TunnelKind {
-    Local,
-    Remote,
-    DynamicSocks,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Snippet {
-    pub id: Uuid,
-    pub name: String,
-    pub command: String,
-    pub variables: Vec<String>,
-    pub scope: SnippetScope,
-    pub require_confirm: bool,
-    pub danger_level: DangerLevel,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SnippetScope {
-    Global,
-    Group(String),
-    Host(HostId),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DangerLevel {
-    Normal,
-    Caution,
-    Destructive,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SessionState {
-    Idle,
-    Connecting,
-    Authenticating,
-    HostKeyVerificationRequired,
-    Connected,
-    Reconnecting,
-    Closed,
-    Failed(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AppEvent {
-    HostCreated(HostId),
-    HostUpdated(HostId),
-    HostDeleted(HostId),
-    SessionConnecting(SessionId),
-    SessionConnected(SessionId),
-    SessionOutput(SessionId, Vec<u8>),
-    SessionClosed(SessionId),
-    VaultLocked,
-    VaultUnlocked,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -289,11 +171,7 @@ mod tests {
             "username":"root",
             "group":null,
             "tags":[],
-            "auth":"AgentOrDefault",
-            "jump":null,
-            "terminal":{"theme":"default","font_family":"monospace","font_size":14,"scrollback_lines":10000},
-            "startup_command":null,
-            "sftp_root":null
+            "auth":"AgentOrDefault"
         }"#;
 
         let host: HostProfile = serde_json::from_str(json).unwrap();
