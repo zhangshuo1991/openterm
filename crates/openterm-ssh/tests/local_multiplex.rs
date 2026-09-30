@@ -60,6 +60,7 @@ async fn shell_and_sftp_multiplex_on_local_connection() {
                         cols: 100,
                         rows: 30,
                     },
+                    command: None,
                 },
                 &mut in_rx,
                 ev_tx,

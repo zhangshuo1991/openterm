@@ -313,6 +313,7 @@ async fn main() -> anyhow::Result<()> {
                     profile,
                     options,
                     ShellOptions {
+                        command: None,
                         term: term
                             .or_else(|| std::env::var("TERM").ok())
                             .unwrap_or_else(|| "xterm-256color".to_string()),

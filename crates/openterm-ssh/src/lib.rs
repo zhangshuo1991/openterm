@@ -283,6 +283,10 @@ pub enum ForwardEvent {
 pub struct ShellOptions {
     pub term: String,
     pub size: PtySize,
+    /// Run this command on the PTY instead of the login shell. Used for
+    /// session persistence (`tmux new -A …`): the PTY semantics are
+    /// identical, so resize/input/output all work unchanged.
+    pub command: Option<String>,
 }
 
 impl Default for ShellOptions {
@@ -290,6 +294,7 @@ impl Default for ShellOptions {
         Self {
             term: "xterm-256color".to_string(),
             size: PtySize { cols: 80, rows: 24 },
+            command: None,
         }
     }
 }
@@ -939,7 +944,10 @@ impl RusshSession {
                 &[],
             )
             .await?;
-        channel.request_shell(true).await?;
+        match &options.command {
+            Some(command) => channel.exec(true, command.as_str()).await?,
+            None => channel.request_shell(true).await?,
+        }
 
         let (mut reader, writer) = channel.split();
         let mut exit_status = 0;

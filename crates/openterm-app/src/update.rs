@@ -118,6 +118,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             // ignores the route and just needs cols/rows via ConnectParams.
             if let Some(session) = app.active_session_mut() {
                 session.pending_connect = Some(crate::connection::ConnectParams {
+                    persistence: false,
                     route: openterm_ssh::ConnectRoute {
                         target: openterm_core::HostProfile::new("local", "localhost"),
                         target_options: openterm_ssh::ConnectOptions {
@@ -185,6 +186,9 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             }
         }
         Message::ToggleJump => with_config(app, |c| c.show_jump = !c.show_jump),
+        Message::TogglePersistence => {
+            with_config(app, |c| c.session_persistence = !c.session_persistence)
+        }
         Message::JumpHostChanged(v) => with_config(app, |c| c.jump_host = v),
 
         Message::Connect => connect_active(app),
@@ -2119,6 +2123,7 @@ fn dispatch_reconnect(app: &mut App, index: usize) {
         }
     };
     let params = ConnectParams {
+        persistence: session.config.session_persistence,
         route,
         cols: session.grid_cols,
         rows: session.grid_rows,
@@ -2161,6 +2166,7 @@ fn connect_active(app: &mut App) -> Task<Message> {
         }
     };
     let params = ConnectParams {
+        persistence: session.config.session_persistence,
         route,
         cols,
         rows,
@@ -2210,6 +2216,7 @@ fn accept_host_key(app: &mut App) -> Task<Message> {
         }
     };
     let params = ConnectParams {
+        persistence: session.config.session_persistence,
         route,
         cols,
         rows,
@@ -3072,12 +3079,14 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
                 }
             }
         }
-        ConnEvent::Closed { .. } => {
+        ConnEvent::Closed { clean, .. } => {
             // An unexpected drop of an ESTABLISHED session (not the user's
-            // Disconnect, not a first-connect failure — those arrive as
-            // Failed) is what auto-reconnect covers.
+            // Disconnect, not a shell the user exited on purpose — the worker
+            // saw an exit status — and not a first-connect failure, which
+            // arrives as Failed) is what auto-reconnect covers.
             let unexpected = session.phase == Phase::Connected
                 && !session.user_disconnect
+                && !clean
                 && session.kind == crate::session::SessionKind::Ssh;
             if unexpected && app.on_disconnect == crate::session::OnDisconnect::AutoReconnect {
                 session.reconnect_attempt = 1;

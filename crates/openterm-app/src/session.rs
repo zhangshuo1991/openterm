@@ -177,6 +177,9 @@ pub struct SessionConfig {
     pub tags_str: String,
     /// Whether the jump-host (bastion) section is expanded.
     pub show_jump: bool,
+    /// Attach the shell to a per-tab tmux session on the host (survives
+    /// disconnects; falls back to a plain shell without tmux).
+    pub session_persistence: bool,
     /// Bastion host to proxy through (UI-only, not wired to SSH yet).
     pub jump_host: String,
 }
@@ -196,6 +199,7 @@ impl SessionConfig {
             group: String::new(),
             tags_str: String::new(),
             show_jump: false,
+            session_persistence: false,
             jump_host: String::new(),
         }
     }

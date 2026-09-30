@@ -54,6 +54,10 @@ pub struct HostProfile {
     pub group: Option<String>,
     pub tags: Vec<String>,
     pub auth: AuthRef,
+    /// Keep the shell alive across disconnects by attaching to a per-session
+    /// tmux session on the host (falls back to a plain shell without tmux).
+    #[serde(default)]
+    pub session_persistence: bool,
     #[serde(default)]
     pub last_connected_at: Option<String>,
 }
@@ -69,6 +73,7 @@ impl HostProfile {
             group: None,
             tags: Vec::new(),
             auth: AuthRef::AgentOrDefault,
+            session_persistence: false,
             last_connected_at: None,
         }
     }

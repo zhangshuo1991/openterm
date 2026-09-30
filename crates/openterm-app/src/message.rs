@@ -65,6 +65,8 @@ pub enum Message {
     BrowseKeyFile,
     KeyFileSelected(Option<String>),
     ToggleJump,
+    /// Toggle per-tab tmux session persistence in the connect card.
+    TogglePersistence,
     JumpHostChanged(String),
     Connect,
     Disconnect,

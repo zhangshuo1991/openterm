@@ -182,6 +182,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
         auth_section,
         auth_extra,
         jump,
+        persistence_toggle(config),
         Space::new().height(Length::Fixed(4.0)),
         buttons,
     ]
@@ -255,6 +256,38 @@ fn browse_btn() -> Element<'static, Message> {
             }
         })
         .into()
+}
+
+/// Per-tab tmux session persistence toggle: keeps the shell (and everything
+/// running in it) alive across disconnects; a reconnect reattaches to it.
+/// Falls back to a plain shell when the host has no tmux, with a note in the
+/// terminal, so the toggle is always safe to leave on.
+fn persistence_toggle(config: &SessionConfig) -> Element<'_, Message> {
+    let checked = config.session_persistence;
+    let box_glyph = if checked { "☑" } else { "☐" };
+    let (box_color, label_color) = if checked {
+        (theme::accent(), theme::text_high())
+    } else {
+        (theme::text_muted(), theme::text_muted())
+    };
+    button(
+        row![
+            text(box_glyph).size(13).color(box_color),
+            text("Session persistence (tmux)")
+                .size(12)
+                .color(label_color),
+        ]
+        .spacing(7)
+        .align_y(iced::Alignment::Center),
+    )
+    .padding([4, 0])
+    .on_press(Message::TogglePersistence)
+    .style(|_, _| button::Style {
+        background: Some(Color::TRANSPARENT.into()),
+        text_color: theme::text_muted(),
+        ..Default::default()
+    })
+    .into()
 }
 
 fn jump_section(config: &SessionConfig) -> Element<'_, Message> {

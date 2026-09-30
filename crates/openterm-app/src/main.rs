@@ -836,6 +836,7 @@ impl App {
         config.user = host.username.clone().unwrap_or_default();
         config.port = host.port.to_string();
         config.group = host.group.clone().unwrap_or_default();
+        config.session_persistence = host.session_persistence;
         config.tags_str = host.tags.join(", ");
         match &host.auth {
             AuthRef::PasswordSecret(secret_id) => {
@@ -1035,6 +1036,7 @@ fn persist_host(app: &App, config: &SessionConfig) -> Result<HostId, String> {
     } else {
         Some(config.group.trim().to_string())
     };
+    profile.session_persistence = config.session_persistence;
     profile.tags = config
         .tags_str
         .split(',')

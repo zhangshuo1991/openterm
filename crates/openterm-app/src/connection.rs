@@ -34,6 +34,10 @@ pub struct ConnectParams {
     pub cols: u16,
     pub rows: u16,
     pub term: String,
+    /// Attach the shell to a per-tab tmux session on the host, so the shell
+    /// (and everything running in it) survives disconnects and reattaches on
+    /// reconnect. Falls back to a plain shell when the host has no tmux.
+    pub persistence: bool,
 }
 
 /// Direction of an SFTP transfer.
@@ -271,6 +275,10 @@ pub enum Event {
     },
     Closed {
         session_id: u64,
+        /// True when the remote command reported an exit status before the
+        /// channel closed (the shell/tmux was exited on purpose). Only an
+        /// unclean close may trigger auto-reconnect.
+        clean: bool,
     },
     Failed {
         session_id: u64,
@@ -309,7 +317,7 @@ impl Event {
             | Event::FileChunk { session_id, .. }
             | Event::FileSaved { session_id, .. }
             | Event::Exit { session_id, .. }
-            | Event::Closed { session_id }
+            | Event::Closed { session_id, .. }
             | Event::Failed { session_id, .. }
             | Event::SuggestionData { session_id, .. } => *session_id,
         }
@@ -429,6 +437,27 @@ async fn run_connection(
     // Terminal 使用主连接
     let shell_session = session_conn.terminal_session();
 
+    // Session persistence: attach to a per-tab tmux session instead of a bare
+    // login shell. `new -A` creates-or-attaches, so a reconnect lands back in
+    // the very same shell (running top/vim included). The tmux session name
+    // embeds this worker's session id, which is stable across reconnects of
+    // the same tab. Without tmux on the host, degrade to a plain shell and
+    // tell the user in the terminal itself.
+    let shell_command = if params.persistence {
+        match shell_session.exec_capture("command -v tmux").await {
+            Ok(_) => Some(format!("tmux -u new -A -s openterm-{session_id}")),
+            Err(_) => {
+                let _ = out.try_send(Event::Output {
+                    session_id,
+                    bytes: b"\r\n\x1b[2m[OpenTerm] tmux not found on this host; session persistence disabled.\x1b[0m\r\n".to_vec(),
+                });
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Spawn the shell pump on its own task so SFTP work never stalls it.
     let (pty_in_tx, mut pty_in_rx) = mpsc::channel::<PtyInput>(256);
     let (pty_ev_tx, mut pty_ev_rx) = mpsc::channel::<PtyEvent>(256);
@@ -438,6 +467,7 @@ async fn run_connection(
             cols: params.cols,
             rows: params.rows,
         },
+        command: shell_command,
     };
     let shell_task = tokio::spawn(async move {
         shell_session
@@ -456,7 +486,10 @@ async fn run_connection(
     flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut output = OutputCoalescer::new();
 
-    // Main multiplexing loop.
+    // Main multiplexing loop. `shell_exited` distinguishes a deliberate exit
+    // (the shell/tmux ran to completion: an ExitStatus message arrived) from a
+    // dropped transport — auto-reconnect must only cover the latter.
+    let mut shell_exited = false;
     let outcome = loop {
         tokio::select! {
             cmd = cmd_rx.recv() => match cmd {
@@ -633,6 +666,7 @@ async fn run_connection(
                     if !bytes.is_empty() {
                         let _ = out.try_send(Event::Output { session_id, bytes });
                     }
+                    shell_exited = true;
                     let _ = out.send(Event::Exit { session_id, code }).await;
                 }
                 Some(PtyEvent::Closed) | None => {
@@ -689,7 +723,8 @@ async fn run_connection(
     match outcome {
         ShellOutcome::WorkerDropped => ControlFlow::Break(()),
         ShellOutcome::Disconnected | ShellOutcome::Closed => {
-            let _ = out.send(Event::Closed { session_id }).await;
+            let clean = shell_exited || matches!(outcome, ShellOutcome::Disconnected);
+            let _ = out.send(Event::Closed { session_id, clean }).await;
             ControlFlow::Continue(())
         }
     }
@@ -1514,7 +1549,12 @@ pub fn local_worker(session_id: u64) -> impl iced::futures::Stream<Item = Event>
             }
             let _ = child.wait();
         });
-        let _ = out.send(Event::Closed { session_id }).await;
+        let _ = out
+            .send(Event::Closed {
+                session_id,
+                clean: true,
+            })
+            .await;
     })
 }
 
@@ -1787,6 +1827,7 @@ mod tests {
             shell_session
                 .event_shell(
                     ShellOptions {
+                        command: None,
                         term: "xterm-256color".to_string(),
                         size: PtySize {
                             cols: 100,
@@ -1973,6 +2014,7 @@ mod tests {
         sender
             .send(Command::Connect(ConnectParams {
                 route: test_route(),
+                persistence: false,
                 cols: 80,
                 rows: 24,
                 term: "xterm-256color".to_string(),
@@ -2263,6 +2305,7 @@ mod tests {
             sender
                 .send(Command::Connect(ConnectParams {
                     route: test_route(),
+                    persistence: false,
                     cols: 80,
                     rows: 24,
                     term: "xterm-256color".to_string(),
@@ -2354,6 +2397,7 @@ mod tests {
             sender
                 .send(Command::Connect(ConnectParams {
                     route: test_route(),
+                    persistence: false,
                     cols: 80,
                     rows: 24,
                     term: "xterm-256color".to_string(),
@@ -2398,6 +2442,7 @@ mod tests {
             sender
                 .send(Command::Connect(ConnectParams {
                     route: test_route(),
+                    persistence: false,
                     cols: 80,
                     rows: 24,
                     term: "xterm-256color".to_string(),
@@ -2419,6 +2464,192 @@ mod tests {
             assert!(reconnected, "worker must reconnect after Closed");
 
             let _ = sender.send(Command::Disconnect).await;
+        }
+    }
+    mod tmux_persistence_tests {
+        use super::*;
+        use iced::futures::StreamExt;
+
+        async fn wait_for_connected(
+            stream: &mut (impl StreamExt<Item = Event> + Unpin),
+            what: &str,
+        ) {
+            // WAN connects (pool dial + tmux probe) can exceed 5 s; keep waiting
+            // on per-poll timeouts until the overall deadline.
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(25);
+            loop {
+                assert!(tokio::time::Instant::now() < deadline, "{what} timed out");
+                match tokio::time::timeout(std::time::Duration::from_secs(5), stream.next()).await {
+                    Ok(Some(Event::Connected { .. })) => return,
+                    Ok(Some(Event::Failed { error, .. })) => panic!("{what} failed: {error}"),
+                    Ok(Some(_)) => continue,
+                    Ok(None) => panic!("{what} ended without Connected"),
+                    Err(_) => continue,
+                }
+            }
+        }
+
+        /// Send `line` and wait until its echo marker appears in the output —
+        /// the only reliable "the interactive shell consumed my input" signal
+        /// (fixed sleeps race the WAN connect + tmux startup).
+        async fn run_until_echoed(
+            sender: &mpsc::Sender<Command>,
+            stream: &mut (impl StreamExt<Item = Event> + Unpin),
+            line: &str,
+            marker: &str,
+        ) {
+            sender
+                .send(Command::Write(format!("{line}\r\n").into_bytes()))
+                .await
+                .expect("send write");
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(25);
+            let mut seen = String::new();
+            loop {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "marker {marker:?} never echoed; output so far: {seen:?}"
+                );
+                match tokio::time::timeout(std::time::Duration::from_secs(5), stream.next()).await {
+                    Ok(Some(Event::Output { bytes, .. })) => {
+                        seen.push_str(&String::from_utf8_lossy(&bytes));
+                        if seen.contains(marker) {
+                            return;
+                        }
+                    }
+                    Ok(Some(_)) => continue,
+                    Ok(None) => panic!("stream ended waiting for {marker:?}"),
+                    Err(_) => continue,
+                }
+            }
+        }
+
+        async fn connect_persistent(sender: &mpsc::Sender<Command>) {
+            sender
+                .send(Command::Connect(ConnectParams {
+                    route: test_route(),
+                    cols: 80,
+                    rows: 24,
+                    term: "xterm-256color".to_string(),
+                    persistence: true,
+                }))
+                .await
+                .expect("send Connect");
+        }
+
+        async fn wait_for_closed(stream: &mut (impl StreamExt<Item = Event> + Unpin)) {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "disconnect timed out"
+                );
+                match tokio::time::timeout(std::time::Duration::from_secs(5), stream.next()).await {
+                    Ok(Some(Event::Closed { .. })) => return,
+                    Ok(Some(_)) => continue,
+                    Ok(None) => panic!("stream ended without Closed"),
+                    Err(_) => continue,
+                }
+            }
+        }
+
+        /// The full session-persistence story against the real server:
+        ///
+        /// 1. connect with persistence on → the shell runs inside a per-tab tmux
+        ///    session (`openterm-<id>`),
+        /// 2. plant a marker file and note the shell PID,
+        /// 3. drop the connection (tmux keeps the shell alive server-side),
+        /// 4. reconnect the SAME tab (same worker/session id),
+        /// 5. assert we are attached to the same tmux session and the original
+        ///    shell process is still alive.
+        ///
+        /// Skips loudly without the test key. Falls back cleanly if the host has
+        /// no tmux (checked separately).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn tmux_session_survives_disconnect_and_reattaches() {
+            if live_test_key().is_none() {
+                return;
+            }
+
+            const SID: u64 = 33;
+            let marker = format!("/tmp/openterm-persist-{SID}.pid");
+
+            let mut stream = Box::pin(worker(SID));
+            let sender = match stream.next().await {
+                Some(Event::Ready { sender, .. }) => sender,
+                _ => panic!("expected Ready"),
+            };
+
+            // --- connect #1: plant the marker --------------------------------
+            connect_persistent(&sender).await;
+            wait_for_connected(&mut stream, "connect #1").await;
+
+            // Plant the marker once the interactive shell provably echoes —
+            // this also proves we are INSIDE a working shell attached to tmux.
+            // The marker uses $((SID)) so it only appears in EXECUTED output —
+            // the PTY echo of the typed line contains the unevaluated form.
+            run_until_echoed(
+                &sender,
+                &mut stream,
+                &format!("echo SHELL_UP_$(({SID}))"),
+                &format!("SHELL_UP_{SID}"),
+            )
+            .await;
+            run_until_echoed(
+                &sender,
+                &mut stream,
+                &format!("echo $PPID > {marker}; echo PLANTED_$(({SID}))"),
+                &format!("PLANTED_{SID}"),
+            )
+            .await;
+
+            // Drop the connection. The worker's teardown closes the SSH transport;
+            // tmux keeps the shell alive on the server.
+            sender.send(Command::Disconnect).await.unwrap();
+            wait_for_closed(&mut stream).await;
+            // Give the server a moment to settle the tmux session.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+            // --- connect #2: same tab, must reattach ---------------------------
+            connect_persistent(&sender).await;
+            wait_for_connected(&mut stream, "connect #2").await;
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+
+            // Verify via an out-of-band exec on the SAME connection: the marker
+            // PID is still alive and the tmux session exists.
+            let probe = async {
+                let route = test_route();
+                let session = RusshBackend.connect_with_route(route).await?;
+                let out = session
+                .exec_capture(&format!(
+                    "tmux has-session -t openterm-{SID} && kill -0 $(cat {marker}) && echo ALIVE_SAME_SHELL"
+                ))
+                .await?;
+                let _ = session.disconnect().await;
+                Ok::<_, openterm_ssh::SshError>(out)
+            };
+            let result = probe.await.expect("probe connect");
+            let text = String::from_utf8_lossy(&result.stdout);
+            assert!(
+                text.contains("ALIVE_SAME_SHELL"),
+                "tmux session missing or original shell died: {text:?}"
+            );
+
+            // Cleanup, out-of-band so it cannot race the disconnect: kill
+            // the tmux session and remove marker files from a fresh
+            // connection.
+            {
+                let session = RusshBackend.connect_with_route(test_route()).await.unwrap();
+                let _ = session
+                    .exec_capture(&format!(
+                        "tmux kill-session -t openterm-{SID} 2>/dev/null; rm -f {marker}"
+                    ))
+                    .await;
+                let _ = session.disconnect().await;
+            }
+            let _ = sender.send(Command::Disconnect).await;
+            eprintln!(
+                "OK: tmux session survived the disconnect; reconnect reattached to the same shell"
+            );
         }
     }
 }
