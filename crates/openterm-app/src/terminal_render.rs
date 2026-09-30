@@ -482,9 +482,88 @@ fn url_at(snapshot: &TerminalSnapshot, col: usize, row: usize) -> Option<String>
 /// - a cheap **overlay layer** (selection tint, copy flash, ghost suggestion)
 ///   is rebuilt every frame, since it changes during drags/animations.
 #[derive(Debug)]
+/// Search-match highlights: cells covered by any match, plus the cells of the
+/// "current" match (emphasized differently). Computed once per view when the
+/// search bar is open; the query itself is folded into the row render key, so
+/// a query change re-tessellates all rows.
+#[derive(Default)]
+pub struct SearchMatches {
+    pub cells: std::collections::HashSet<(usize, usize)>,
+    pub current: std::collections::HashSet<(usize, usize)>,
+}
+
+pub fn compute_search_matches(
+    snapshot: &TerminalSnapshot,
+    query: &str,
+    current_idx: usize,
+) -> SearchMatches {
+    let mut out = SearchMatches::default();
+    if query.is_empty() {
+        return out;
+    }
+    let mut matches: Vec<Vec<(usize, usize)>> = Vec::new();
+    for (row_index, row) in snapshot.cells.iter().enumerate() {
+        // Build the row's lowercased text and a parallel map back to columns.
+        let mut text = String::new();
+        let mut cols: Vec<usize> = Vec::new();
+        for cell in row {
+            if cell.wide_spacer {
+                continue;
+            }
+            for lc in cell.ch.to_lowercase() {
+                text.push(lc);
+                cols.push(cell.col);
+            }
+        }
+        let qlen = query.chars().count();
+        let mut from = 0;
+        while let Some(byte_pos) = text[from..].find(query) {
+            let abs = from + byte_pos;
+            let char_start = text[..abs].chars().count();
+            let cells: Vec<(usize, usize)> = cols
+                .iter()
+                .skip(char_start)
+                .take(qlen)
+                .map(|&c| (row_index, c))
+                .collect();
+            if !cells.is_empty() {
+                matches.push(cells);
+            }
+            from = abs + query.len();
+        }
+    }
+    if !matches.is_empty() {
+        let cur = current_idx % matches.len();
+        for (i, cells) in matches.iter().enumerate() {
+            for &c in cells {
+                out.cells.insert(c);
+                if i == cur {
+                    out.current.insert(c);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// ASCII covers the overwhelming majority of terminal output (commands, logs,
+/// code) and needs no font fallback or ligature shaping — the Basic pipeline
+/// tessellates it much cheaper, at identical visual output for monospace
+/// single characters.
+fn shaping_for(ch: char) -> iced::widget::text::Shaping {
+    if ch.is_ascii() {
+        iced::widget::text::Shaping::Basic
+    } else {
+        iced::widget::text::Shaping::Advanced
+    }
+}
+
 pub struct TerminalCanvas<'a> {
-    /// Persistent geometry cache owned by the session.
-    pub cache: &'a canvas::Cache,
+    /// One geometry cache per grid row, owned by the session. `sync_rows` on
+    /// the render cache clears only the rows whose cells changed, so an
+    /// output burst re-tessellates just the touched rows instead of the whole
+    /// grid.
+    pub rows: &'a std::cell::RefCell<Vec<canvas::Cache>>,
     pub snapshot: std::sync::Arc<TerminalSnapshot>,
     pub font_size: u16,
     /// Committed selection from the session (for cross-frame highlight when not dragging).
@@ -492,11 +571,12 @@ pub struct TerminalCanvas<'a> {
     /// Mouse-reporting protocol the remote app requested. When `report` is set,
     /// clicks/drags/wheel are forwarded to the PTY instead of selecting locally.
     pub mouse: MouseProtocol,
-    /// Lowercased search query; empty disables highlighting.
-    pub search_query: String,
-    /// Index of the "current" match to emphasize (wraps modulo match count).
-    pub search_current: usize,
-    /// Shape used to paint the cursor cell.
+    /// Pre-computed search highlights (empty sets when the search bar is
+    /// closed). The query is folded into the row render key, so a query
+    /// change dirties every row.
+    pub search_matches: SearchMatches,
+    /// Shape used to paint the cursor cell (drawn in the per-frame overlay,
+    /// never in the cached row geometry).
     pub cursor_shape: crate::theme::CursorShape,
     /// Copy-confirmation flash intensity (0 = none, 1 = just copied).
     pub copy_flash: f32,
@@ -765,14 +845,27 @@ impl canvas::Program<Message> for TerminalCanvas<'_> {
     ) -> Vec<Geometry> {
         let m = metrics(self.font_size);
 
-        // Grid layer: geometry is reused verbatim from the cache unless the
-        // session cleared it (content/font/theme/search changed).
-        let grid = self.cache.draw(renderer, bounds.size(), |frame| {
-            self.draw_grid(frame, m);
-        });
+        // Row layers: each row's geometry is cached separately and only
+        // re-tessellates when that row's cells changed (the session's
+        // `sync_rows` clears exactly those caches).
+        let row_caches = self.rows.borrow();
+        let mut layers = Vec::with_capacity(row_caches.len() + 1);
+        for (row_index, cache) in row_caches.iter().enumerate() {
+            let cells = self.snapshot.cells.get(row_index);
+            layers.push(cache.draw(renderer, bounds.size(), |frame| {
+                if let Some(cells) = cells {
+                    self.draw_row(frame, row_index, cells, m);
+                }
+            }));
+        }
 
-        // Overlay layer: selection tint / copy flash / ghost suggestion —
-        // cheap to rebuild and changes during drags and animations.
+        // Overlay layer: cursor + selection tint / copy flash / ghost
+        // suggestion — rebuilt every frame by design (all cheap), so cursor
+        // moves, selection drags and animations never invalidate the cached
+        // row geometry above.
+        let mut overlay = Frame::new(renderer, bounds.size());
+        self.draw_cursor_overlay(&mut overlay, m);
+
         // Active in-progress drag takes priority; otherwise use the committed selection.
         let sel: Option<((usize, usize), (usize, usize))> = if state.start.is_some()
             && state.end.is_some()
@@ -783,11 +876,6 @@ impl canvas::Program<Message> for TerminalCanvas<'_> {
             self.selection.map(|(c1, r1, c2, r2)| ((c1, r1), (c2, r2)))
         };
         let want_ghost = !self.inline_suggestion.is_empty() && self.snapshot.cursor.visible;
-        if sel.is_none() && !want_ghost {
-            return vec![grid];
-        }
-
-        let mut overlay = Frame::new(renderer, bounds.size());
 
         if let Some((s, e)) = sel {
             // Translucent accent tint over the selected cells; the glyphs keep
@@ -848,7 +936,8 @@ impl canvas::Program<Message> for TerminalCanvas<'_> {
             }
         }
 
-        vec![grid, overlay.into_geometry()]
+        layers.push(overlay.into_geometry());
+        layers
     }
 
     fn mouse_interaction(
@@ -870,153 +959,135 @@ impl TerminalCanvas<'_> {
     /// glyphs, underlines — into `frame`. Selection is deliberately absent:
     /// it is drawn in the per-frame overlay so drag updates don't invalidate
     /// this (cached) geometry.
-    fn draw_grid(&self, frame: &mut Frame, m: Metrics) {
-        // Compute search-match highlights: a set of matched cells, plus the
-        // cells belonging to the "current" match (emphasized differently).
-        // This only runs on a cache rebuild, never on an idle redraw.
-        let mut match_cells: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
-        let mut current_cells: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
-        if !self.search_query.is_empty() {
-            let mut matches: Vec<Vec<(usize, usize)>> = Vec::new();
-            for (row_index, row) in self.snapshot.cells.iter().enumerate() {
-                // Build the row's lowercased text and a parallel map back to columns.
-                let mut text = String::new();
-                let mut cols: Vec<usize> = Vec::new();
-                for cell in row {
-                    if cell.wide_spacer { continue; }
-                    for lc in cell.ch.to_lowercase() {
-                        text.push(lc);
-                        cols.push(cell.col);
-                    }
-                }
-                let qlen = self.search_query.chars().count();
-                let mut from = 0;
-                while let Some(byte_pos) = text[from..].find(&self.search_query) {
-                    let abs = from + byte_pos;
-                    let char_start = text[..abs].chars().count();
-                    let cells: Vec<(usize, usize)> = cols
-                        .iter()
-                        .skip(char_start)
-                        .take(qlen)
-                        .map(|&c| (row_index, c))
-                        .collect();
-                    if !cells.is_empty() {
-                        matches.push(cells);
-                    }
-                    from = abs + self.search_query.len();
-                }
+    /// Paint one grid row — backgrounds, search highlights, glyphs,
+    /// underlines — into `frame`. The cursor and selection are deliberately
+    /// absent: they live in the per-frame overlay so moving them never
+    /// invalidates this (cached) geometry.
+    fn draw_row(&self, frame: &mut Frame, row_index: usize, cells: &[TerminalCell], m: Metrics) {
+        for cell in cells {
+            if cell.wide_spacer {
+                continue;
             }
-            if !matches.is_empty() {
-                let cur = self.search_current % matches.len();
-                for (i, cells) in matches.iter().enumerate() {
-                    for &c in cells {
-                        match_cells.insert(c);
-                        if i == cur {
-                            current_cells.insert(c);
-                        }
-                    }
-                }
+            let x = cell.col as f32 * m.cell_width;
+            let y = row_index as f32 * m.line_height;
+            let inverse = cell.inverse;
+            let is_match = self.search_matches.cells.contains(&(row_index, cell.col));
+            let is_current = self.search_matches.current.contains(&(row_index, cell.col));
+
+            if is_match {
+                // Search highlight: orange for the current match, yellow otherwise.
+                let hl = if is_current {
+                    Color::from_rgb(0.95, 0.55, 0.1)
+                } else {
+                    Color::from_rgb(0.85, 0.78, 0.2)
+                };
+                frame.fill_rectangle(
+                    Point::new(x, y),
+                    Size::new(cell_draw_width(cell, m), m.line_height),
+                    hl,
+                );
+            } else if inverse || cell.background.is_some() {
+                let bg = if inverse {
+                    theme::accent_strong()
+                } else {
+                    cell.background.map(color_to_iced).unwrap_or(Color::TRANSPARENT)
+                };
+                frame.fill_rectangle(
+                    Point::new(x, y),
+                    Size::new(cell_draw_width(cell, m), m.line_height),
+                    bg,
+                );
+            }
+
+            if cell.ch == ' ' {
+                continue;
+            }
+
+            let fg = if is_match {
+                Color::from_rgb(0.05, 0.05, 0.05)
+            } else if inverse {
+                theme::surface_0()
+            } else {
+                cell.foreground.map(color_to_iced).unwrap_or(theme::text_high())
+            };
+
+            // Box-drawing / block chars: crisp full-cell vectors, not font
+            // glyphs (see `box_glyph` — fixes broken/fuzzy TUI table lines).
+            if draw_box_glyph(frame, cell.ch, x, y, cell_draw_width(cell, m), m.line_height, fg) {
+                continue;
+            }
+
+            frame.fill_text(Text {
+                content: cell.ch.to_string(),
+                position: Point::new(x, y),
+                max_width: cell_draw_width(cell, m),
+                color: fg,
+                size: f32::from(self.font_size).into(),
+                line_height: LineHeight::Absolute(m.line_height.into()),
+                font: font_for(cell.ch, cell.bold),
+                align_x: alignment::Horizontal::Left.into(),
+                align_y: alignment::Vertical::Top,
+                shaping: shaping_for(cell.ch),
+            });
+
+            if cell.underline {
+                let underline = Path::rectangle(
+                    Point::new(x, y + m.line_height - 1.5),
+                    Size::new(cell_draw_width(cell, m), 1.0),
+                );
+                frame.fill(&underline, fg);
             }
         }
+    }
 
-        for (row_index, row) in self.snapshot.cells.iter().enumerate() {
-            for cell in row {
-                if cell.wide_spacer { continue; }
-                let x = cell.col as f32 * m.cell_width;
-                let y = row_index as f32 * m.line_height;
-                let cursor_here = self.snapshot.cursor.visible
-                    && self.snapshot.cursor.row == row_index
-                    && self.snapshot.cursor.col == cell.col;
-                // Only a Block cursor inverts the whole cell; Underline/Beam
-                // leave the glyph untouched and add a thin bar instead.
-                let block_cursor =
-                    cursor_here && self.cursor_shape == crate::theme::CursorShape::Block;
-                let inverse = cell.inverse || block_cursor;
-                let is_match = match_cells.contains(&(row_index, cell.col));
-                let is_current = current_cells.contains(&(row_index, cell.col));
+    /// Paint the cursor into the per-frame overlay. Drawing it here (instead
+    /// of in the cached row geometry) is what lets the cursor move or change
+    /// shape without re-tessellating a single row.
+    fn draw_cursor_overlay(&self, frame: &mut Frame, m: Metrics) {
+        let cursor = self.snapshot.cursor;
+        if !cursor.visible {
+            return;
+        }
+        let Some(row) = self.snapshot.cells.get(cursor.row) else {
+            return;
+        };
+        let Some(cell) = row.get(cursor.col) else {
+            return;
+        };
+        let x = cursor.col as f32 * m.cell_width;
+        let y = cursor.row as f32 * m.line_height;
+        let w = cell_draw_width(cell, m);
 
-                if is_match {
-                    // Search highlight: orange for the current match, yellow otherwise.
-                    let hl = if is_current {
-                        Color::from_rgb(0.95, 0.55, 0.1)
-                    } else {
-                        Color::from_rgb(0.85, 0.78, 0.2)
-                    };
-                    frame.fill_rectangle(
-                        Point::new(x, y),
-                        Size::new(cell_draw_width(cell, m), m.line_height),
-                        hl,
-                    );
-                } else if inverse || cell.background.is_some() {
-                    let bg = if inverse {
-                        theme::accent_strong()
-                    } else {
-                        cell.background.map(color_to_iced).unwrap_or(Color::TRANSPARENT)
-                    };
-                    frame.fill_rectangle(
-                        Point::new(x, y),
-                        Size::new(cell_draw_width(cell, m), m.line_height),
-                        bg,
-                    );
+        match self.cursor_shape {
+            // Block inverts the cell: accent background + surface glyph on top.
+            crate::theme::CursorShape::Block => {
+                frame.fill_rectangle(
+                    Point::new(x, y),
+                    Size::new(w, m.line_height),
+                    theme::accent_strong(),
+                );
+                if cell.ch != ' ' {
+                    frame.fill_text(Text {
+                        content: cell.ch.to_string(),
+                        position: Point::new(x, y),
+                        max_width: w,
+                        color: theme::surface_0(),
+                        size: f32::from(self.font_size).into(),
+                        line_height: LineHeight::Absolute(m.line_height.into()),
+                        font: font_for(cell.ch, cell.bold),
+                        align_x: alignment::Horizontal::Left.into(),
+                        align_y: alignment::Vertical::Top,
+                        shaping: shaping_for(cell.ch),
+                    });
                 }
-
-                // Underline / Beam cursor bars (drawn whether or not the cell is
-                // blank, so the cursor is visible on an empty line).
-                if cursor_here && !block_cursor {
-                    draw_cursor_bar(frame, self.cursor_shape, x, y, cell_draw_width(cell, m), m.line_height);
-                }
-
-                if cell.ch == ' ' {
-                    // A space under a Block cursor still needs the inverse fill.
-                    if block_cursor {
-                        frame.fill_rectangle(
-                            Point::new(x, y),
-                            Size::new(cell_draw_width(cell, m), m.line_height),
-                            theme::accent_strong(),
-                        );
-                    }
-                    continue;
-                }
-
-                let fg = if is_match {
-                    Color::from_rgb(0.05, 0.05, 0.05)
-                } else if inverse {
-                    theme::surface_0()
-                } else {
-                    cell.foreground.map(color_to_iced).unwrap_or(theme::text_high())
-                };
-
-                // Box-drawing / block chars: crisp full-cell vectors, not font
-                // glyphs (see `box_glyph` — fixes broken/fuzzy TUI table lines).
-                if draw_box_glyph(frame, cell.ch, x, y, cell_draw_width(cell, m), m.line_height, fg) {
-                    continue;
-                }
-
-                frame.fill_text(Text {
-                    content: cell.ch.to_string(),
-                    position: Point::new(x, y),
-                    max_width: cell_draw_width(cell, m),
-                    color: fg,
-                    size: f32::from(self.font_size).into(),
-                    line_height: LineHeight::Absolute(m.line_height.into()),
-                    font: font_for(cell.ch, cell.bold),
-                    align_x: alignment::Horizontal::Left.into(),
-                    align_y: alignment::Vertical::Top,
-                    shaping: iced::widget::text::Shaping::Advanced,
-                });
-
-                if cell.underline {
-                    let underline = Path::rectangle(
-                        Point::new(x, y + m.line_height - 1.5),
-                        Size::new(cell_draw_width(cell, m), 1.0),
-                    );
-                    frame.fill(&underline, fg);
-                }
+            }
+            // Underline / Beam leave the glyph untouched and add a thin bar.
+            _ => {
+                draw_cursor_bar(frame, self.cursor_shape, x, y, w, m.line_height);
             }
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1065,5 +1136,59 @@ mod tests {
         let (_, rows) = grid_for_viewport(800.0, height, theme::DEFAULT_FONT_SIZE);
         let drawn = f32::from(rows) * metrics(theme::DEFAULT_FONT_SIZE).line_height;
         assert!(drawn <= height, "drawn {drawn} > viewport {height}");
+    }
+}
+
+#[cfg(test)]
+mod search_match_tests {
+    use super::*;
+    use openterm_terminal::{TerminalCell, TerminalCursor, TerminalSize, TerminalSnapshot};
+
+    fn row(row_index: usize, text: &str) -> Vec<TerminalCell> {
+        text.chars()
+            .enumerate()
+            .map(|(col, ch)| TerminalCell {
+                row: row_index,
+                col,
+                ch,
+                wide: false,
+                wide_spacer: false,
+                inverse: false,
+                bold: false,
+                underline: false,
+                foreground: None,
+                background: None,
+            })
+            .collect()
+    }
+
+    fn snap(rows: Vec<Vec<TerminalCell>>) -> TerminalSnapshot {
+        TerminalSnapshot {
+            size: TerminalSize { cols: 20, rows: rows.len() as u16 },
+            cursor: TerminalCursor { row: 0, col: 0, visible: true },
+            cells: rows,
+        }
+    }
+
+    #[test]
+    fn search_matches_cover_cells_and_honor_case_folding() {
+        let snap = snap(vec![row(0, "Hello hello"), row(1, "world")]);
+        let m = compute_search_matches(&snap, "hello", 0);
+        // Both occurrences, case-insensitively ("Hello hello": cols 0 and 6).
+        assert!(m.cells.contains(&(0, 0)) && m.cells.contains(&(0, 6)));
+        assert_eq!(m.cells.len(), 10, "2 matches × 5 cells");
+        // First occurrence is the current match with idx 0.
+        assert!(m.current.contains(&(0, 0)));
+        assert!(!m.current.contains(&(0, 6)));
+
+        let m1 = compute_search_matches(&snap, "hello", 1);
+        assert!(m1.current.contains(&(0, 6)), "idx 1 selects the second match");
+    }
+
+    #[test]
+    fn ascii_cells_take_the_basic_shaping_path() {
+        assert_eq!(shaping_for('a'), iced::widget::text::Shaping::Basic);
+        assert_eq!(shaping_for('~'), iced::widget::text::Shaping::Basic);
+        assert_eq!(shaping_for('中'), iced::widget::text::Shaping::Advanced);
     }
 }

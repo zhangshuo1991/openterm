@@ -32,19 +32,20 @@ pub fn view(app: &App) -> Element<'_, Message> {
     // unrelated message (tick, mouse move, toast) doesn't re-materialize it.
     let snapshot = session.render.snapshot(&session.terminal);
 
-    // Render key: everything the *cached* grid geometry depends on. When it
-    // changes, the canvas cache is cleared and the grid re-tessellates once;
-    // otherwise every redraw reuses the stored geometry. Selection, copy
-    // flash, and the ghost suggestion live in a per-frame overlay and are
-    // intentionally absent here.
+    // Row render key: everything the *cached* row geometry depends on. When it
+    // changes, every row's cache is cleared and re-tessellated once; otherwise
+    // only rows whose cells changed are. The cursor (and selection, copy flash,
+    // ghost suggestion) live in the per-frame overlay and are intentionally
+    // absent here.
     let key = {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         session.terminal.generation().hash(&mut h);
         app.font_size.hash(&mut h);
         search_query.hash(&mut h);
+        // The "current" search match is baked into row geometry (orange vs
+        // yellow), so stepping matches must re-tessellate the touched rows.
         app.terminal_search_idx.hash(&mut h);
-        app.cursor_shape().to_str().hash(&mut h);
         theme::current_scheme().to_str().hash(&mut h);
         let accent = theme::accent();
         (accent.r.to_bits(), accent.g.to_bits(), accent.b.to_bits()).hash(&mut h);
@@ -52,16 +53,27 @@ pub fn view(app: &App) -> Element<'_, Message> {
         (m.cell_width.to_bits(), m.line_height.to_bits()).hash(&mut h);
         h.finish()
     };
-    session.render.sync_key(key);
+    session.render.sync_rows(&snapshot, session.terminal.generation(), key);
+
+    // Search highlights are computed once per view (only when the bar is
+    // open); the row caches bake them into geometry keyed on the query.
+    let search_matches = if search_query.is_empty() {
+        Default::default()
+    } else {
+        crate::terminal_render::compute_search_matches(
+            &snapshot,
+            &search_query,
+            app.terminal_search_idx,
+        )
+    };
 
     let program = TerminalCanvas {
-        cache: &session.render.canvas,
+        rows: &session.render.rows,
         snapshot,
         font_size: app.font_size,
         selection: session.selection,
         mouse: session.terminal.mouse_protocol(),
-        search_query,
-        search_current: app.terminal_search_idx,
+        search_matches,
         cursor_shape: app.cursor_shape(),
         copy_flash: app.copy_flash(),
         inline_suggestion: session.inline_suggestion.clone().unwrap_or_default(),

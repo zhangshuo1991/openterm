@@ -20,14 +20,20 @@ use crate::connection::{Command, ConnectParams};
 /// - `snapshot` memoizes the materialized cell grid, keyed by the buffer's
 ///   generation counter, so unrelated messages (ticks, mouse moves, toasts)
 ///   don't rebuild a `Vec<Vec<TerminalCell>>` per `view()`.
-/// - `canvas` stores the grid's tessellated geometry; it is cleared only when
-///   the render key (generation + font/theme/search state) changes, so a
-///   redraw of an unchanged grid re-uses the GPU geometry wholesale.
+/// - `rows` stores one tessellated-geometry cache *per grid row*. An output
+///   burst only re-tessellates the rows whose cells actually changed
+///   (see [`TerminalRenderCache::sync_rows`]); the cursor is drawn in the
+///   per-frame overlay, so moving it never touches row geometry.
 #[derive(Default)]
 pub struct TerminalRenderCache {
     snapshot: std::cell::RefCell<Option<(u64, std::sync::Arc<TerminalSnapshot>)>>,
-    pub canvas: iced::widget::canvas::Cache,
-    key: std::cell::Cell<u64>,
+    /// One geometry cache per grid row (indexed like `snapshot.cells`).
+    pub rows: std::cell::RefCell<Vec<iced::widget::canvas::Cache>>,
+    /// Rows as of the last sync, for the cheap row-by-row diff.
+    prev: std::cell::RefCell<Option<std::sync::Arc<TerminalSnapshot>>>,
+    /// Snapshot generation and global render key already synced into `rows`.
+    synced_generation: std::cell::Cell<u64>,
+    synced_key: std::cell::Cell<u64>,
 }
 
 impl TerminalRenderCache {
@@ -46,21 +52,60 @@ impl TerminalRenderCache {
         snap
     }
 
-    /// Install the render key for the cached grid geometry; clears the canvas
-    /// cache when it differs from the previous frame's key.
-    pub fn sync_key(&self, key: u64) {
-        if self.key.get() != key {
-            self.canvas.clear();
-            self.key.set(key);
+    /// Clear the row caches whose content changed since the last sync (or all
+    /// of them when the global render key — font, theme, search — moved), so
+    /// the next draw re-tessellates only what actually changed. Returns the
+    /// number of rows marked dirty.
+    pub fn sync_rows(
+        &self,
+        current: &std::sync::Arc<TerminalSnapshot>,
+        generation: u64,
+        key: u64,
+    ) -> usize {
+        let key_moved = self.synced_key.replace(key) != key;
+        {
+            let mut rows = self.rows.borrow_mut();
+            if rows.len() != current.cells.len() {
+                rows.clear();
+                for _ in 0..current.cells.len() {
+                    rows.push(iced::widget::canvas::Cache::new());
+                }
+                self.prev.replace(None);
+                // Force a full diff below even when generation/key line up.
+                self.synced_generation.set(u64::MAX);
+            }
         }
+        if self.synced_generation.get() == generation && !key_moved {
+            return 0;
+        }
+        let prev = self.prev.replace(None);
+        let mut dirty = 0;
+        {
+            let rows = self.rows.borrow();
+            for (row_index, cache) in rows.iter().enumerate() {
+                let changed = key_moved
+                    || prev
+                        .as_ref()
+                        .map_or(true, |p| p.cells.get(row_index) != current.cells.get(row_index));
+                if changed {
+                    cache.clear();
+                    dirty += 1;
+                }
+            }
+        }
+        self.prev.replace(Some(current.clone()));
+        self.synced_generation.set(generation);
+        dirty
     }
 
     /// Drop everything (used when the terminal buffer itself is replaced and
     /// its generation counter restarts).
     pub fn reset(&self) {
         *self.snapshot.borrow_mut() = None;
-        self.canvas.clear();
-        self.key.set(0);
+        self.rows.borrow_mut().clear();
+        self.prev.replace(None);
+        self.synced_generation.set(0);
+        self.synced_key.set(0);
     }
 }
 
@@ -2310,5 +2355,74 @@ Options:
                 assert_eq!(xy, yx.reverse(), "asymmetry between {x:?} and {y:?}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod render_cache_tests {
+    use super::*;
+    use openterm_terminal::{TerminalCell, TerminalCursor, TerminalSize, TerminalSnapshot};
+
+    fn row(row_index: usize, text: &str) -> Vec<TerminalCell> {
+        text.chars()
+            .enumerate()
+            .map(|(col, ch)| TerminalCell {
+                row: row_index,
+                col,
+                ch,
+                wide: false,
+                wide_spacer: false,
+                inverse: false,
+                bold: false,
+                underline: false,
+                foreground: None,
+                background: None,
+            })
+            .collect()
+    }
+
+    fn snap(rows: Vec<Vec<TerminalCell>>) -> std::sync::Arc<TerminalSnapshot> {
+        std::sync::Arc::new(TerminalSnapshot {
+            size: TerminalSize {
+                cols: 20,
+                rows: rows.len() as u16,
+            },
+            cursor: TerminalCursor {
+                row: 0,
+                col: 0,
+                visible: true,
+            },
+            cells: rows,
+        })
+    }
+
+    /// The core of row-level damage tracking: a sync reports every row dirty
+    /// the first time, nothing when nothing changed, and only the row whose
+    /// cells changed when one row is edited.
+    #[test]
+    fn sync_rows_marks_only_changed_rows_dirty() {
+        let cache = TerminalRenderCache::default();
+        let a = snap(vec![row(0, "alpha"), row(1, "beta"), row(2, "gamma")]);
+
+        assert_eq!(cache.sync_rows(&a, 1, 100), 3, "first sync dirties all rows");
+        assert_eq!(cache.sync_rows(&a, 1, 100), 0, "unchanged sync dirties nothing");
+
+        let b = snap(vec![row(0, "alpha"), row(1, "BETA!"), row(2, "gamma")]);
+        assert_eq!(cache.sync_rows(&b, 2, 100), 1, "only the edited row is dirty");
+
+        // A global key move (font/theme/search) dirties every row again.
+        assert_eq!(cache.sync_rows(&b, 2, 999), 3);
+        assert_eq!(cache.sync_rows(&b, 2, 999), 0);
+    }
+
+    /// A grid resize rebuilds all row caches (the row count itself changed).
+    #[test]
+    fn sync_rows_handles_grid_resize() {
+        let cache = TerminalRenderCache::default();
+        let small = snap(vec![row(0, "one")]);
+        assert_eq!(cache.sync_rows(&small, 1, 100), 1);
+
+        let big = snap(vec![row(0, "one"), row(1, "two"), row(2, "three")]);
+        assert_eq!(cache.sync_rows(&big, 2, 100), 3, "resize dirties every row");
     }
 }

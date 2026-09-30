@@ -43,6 +43,63 @@ pub enum Direction {
     Download,
 }
 
+/// Quiet period that flushes a small (interactive-scale) burst. Two
+/// milliseconds is far below a frame (16 ms) yet long enough for a shell
+/// echo's escape-sequence fragments to arrive and merge.
+const QUIESCE_WINDOW: std::time::Duration = std::time::Duration::from_millis(2);
+/// Bursts up to this size are treated as interactive and get the quiescence
+/// flush; anything bigger is a bulk stream and waits for the frame tick.
+const QUIESCE_MAX_BYTES: usize = 4 * 1024;
+/// Hard cap on one merged output message, so memory stays bounded even if the
+/// producer outruns the UI runtime for a long time.
+const OUTPUT_BATCH_CAP: usize = 256 * 1024;
+/// Frame-paced flush for continuous streams (`cat`, build logs), matching a
+/// 60 Hz display: more redraws than that cannot be seen anyway.
+const OUTPUT_FRAME_TICK: std::time::Duration = std::time::Duration::from_millis(16);
+
+/// Merges PTY output bursts before they cross into the UI runtime.
+///
+/// A keystroke echo flushes as soon as the stream has been quiet for
+/// [`QUIESCE_WINDOW`], so typing stays snappy. A continuous stream keeps
+/// merging into frame-sized messages instead of dispatching one Elm message
+/// per socket read — during `cat` that previously meant hundreds of message
+/// dispatches and full-grid re-snapshots per second.
+pub(crate) struct OutputCoalescer {
+    buf: Vec<u8>,
+    deadline: Option<tokio::time::Instant>,
+}
+
+impl OutputCoalescer {
+    fn new() -> Self {
+        Self {
+            buf: Vec::new(),
+            deadline: None,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+        if self.buf.len() >= OUTPUT_BATCH_CAP {
+            // Caller flushes on size (see `len`); no timer needed.
+            self.deadline = None;
+        } else if self.buf.len() <= QUIESCE_MAX_BYTES {
+            self.deadline = Some(tokio::time::Instant::now() + QUIESCE_WINDOW);
+        } else {
+            // Bulk stream: batch until the frame tick.
+            self.deadline = None;
+        }
+    }
+
+    fn flush(&mut self) -> Vec<u8> {
+        self.deadline = None;
+        std::mem::take(&mut self.buf)
+    }
+
+    fn len(&self) -> usize {
+        self.buf.len()
+    }
+}
+
 /// Commands the UI sends to a session's connection worker.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -387,9 +444,9 @@ async fn run_connection(
     let mut transfers: std::collections::HashMap<u64, TransferCtl> =
         std::collections::HashMap::new();
     // #5: accumulate output bytes and flush at ~60fps to reduce per-byte overhead.
-    let mut output_buf: Vec<u8> = Vec::new();
-    let mut flush_tick = tokio::time::interval(std::time::Duration::from_millis(16));
+    let mut flush_tick = tokio::time::interval(OUTPUT_FRAME_TICK);
     flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut output = OutputCoalescer::new();
 
     // Main multiplexing loop.
     let outcome = loop {
@@ -552,25 +609,50 @@ async fn run_connection(
             },
             ev = pty_ev_rx.recv() => match ev {
                 Some(PtyEvent::Output(bytes)) => {
-                    output_buf.extend_from_slice(&bytes);
+                    output.push(&bytes);
+                    if output.len() >= OUTPUT_BATCH_CAP {
+                        let bytes = output.flush();
+                        if out.try_send(Event::Output { session_id, bytes })
+                            .is_err_and(|e| e.is_disconnected())
+                        {
+                            break ShellOutcome::WorkerDropped;
+                        }
+                    }
                 }
                 Some(PtyEvent::ExitStatus(code)) => {
                     // Flush buffered bytes before the exit event so order is preserved.
-                    if !output_buf.is_empty() {
-                        let _ = out.try_send(Event::Output { session_id, bytes: std::mem::take(&mut output_buf) });
+                    let bytes = output.flush();
+                    if !bytes.is_empty() {
+                        let _ = out.try_send(Event::Output { session_id, bytes });
                     }
                     let _ = out.send(Event::Exit { session_id, code }).await;
                 }
                 Some(PtyEvent::Closed) | None => {
-                    if !output_buf.is_empty() {
-                        let _ = out.try_send(Event::Output { session_id, bytes: std::mem::take(&mut output_buf) });
+                    let bytes = output.flush();
+                    if !bytes.is_empty() {
+                        let _ = out.try_send(Event::Output { session_id, bytes });
                     }
                     break ShellOutcome::Closed;
                 }
             },
+            _ = async {
+                match output.deadline {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                let bytes = output.flush();
+                if !bytes.is_empty()
+                    && out
+                        .try_send(Event::Output { session_id, bytes })
+                        .is_err_and(|e| e.is_disconnected())
+                {
+                    break ShellOutcome::WorkerDropped;
+                }
+            }
             _ = flush_tick.tick() => {
-                if !output_buf.is_empty() {
-                    let bytes = std::mem::take(&mut output_buf);
+                let bytes = output.flush();
+                if !bytes.is_empty() {
                     match out.try_send(Event::Output { session_id, bytes }) {
                         Ok(()) => {}
                         Err(e) if e.is_disconnected() => break ShellOutcome::WorkerDropped,
@@ -1271,6 +1353,13 @@ pub fn local_worker(session_id: u64) -> impl iced::futures::Stream<Item = Event>
         let _ = out.send(Event::Connected { session_id }).await;
 
         // Bridge the blocking PTY read into async via a dedicated thread.
+        //
+        // The reader thread OWNS the fd from here on: on macOS, close() on a
+        // PTY master blocks while another thread sits inside read() on it
+        // (the teardown path used to close it here, deadlocking exactly when
+        // the shell was still echoing — i.e. right after heavy output). The
+        // reaper's SIGHUP/SIGKILL makes the shell release the slave, read()
+        // then returns <= 0, and the thread closes the master itself.
         let (pty_tx, mut pty_rx) = mpsc::channel::<Vec<u8>>(256);
         let read_fd = master_fd;
         std::thread::spawn(move || {
@@ -1286,7 +1375,16 @@ pub fn local_worker(session_id: u64) -> impl iced::futures::Stream<Item = Event>
                     break;
                 }
             }
+            unsafe {
+                libc::close(read_fd);
+            }
         });
+
+        // Same output batching as the SSH worker: interactive echoes flush on
+        // quiescence, continuous streams merge into frame-sized messages.
+        let mut output = OutputCoalescer::new();
+        let mut flush_tick = tokio::time::interval(OUTPUT_FRAME_TICK);
+        flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
@@ -1343,15 +1441,49 @@ pub fn local_worker(session_id: u64) -> impl iced::futures::Stream<Item = Event>
                     _ => {}
                 },
                 bytes = pty_rx.recv() => match bytes {
-                    Some(b) => { if out.send(Event::Output { session_id, bytes: b }).await.is_err() { break; } }
-                    None => break,
+                    Some(b) => {
+                        output.push(&b);
+                        if output.len() >= OUTPUT_BATCH_CAP {
+                            let bytes = output.flush();
+                            if out.send(Event::Output { session_id, bytes }).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    None => {
+                        let bytes = output.flush();
+                        if !bytes.is_empty() {
+                            let _ = out.send(Event::Output { session_id, bytes }).await;
+                        }
+                        break;
+                    }
                 },
+                _ = async {
+                    match output.deadline {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    let bytes = output.flush();
+                    if !bytes.is_empty()
+                        && out.send(Event::Output { session_id, bytes }).await.is_err()
+                    {
+                        break;
+                    }
+                }
+                _ = flush_tick.tick() => {
+                    let bytes = output.flush();
+                    if !bytes.is_empty()
+                        && out.send(Event::Output { session_id, bytes }).await.is_err()
+                    {
+                        break;
+                    }
+                }
             }
         }
 
-        unsafe {
-            libc::close(master_fd);
-        }
+        // The master fd is NOT closed here — the reader thread owns it (see
+        // the spawn above); closing under a blocked read() deadlocks on macOS.
         // Reap the shell on a blocking thread so it never lingers as a
         // zombie: HUP first (the normal terminal hang-up), escalate to KILL
         // if it hasn't exited after a short grace period. Detached — the
@@ -1886,15 +2018,21 @@ mod tests {
     }
 
     /// The SSH key used by the live tests (`OPENTERM_TEST_KEY`, default
-    /// `~/.ssh/id_ed25519`). None when the key file does not exist, so the
-    /// live tests skip loudly instead of failing offline.
-    fn live_test_key() -> Option<std::path::PathBuf> {
-        let path = std::env::var_os("OPENTERM_TEST_KEY")
+    /// `~/.ssh/id_ed25519`), without checking that it exists. The local-shell
+    /// tests pass a dummy route they never dial.
+    fn live_key_path() -> std::path::PathBuf {
+        std::env::var_os("OPENTERM_TEST_KEY")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
                 let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
                 home.unwrap_or_default().join(".ssh").join("id_ed25519")
-            });
+            })
+    }
+
+    /// [`live_key_path`] when the key file actually exists, else None (with a
+    /// loud skip note) so live tests skip instead of failing offline.
+    fn live_test_key() -> Option<std::path::PathBuf> {
+        let path = live_key_path();
         if path.exists() {
             Some(path)
         } else {
@@ -1910,7 +2048,7 @@ mod tests {
     fn test_route() -> ConnectRoute {
         use openterm_core::HostProfile;
         use openterm_ssh::{AuthMethod, ConnectOptions, HostKeyPolicy};
-        let key = live_test_key().expect("caller checked live_test_key");
+        let key = live_key_path();
         let mut profile = HostProfile::new("live", "82.157.57.178");
         profile.port = 22;
         profile.username = Some("ubuntu".to_string());
@@ -2053,5 +2191,133 @@ mod tests {
             "OK: recursive upload+download round-trip of {expected_total} bytes across {} files",
             down_files.len()
         );
+    }
+    mod output_coalescer_tests {
+        use super::*;
+
+        /// Interactive-scale bursts arm the quiescence timer so a keystroke echo
+        /// flushes after ~2 ms instead of waiting a full frame tick.
+        #[test]
+        fn small_bursts_arm_the_quiescence_deadline() {
+            let mut c = OutputCoalescer::new();
+            c.push(b"hi");
+            assert!(
+                c.deadline.is_some(),
+                "interactive burst must arm quiescence"
+            );
+            assert_eq!(c.flush(), b"hi".to_vec());
+            assert!(c.deadline.is_none());
+            assert_eq!(c.flush(), Vec::<u8>::new(), "flush is idempotent");
+        }
+
+        /// Bulk streams must NOT flush every 2 ms — they wait for the frame tick,
+        /// otherwise `cat` would still produce ~500 messages/second.
+        #[test]
+        fn bulk_streams_wait_for_the_frame_tick() {
+            let mut c = OutputCoalescer::new();
+            c.push(&vec![b'a'; QUIESCE_MAX_BYTES + 1]);
+            assert!(c.deadline.is_none(), "bulk stream must not arm quiescence");
+            assert_eq!(c.len(), QUIESCE_MAX_BYTES + 1);
+        }
+
+        /// A batch at the cap signals the caller (via len) to flush immediately.
+        #[test]
+        fn capped_batches_report_their_size_for_immediate_flush() {
+            let mut c = OutputCoalescer::new();
+            c.push(&vec![b'a'; OUTPUT_BATCH_CAP]);
+            assert!(c.len() >= OUTPUT_BATCH_CAP);
+            assert_eq!(c.flush().len(), OUTPUT_BATCH_CAP);
+        }
+    }
+
+    #[cfg(unix)]
+    mod latency_benchmark {
+        use super::*;
+        use iced::futures::StreamExt;
+
+        /// Keystroke→echo latency through the whole UI pipeline: PTY write →
+        /// shell echo → read thread → coalescer → Event stream. Prints p50/p95 so
+        /// output-path regressions show up as numbers; the assert is a generous
+        /// sanity bound (50 ms), not a target.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn keystroke_echo_latency_profile() {
+            if let Err(error) = pty_available() {
+                eprintln!("skipping: {error}");
+                return;
+            }
+
+            let mut stream = Box::pin(local_worker(11));
+            let sender = match stream.next().await {
+                Some(Event::Ready { sender, .. }) => sender,
+                _ => panic!("expected Ready as the first worker event"),
+            };
+            sender
+                .send(Command::Connect(ConnectParams {
+                    route: test_route(),
+                    cols: 80,
+                    rows: 24,
+                    term: "xterm-256color".to_string(),
+                }))
+                .await
+                .unwrap();
+            loop {
+                match stream.next().await {
+                    Some(Event::Connected { .. }) => break,
+                    Some(Event::Failed { error, .. }) => panic!("local shell failed: {error}"),
+                    Some(_) => continue,
+                    None => panic!("worker stream ended before Connected"),
+                }
+            }
+
+            // Let the shell's banner/prompt drain before measuring.
+            let settle_until = tokio::time::Instant::now() + std::time::Duration::from_millis(400);
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(settle_until) => break,
+                    ev = stream.next() => { if ev.is_none() { panic!("stream ended during settle"); } }
+                }
+            }
+
+            const SAMPLES: usize = 50;
+            let mut latencies = Vec::with_capacity(SAMPLES);
+            for _ in 0..SAMPLES {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                let t0 = std::time::Instant::now();
+                sender.send(Command::Write(vec![b'x'])).await.unwrap();
+                loop {
+                    match tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+                        .await
+                    {
+                        Ok(Some(Event::Output { .. })) => break,
+                        Ok(Some(_)) => continue,
+                        Ok(None) => panic!("stream ended mid-benchmark"),
+                        Err(_) => panic!("no echo within 2 s"),
+                    }
+                }
+                latencies.push(t0.elapsed());
+            }
+            latencies.sort();
+
+            let at = |q: usize| latencies[q.min(SAMPLES - 1)].as_secs_f64() * 1000.0;
+            eprintln!(
+                "keystroke→echo over {SAMPLES} keys: min {:.1} ms  p50 {:.1} ms  p95 {:.1} ms",
+                at(0),
+                at(SAMPLES / 2),
+                at(SAMPLES * 95 / 100)
+            );
+            assert!(
+                latencies[SAMPLES / 2] < std::time::Duration::from_millis(50),
+                "median keystroke→echo latency {:.1} ms exceeds the 50 ms sanity bound",
+                at(SAMPLES / 2)
+            );
+
+            sender.send(Command::Disconnect).await.unwrap();
+            loop {
+                match stream.next().await {
+                    Some(Event::Closed { .. }) | None => break,
+                    Some(_) => continue,
+                }
+            }
+        }
     }
 }
