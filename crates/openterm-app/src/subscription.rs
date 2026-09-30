@@ -65,6 +65,15 @@ pub fn subscription(app: &App) -> Subscription<Message> {
         Subscription::none()
     };
 
+
+    // Auto-reconnect driver: while any session sits in the backoff window a
+    // 250 ms heartbeat checks whether a retry is due.
+    let reconnect_tick = if app.sessions.iter().any(|s| s.phase == Phase::Reconnecting) {
+        iced::time::every(std::time::Duration::from_millis(250))
+            .map(|_| Message::ReconnectTick(std::time::Instant::now()))
+    } else {
+        Subscription::none()
+    };
     // While the vault overlay is up it gates everything: only Enter (submit)
     // and Esc (manual lock when already unlockable) reach the app, and no
     // keystrokes leak to the terminal.
@@ -78,7 +87,7 @@ pub fn subscription(app: &App) -> Subscription<Message> {
                 _ => None,
             }
         });
-        return Subscription::batch([connections, modifiers, keys, vault_tick, toast_tick]);
+        return Subscription::batch([connections, modifiers, keys, vault_tick, toast_tick, reconnect_tick]);
     }
 
     // While the settings overlay is open, Esc closes it.
@@ -92,7 +101,7 @@ pub fn subscription(app: &App) -> Subscription<Message> {
                 _ => None,
             }
         });
-        return Subscription::batch([connections, modifiers, keys, vault_tick, toast_tick]);
+        return Subscription::batch([connections, modifiers, keys, vault_tick, toast_tick, reconnect_tick]);
     }
 
     // While terminal search is open, Esc closes it and app shortcuts still
@@ -123,7 +132,7 @@ pub fn subscription(app: &App) -> Subscription<Message> {
         } else {
             Subscription::none()
         };
-        return Subscription::batch([connections, modifiers, search_keys, frames, metrics, vault_tick, toast_tick]);
+        return Subscription::batch([connections, modifiers, search_keys, frames, metrics, vault_tick, toast_tick, reconnect_tick]);
     }
 
     // While the palette is open it owns the keyboard (nav + run + close).
@@ -145,7 +154,7 @@ pub fn subscription(app: &App) -> Subscription<Message> {
     } else {
         Subscription::none()
     };
-    return Subscription::batch([connections, modifiers, palette_keys, frames, vault_tick, toast_tick]);
+    return Subscription::batch([connections, modifiers, palette_keys, frames, vault_tick, toast_tick, reconnect_tick]);
     }
 
     // The Ctrl+R history-search overlay owns the keyboard while open: nav + run
@@ -234,12 +243,18 @@ pub fn subscription(app: &App) -> Subscription<Message> {
     let ping_tick = iced::time::every(std::time::Duration::from_secs(30))
         .map(|_| Message::PingTick);
 
-    // Connecting-dot pulse: slow heartbeat while any session is handshaking.
-    let pulse = if app.sessions.iter().any(|s| s.phase == Phase::Connecting) {
+    // Connecting-dot pulse: slow heartbeat while any session is handshaking
+    // or auto-reconnecting (the amber dot pulses in both states).
+    let pulse = if app
+        .sessions
+        .iter()
+        .any(|s| matches!(s.phase, Phase::Connecting | Phase::Reconnecting))
+    {
         iced::time::every(std::time::Duration::from_millis(700)).map(|_| Message::PulseTick)
     } else {
         Subscription::none()
     };
+
 
     // IME commit events (Chinese/Japanese/Korean input confirmed).
     let ime = if active_connected {
@@ -254,7 +269,7 @@ pub fn subscription(app: &App) -> Subscription<Message> {
         Subscription::none()
     };
 
-    Subscription::batch([connections, modifiers, typing, resize, metrics, frames, ping_tick, pulse, ime, vault_tick, toast_tick])
+    Subscription::batch([connections, modifiers, typing, resize, metrics, frames, ping_tick, pulse, reconnect_tick, ime, vault_tick, toast_tick])
 }
 
 /// Builder for `Subscription::run_with` — must be a non-capturing fn pointer.

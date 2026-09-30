@@ -234,7 +234,7 @@ fn input_style(_theme: &iced::Theme, status: text_input::Status) -> text_input::
 /// alternate ticks while the phase is Connecting, giving a breathing effect.
 pub fn status_dot<'a>(phase: &Phase, pulse: bool) -> Element<'a, Message> {
     let base = phase_color(phase);
-    let color = if matches!(phase, Phase::Connecting) && pulse {
+    let color = if matches!(phase, Phase::Connecting | Phase::Reconnecting) && pulse {
         theme::with_alpha(base, 0.3)
     } else {
         base
@@ -245,7 +245,7 @@ pub fn status_dot<'a>(phase: &Phase, pulse: bool) -> Element<'a, Message> {
 pub fn phase_color(phase: &Phase) -> Color {
     match phase {
         Phase::Connected => theme::status_ok(),
-        Phase::Connecting => theme::status_warn(),
+        Phase::Connecting | Phase::Reconnecting => theme::status_warn(),
         Phase::Failed(_) => theme::status_error(),
         Phase::Idle => theme::status_idle(),
     }

@@ -275,6 +275,9 @@ pub enum Message {
     Tick(std::time::Instant),
     /// Slow heartbeat for the "connecting" status-dot pulse (≈700 ms).
     PulseTick,
+    /// Fires while any session is in the auto-reconnect backoff window; the
+    /// handler dispatches Connect for every session whose retry is due.
+    ReconnectTick(std::time::Instant),
 
     // --- Terminal search (Cmd+F) ---
     TerminalSearchOpen,

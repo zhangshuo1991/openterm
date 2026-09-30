@@ -223,14 +223,33 @@ pub enum Phase {
     Connecting,
     /// Shell is live.
     Connected,
+    /// An established connection dropped and auto-reconnect is retrying with
+    /// backoff. The terminal grid is kept so the session resumes in place.
+    Reconnecting,
     /// Last attempt failed; message explains why.
     Failed(String),
 }
 
 impl Phase {
     pub fn is_active(&self) -> bool {
-        matches!(self, Phase::Connecting | Phase::Connected)
+        matches!(
+            self,
+            Phase::Connecting | Phase::Connected | Phase::Reconnecting
+        )
     }
+}
+
+/// Reconnect backoff: 0.5 s doubling to a 30 s cap, plus jitter so many
+/// sessions dropped by the same network event don't redial in lockstep.
+pub fn reconnect_backoff(attempt: u32) -> std::time::Duration {
+    let base_ms = 500_u64.saturating_mul(1 << attempt.saturating_sub(1).min(6));
+    let capped = base_ms.min(30_000);
+    let jitter = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_millis() as u64)
+        .unwrap_or(0))
+        % 250;
+    std::time::Duration::from_millis(capped + jitter)
 }
 
 /// Whether this session is an SSH connection or a local shell.
@@ -867,6 +886,12 @@ pub struct Session {
     pub grid_cols: u16,
     pub grid_rows: u16,
     pub phase: Phase,
+    /// Auto-reconnect state: attempt number (1-based) and when to retry next.
+    pub reconnect_attempt: u32,
+    pub reconnect_at: Option<std::time::Instant>,
+    /// True between the user pressing Disconnect and the worker's Closed event,
+    /// so the Closed handler knows not to auto-reconnect.
+    pub user_disconnect: bool,
     /// Command channel to this session's connection worker (set on `Ready`).
     pub cmd_tx: Option<mpsc::Sender<Command>>,
     /// Connect params requested before the worker channel was ready.
@@ -1206,6 +1231,9 @@ impl Session {
             grid_cols: cols,
             grid_rows: rows,
             phase: Phase::Idle,
+            reconnect_attempt: 0,
+            reconnect_at: None,
+            user_disconnect: false,
             cmd_tx: None,
             pending_connect: None,
             host_key: None,
@@ -2424,5 +2452,32 @@ mod render_cache_tests {
 
         let big = snap(vec![row(0, "one"), row(1, "two"), row(2, "three")]);
         assert_eq!(cache.sync_rows(&big, 2, 100), 3, "resize dirties every row");
+    }
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    use super::*;
+
+    /// The backoff doubles from 500 ms and caps at 30 s (+ up to 250 ms
+    /// jitter, which must never push a retry past ~30.25 s).
+    #[test]
+    fn backoff_doubles_then_caps() {
+        let b1 = reconnect_backoff(1);
+        let b2 = reconnect_backoff(2);
+        let b3 = reconnect_backoff(3);
+        assert!(b1 >= std::time::Duration::from_millis(500));
+        assert!(b1 <= std::time::Duration::from_millis(750));
+        assert!(b2 >= std::time::Duration::from_millis(1000));
+        assert!(b2 <= std::time::Duration::from_millis(1250));
+        assert!(b3 >= std::time::Duration::from_millis(2000));
+        for attempt in [10_u32, 20, 100] {
+            let b = reconnect_backoff(attempt);
+            assert!(
+                b <= std::time::Duration::from_millis(30_250),
+                "attempt {attempt} exceeded the 30 s cap: {b:?}"
+            );
+            assert!(b >= std::time::Duration::from_millis(30_000));
+        }
     }
 }

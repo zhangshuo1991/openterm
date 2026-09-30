@@ -143,6 +143,7 @@ fn phase_word(phase: &Phase) -> &'static str {
     match phase {
         Phase::Connected => "Connected",
         Phase::Connecting => "Connecting",
+        Phase::Reconnecting => "Reconnecting",
         Phase::Failed(_) => "Disconnected",
         Phase::Idle => "Idle",
     }

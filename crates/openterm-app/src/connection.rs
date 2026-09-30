@@ -275,6 +275,10 @@ pub enum Event {
     Failed {
         session_id: u64,
         error: String,
+        /// True for failures another attempt cannot fix (bad credentials,
+        /// missing username). Auto-reconnect must stop on these — retrying a
+        /// wrong password forever just locks the account.
+        fatal: bool,
     },
     /// Result of a smart-suggestion query (stdout parsed into candidates).
     SuggestionData {
@@ -381,10 +385,12 @@ async fn run_connection(
                 return ControlFlow::Continue(());
             }
             Err(error) => {
+                let fatal = matches!(error, SshError::Authentication | SshError::MissingUsername);
                 let _ = out
                     .send(Event::Failed {
                         session_id,
                         error: error.to_string(),
+                        fatal,
                     })
                     .await;
                 return ControlFlow::Continue(());
@@ -403,10 +409,12 @@ async fn run_connection(
                 return ControlFlow::Continue(());
             }
             Err(error) => {
+                let fatal = matches!(error, SshError::Authentication | SshError::MissingUsername);
                 let _ = out
                     .send(Event::Failed {
                         session_id,
                         error: error.to_string(),
+                        fatal,
                     })
                     .await;
                 return ControlFlow::Continue(());
@@ -1345,6 +1353,7 @@ pub fn local_worker(session_id: u64) -> impl iced::futures::Stream<Item = Event>
                     .send(Event::Failed {
                         session_id,
                         error: e.to_string(),
+                        fatal: true,
                     })
                     .await;
                 return;
@@ -2318,6 +2327,98 @@ mod tests {
                     Some(_) => continue,
                 }
             }
+        }
+    }
+    mod reconnect_worker_tests {
+        use super::*;
+        use iced::futures::StreamExt;
+
+        /// The plumbing auto-reconnect rides on: the worker must survive a shell
+        /// death (Event::Closed) and accept a fresh Connect on the SAME channel,
+        /// reaching Connected again. This is exactly what dispatch_reconnect does
+        /// after a dropped connection. Runs against the real test server with
+        /// key auth; skips loudly without the key.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn worker_accepts_reconnect_after_shell_death() {
+            if live_test_key().is_none() {
+                return;
+            }
+
+            let mut stream = Box::pin(worker(21));
+            let sender = match stream.next().await {
+                Some(Event::Ready { sender, .. }) => sender,
+                _ => panic!("expected Ready"),
+            };
+
+            // First connection.
+            sender
+                .send(Command::Connect(ConnectParams {
+                    route: test_route(),
+                    cols: 80,
+                    rows: 24,
+                    term: "xterm-256color".to_string(),
+                }))
+                .await
+                .unwrap();
+            let mut saw_connected = false;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+            while tokio::time::Instant::now() < deadline {
+                match tokio::time::timeout(std::time::Duration::from_secs(5), stream.next()).await {
+                    Ok(Some(Event::Connected { .. })) => {
+                        saw_connected = true;
+                        break;
+                    }
+                    Ok(Some(_)) => continue,
+                    _ => panic!("first connect did not reach Connected"),
+                }
+            }
+            assert!(saw_connected);
+
+            // Kill the shell from inside — the connection drops, worker reports
+            // Closed and stays alive.
+            sender
+                .send(Command::Write(b"exit\r\n".to_vec()))
+                .await
+                .unwrap();
+            let mut saw_closed = false;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+            while tokio::time::Instant::now() < deadline {
+                match tokio::time::timeout(std::time::Duration::from_secs(5), stream.next()).await {
+                    Ok(Some(Event::Closed { .. })) => {
+                        saw_closed = true;
+                        break;
+                    }
+                    Ok(Some(_)) => continue,
+                    _ => panic!("shell exit did not produce Closed"),
+                }
+            }
+            assert!(saw_closed, "worker should report Closed but keep running");
+
+            // Reconnect on the same channel — this is the auto-reconnect path.
+            sender
+                .send(Command::Connect(ConnectParams {
+                    route: test_route(),
+                    cols: 80,
+                    rows: 24,
+                    term: "xterm-256color".to_string(),
+                }))
+                .await
+                .unwrap();
+            let mut reconnected = false;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+            while tokio::time::Instant::now() < deadline {
+                match tokio::time::timeout(std::time::Duration::from_secs(5), stream.next()).await {
+                    Ok(Some(Event::Connected { .. })) => {
+                        reconnected = true;
+                        break;
+                    }
+                    Ok(Some(_)) => continue,
+                    _ => panic!("reconnect did not reach Connected"),
+                }
+            }
+            assert!(reconnected, "worker must reconnect after Closed");
+
+            let _ = sender.send(Command::Disconnect).await;
         }
     }
 }
