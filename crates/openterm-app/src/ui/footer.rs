@@ -13,7 +13,7 @@ use crate::App;
 pub fn view(app: &App) -> Element<'_, Message> {
     let (status, phase_label, target) = match app.active_session() {
         Some(session) => (
-            session.status.clone(),
+            session.status_detail().unwrap_or_default(),
             session.phase.clone(),
             session.config.target_label(),
         ),
@@ -31,7 +31,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
     let pill = container(
         row![
             widgets::status_dot(&phase_label, app.connecting_pulse),
-            text(phase_word(&phase_label)).size(11).color(pill_color),
+            text(phase_label.label()).size(11).color(pill_color),
         ]
         .spacing(6)
         .align_y(iced::Alignment::Center),
@@ -137,16 +137,6 @@ pub fn view(app: &App) -> Element<'_, Message> {
         ..Default::default()
     })
     .into()
-}
-
-fn phase_word(phase: &Phase) -> &'static str {
-    match phase {
-        Phase::Connected => "Connected",
-        Phase::Connecting => "Connecting",
-        Phase::Reconnecting => "Reconnecting",
-        Phase::Failed(_) => "Disconnected",
-        Phase::Idle => "Idle",
-    }
 }
 
 fn footer_button<'a>(label: &str, on_press: Message) -> Element<'a, Message> {

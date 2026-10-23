@@ -219,9 +219,13 @@ impl SessionConfig {
 }
 
 /// The connection lifecycle phase of a session.
+///
+/// This is the single source of truth for what the tab dot, the footer and the
+/// workspace show: every status word is derived from it (see [`Phase::label`]
+/// and [`Session::status_detail`]), never stored next to it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Phase {
-    /// Never connected, or fully disconnected.
+    /// Never connected.
     Idle,
     /// Connection in progress.
     Connecting,
@@ -230,8 +234,61 @@ pub enum Phase {
     /// An established connection dropped and auto-reconnect is retrying with
     /// backoff. The terminal grid is kept so the session resumes in place.
     Reconnecting,
-    /// Last attempt failed; message explains why.
-    Failed(String),
+    /// An established session ended.
+    Closed(CloseReason),
+    /// A connect attempt failed before the shell came up.
+    Failed(Failure),
+}
+
+/// Why an established session ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseReason {
+    /// The user pressed Disconnect.
+    User,
+    /// The transport or channel dropped without an exit status.
+    Remote,
+    /// The remote shell exited and reported this status.
+    Exited(u32),
+}
+
+/// A failed connect attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failure {
+    pub kind: FailureKind,
+    pub message: String,
+}
+
+/// The class of a connect failure, which decides what the user can do next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// Credentials rejected or missing: retrying unchanged cannot help.
+    Auth,
+    /// The host key was rejected or could not be trusted.
+    HostKey,
+    /// Anything else (DNS, TCP, timeout, protocol, bad config).
+    Connection,
+}
+
+impl Failure {
+    pub fn new(kind: FailureKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    /// Classify a transport error from the SSH backend.
+    pub fn from_ssh(error: &openterm_ssh::SshError) -> Self {
+        use openterm_ssh::SshError;
+        let kind = match error {
+            SshError::Authentication | SshError::MissingUsername | SshError::Agent(_) => {
+                FailureKind::Auth
+            }
+            SshError::HostKeyVerificationRequired(_) => FailureKind::HostKey,
+            _ => FailureKind::Connection,
+        };
+        Self::new(kind, error.to_string())
+    }
 }
 
 impl Phase {
@@ -240,6 +297,49 @@ impl Phase {
             self,
             Phase::Connecting | Phase::Connected | Phase::Reconnecting
         )
+    }
+
+    /// The short state word shown on the status pill.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Phase::Idle => "Not connected",
+            Phase::Connecting => "Connecting",
+            Phase::Connected => "Connected",
+            Phase::Reconnecting => "Reconnecting",
+            Phase::Closed(CloseReason::User) => "Disconnected",
+            Phase::Closed(CloseReason::Remote) => "Closed by remote host",
+            Phase::Closed(CloseReason::Exited(_)) => "Shell exited",
+            Phase::Failed(failure) => match failure.kind {
+                FailureKind::Auth => "Authentication failed",
+                FailureKind::HostKey => "Host key rejected",
+                FailureKind::Connection => "Connection failed",
+            },
+        }
+    }
+
+    /// The phase a session moves to when its established channel closes.
+    ///
+    /// `clean` is true when the remote command reported an exit status before
+    /// the channel closed. Only an unexpected drop of a live SSH session may
+    /// auto-reconnect; the user's own Disconnect and a shell exited on purpose
+    /// never do.
+    pub fn after_close(
+        &self,
+        user_disconnect: bool,
+        clean: bool,
+        exit_code: Option<u32>,
+        can_reconnect: bool,
+    ) -> Phase {
+        if user_disconnect {
+            return Phase::Closed(CloseReason::User);
+        }
+        if clean {
+            return Phase::Closed(CloseReason::Exited(exit_code.unwrap_or(0)));
+        }
+        if *self == Phase::Connected && can_reconnect {
+            return Phase::Reconnecting;
+        }
+        Phase::Closed(CloseReason::Remote)
     }
 }
 
@@ -902,8 +1002,9 @@ pub struct Session {
     pub pending_connect: Option<ConnectParams>,
     /// A host key awaiting user confirmation.
     pub host_key: Option<HostKeyChallenge>,
-    /// Short status line shown in the tab/footer for this session.
-    pub status: String,
+    /// Exit status the remote shell reported, consumed by the Closed event
+    /// that follows it.
+    pub exit_code: Option<u32>,
     // --- SFTP workspace state (Phase 2) ---
     pub sftp_open: bool,
     /// Which metric's process drill-down is shown (None = the rail's process
@@ -1241,7 +1342,7 @@ impl Session {
             cmd_tx: None,
             pending_connect: None,
             host_key: None,
-            status: "Not connected".to_string(),
+            exit_code: None,
             sftp_open: false,
             monitor_panel: None,
             processes: Vec::new(),
@@ -1310,6 +1411,56 @@ impl Session {
             format!("Session {}", self.id)
         } else {
             label
+        }
+    }
+
+    /// The established channel closed. An unexpected drop of a live SSH
+    /// session (not the user's Disconnect, not a shell exited on purpose, not
+    /// a first-connect failure, which arrives as Failed) is what auto-reconnect
+    /// covers.
+    pub fn on_closed(&mut self, clean: bool, auto_reconnect: bool) {
+        let can_reconnect = auto_reconnect && self.kind == SessionKind::Ssh;
+        self.phase = self.phase.after_close(
+            self.user_disconnect,
+            clean,
+            self.exit_code.take(),
+            can_reconnect,
+        );
+        if self.phase == Phase::Reconnecting {
+            self.reconnect_attempt = 1;
+            self.reconnect_at = Some(std::time::Instant::now() + reconnect_backoff(1));
+        } else {
+            self.reconnect_at = None;
+        }
+        self.user_disconnect = false;
+    }
+
+    /// A connect attempt failed. A retryable failure inside the reconnect loop
+    /// schedules the next attempt instead of surfacing as Failed. Fatal ones
+    /// (auth, username) stop the loop: another attempt cannot change them, and
+    /// hammering a wrong password would lock the account.
+    pub fn on_failed(&mut self, failure: Failure, fatal: bool) {
+        if self.phase == Phase::Reconnecting && !fatal {
+            self.reconnect_attempt += 1;
+            self.reconnect_at =
+                Some(std::time::Instant::now() + reconnect_backoff(self.reconnect_attempt));
+        } else {
+            self.phase = Phase::Failed(failure);
+        }
+    }
+
+    /// Secondary status text for the footer, derived from the phase. `None`
+    /// when the phase label already says everything.
+    pub fn status_detail(&self) -> Option<String> {
+        match &self.phase {
+            Phase::Connecting if self.host_key.is_some() => {
+                Some("Confirm the host key to continue".to_string())
+            }
+            Phase::Connected if self.user_disconnect => Some("Disconnecting…".to_string()),
+            Phase::Reconnecting => Some(format!("Attempt {}", self.reconnect_attempt.max(1))),
+            Phase::Closed(CloseReason::Exited(code)) => Some(format!("Exit status {code}")),
+            Phase::Failed(failure) => Some(failure.message.clone()),
+            _ => None,
         }
     }
 
@@ -1777,6 +1928,66 @@ mod tests {
 
     fn session() -> Session {
         Session::new(1, SessionConfig::blank("u".into(), "k".into()), 80, 24)
+    }
+
+    #[test]
+    fn user_disconnect_closes_without_reconnecting() {
+        let next = Phase::Connected.after_close(true, false, None, true);
+        assert_eq!(next, Phase::Closed(CloseReason::User));
+        assert_eq!(next.label(), "Disconnected");
+    }
+
+    #[test]
+    fn exited_shell_reports_its_status_and_does_not_reconnect() {
+        let next = Phase::Connected.after_close(false, true, Some(130), true);
+        assert_eq!(next, Phase::Closed(CloseReason::Exited(130)));
+        let mut s = session();
+        s.phase = next;
+        assert_eq!(s.phase.label(), "Shell exited");
+        assert_eq!(s.status_detail().as_deref(), Some("Exit status 130"));
+    }
+
+    #[test]
+    fn unexpected_drop_reconnects_only_when_allowed() {
+        assert_eq!(
+            Phase::Connected.after_close(false, false, None, true),
+            Phase::Reconnecting
+        );
+        let next = Phase::Connected.after_close(false, false, None, false);
+        assert_eq!(next, Phase::Closed(CloseReason::Remote));
+        assert_eq!(next.label(), "Closed by remote host");
+    }
+
+    #[test]
+    fn drop_before_shell_is_up_does_not_reconnect() {
+        assert_eq!(
+            Phase::Connecting.after_close(false, false, None, true),
+            Phase::Closed(CloseReason::Remote)
+        );
+    }
+
+    #[test]
+    fn failures_are_classified_for_the_status_pill() {
+        let auth = Failure::from_ssh(&openterm_ssh::SshError::Authentication);
+        assert_eq!(auth.kind, FailureKind::Auth);
+        assert_eq!(Phase::Failed(auth).label(), "Authentication failed");
+
+        let timeout = Failure::from_ssh(&openterm_ssh::SshError::Timeout);
+        assert_eq!(timeout.kind, FailureKind::Connection);
+        let mut s = session();
+        s.phase = Phase::Failed(timeout);
+        assert_eq!(s.phase.label(), "Connection failed");
+        assert_eq!(s.status_detail().as_deref(), Some("operation timed out"));
+    }
+
+    #[test]
+    fn connected_status_is_not_repeated_in_the_detail() {
+        let mut s = session();
+        s.phase = Phase::Connected;
+        assert_eq!(s.phase.label(), "Connected");
+        assert_eq!(s.status_detail(), None);
+        s.user_disconnect = true;
+        assert_eq!(s.status_detail().as_deref(), Some("Disconnecting…"));
     }
 
     #[test]
