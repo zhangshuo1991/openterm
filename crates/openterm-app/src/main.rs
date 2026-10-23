@@ -50,6 +50,7 @@ fn main() -> iced::Result {
     // ~28px the system titlebar used to take.
     let window = iced::window::Settings {
         size: iced::Size::new(1200.0, 780.0),
+        #[cfg(target_os = "macos")]
         platform_specific: iced::window::settings::PlatformSpecific {
             title_hidden: true,
             titlebar_transparent: true,
