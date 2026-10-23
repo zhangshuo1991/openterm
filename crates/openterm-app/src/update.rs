@@ -5,7 +5,7 @@ use iced::{animation::Animation, clipboard, Task};
 
 use crate::connection::{Command, ConnectParams, Event as ConnEvent};
 use crate::message::Message;
-use crate::session::{Phase, SessionConfig};
+use crate::session::{Failure, FailureKind, Phase, SessionConfig};
 use crate::{persist_host, App};
 
 pub fn update(app: &mut App, message: Message) -> Task<Message> {
@@ -200,7 +200,6 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 // Suppresses auto-reconnect for the Closed event this
                 // disconnect is about to produce.
                 session.user_disconnect = true;
-                session.status = "Disconnecting…".to_string();
             }
             Task::none()
         }
@@ -249,8 +248,8 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::RejectHostKey => {
             if let Some(session) = app.active_session_mut() {
                 session.host_key = None;
-                session.phase = Phase::Failed("Host key rejected.".to_string());
-                session.status = "Host key rejected".to_string();
+                session.phase =
+                    Phase::Failed(Failure::new(FailureKind::HostKey, "Host key rejected."));
             }
             Task::none()
         }
@@ -2111,14 +2110,12 @@ fn dispatch_reconnect(app: &mut App, index: usize) {
     if session.phase != Phase::Reconnecting {
         return;
     }
-    let attempt = session.reconnect_attempt.max(1);
     let route = match App::build_route(&session.config, keepalive) {
         Ok(route) => route,
         Err(error) => {
             // Config-level errors (missing host etc.) can't be retried away.
             session.reconnect_at = None;
-            session.phase = Phase::Failed(error.clone());
-            session.status = error;
+            session.phase = Phase::Failed(Failure::new(FailureKind::Connection, error));
             return;
         }
     };
@@ -2132,7 +2129,6 @@ fn dispatch_reconnect(app: &mut App, index: usize) {
     session.user_disconnect = false;
     session.reconnect_at = None; // due; the next failure reschedules
     session.host_key = None;
-    session.status = format!("Reconnecting — attempt {attempt}…");
     if let Some(tx) = &session.cmd_tx {
         let _ = tx.try_send(Command::Connect(params));
     } else {
@@ -2160,8 +2156,7 @@ fn connect_active(app: &mut App) -> Task<Message> {
     let route = match App::build_route(&session.config, keepalive) {
         Ok(route) => route,
         Err(error) => {
-            session.phase = Phase::Failed(error.clone());
-            session.status = error;
+            session.phase = Phase::Failed(Failure::new(FailureKind::Connection, error));
             return Task::none();
         }
     };
@@ -2175,7 +2170,6 @@ fn connect_active(app: &mut App) -> Task<Message> {
     session.resize_grid(cols, rows);
     session.clear_grid();
     session.phase = Phase::Connecting;
-    session.status = "Connecting…".to_string();
     session.host_key = None;
     session.reconnect_attempt = 0;
     session.reconnect_at = None;
@@ -2202,16 +2196,17 @@ fn accept_host_key(app: &mut App) -> Task<Message> {
         return Task::none();
     };
     if let Err(error) = challenge.accept() {
-        session.phase = Phase::Failed(format!("Could not trust host key: {error}"));
-        session.status = "Host key error".to_string();
+        session.phase = Phase::Failed(Failure::new(
+            FailureKind::HostKey,
+            format!("Could not trust host key: {error}"),
+        ));
         return Task::none();
     }
     // Re-attempt the connection now that the key is trusted.
     let route = match App::build_route(&session.config, keepalive) {
         Ok(route) => route,
         Err(error) => {
-            session.phase = Phase::Failed(error.clone());
-            session.status = error;
+            session.phase = Phase::Failed(Failure::new(FailureKind::Connection, error));
             return Task::none();
         }
     };
@@ -2223,7 +2218,6 @@ fn accept_host_key(app: &mut App) -> Task<Message> {
         term: "xterm-256color".to_string(),
     };
     session.phase = Phase::Connecting;
-    session.status = "Connecting…".to_string();
     session.user_disconnect = false;
     if let Some(tx) = &session.cmd_tx {
         let _ = tx.try_send(Command::Connect(params));
@@ -2764,13 +2758,12 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
             // failure still routes into the backoff loop instead of Failed.
             if session.phase != Phase::Reconnecting {
                 session.phase = Phase::Connecting;
-                session.status = "Connecting…".to_string();
             }
         }
         ConnEvent::Connected { .. } => {
             let recovered_after = session.reconnect_attempt;
             session.phase = Phase::Connected;
-            session.status = "Connected".to_string();
+            session.exit_code = None;
             session.host_key = None;
             session.reconnect_attempt = 0;
             session.reconnect_at = None;
@@ -2886,7 +2879,6 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
         ConnEvent::HostKeyRequired { challenge, .. } => {
             session.host_key = Some(*challenge);
             session.phase = Phase::Connecting;
-            session.status = "Host key confirmation required".to_string();
         }
         ConnEvent::SftpListed { path, result, .. } => match result {
             Ok(mut entries) => {
@@ -3043,7 +3035,7 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
             session.ports = crate::metrics::parse_ports(&raw);
         }
         ConnEvent::Exit { code, .. } => {
-            session.status = format!("Process exited ({code})");
+            session.exit_code = Some(code);
         }
         ConnEvent::FileChunk {
             path,
@@ -3080,27 +3072,8 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
             }
         }
         ConnEvent::Closed { clean, .. } => {
-            // An unexpected drop of an ESTABLISHED session (not the user's
-            // Disconnect, not a shell the user exited on purpose — the worker
-            // saw an exit status — and not a first-connect failure, which
-            // arrives as Failed) is what auto-reconnect covers.
-            let unexpected = session.phase == Phase::Connected
-                && !session.user_disconnect
-                && !clean
-                && session.kind == crate::session::SessionKind::Ssh;
-            if unexpected && app.on_disconnect == crate::session::OnDisconnect::AutoReconnect {
-                session.reconnect_attempt = 1;
-                session.reconnect_at =
-                    Some(std::time::Instant::now() + crate::session::reconnect_backoff(1));
-                session.phase = Phase::Reconnecting;
-                session.status = "Connection lost — reconnecting…".to_string();
-            } else {
-                session.phase = Phase::Idle;
-                session.status = "Disconnected".to_string();
-            }
-            session.reconnect_at = session
-                .reconnect_at
-                .filter(|_| session.phase == Phase::Reconnecting);
+            let auto_reconnect = app.on_disconnect == crate::session::OnDisconnect::AutoReconnect;
+            session.on_closed(clean, auto_reconnect);
             session.monitor_panel = None;
             session.processes.clear();
             session.connected_at = None;
@@ -3120,32 +3093,24 @@ fn handle_conn_event(app: &mut App, event: ConnEvent) -> Task<Message> {
             } else {
                 (
                     crate::ui::toasts::ToastKind::Info,
-                    format!("Disconnected from {}", session.config.target_label()),
+                    format!(
+                        "{} — {}",
+                        session.config.target_label(),
+                        session.phase.label()
+                    ),
                 )
             });
         }
-        ConnEvent::Failed { error, fatal, .. } => {
+        ConnEvent::Failed { failure, fatal, .. } => {
             crate::smoke::record(&smoke, "failed");
-            // A retryable failure inside the reconnect loop schedules the next
-            // attempt instead of surfacing as Failed. Fatal ones (auth,
-            // username) stop the loop: another attempt cannot change them,
-            // and hammering a wrong password would lock the account.
-            if session.phase == Phase::Reconnecting && !fatal {
-                session.reconnect_attempt += 1;
-                let attempt = session.reconnect_attempt;
-                session.reconnect_at =
-                    Some(std::time::Instant::now() + crate::session::reconnect_backoff(attempt));
-                session.status = format!("Reconnecting — attempt {attempt}: {error}");
-            } else {
-                session.phase = Phase::Failed(error.clone());
-                session.status = error.clone();
-            }
+            let message = failure.message.clone();
+            session.on_failed(failure, fatal);
             session.connected_at = None;
             session.suggestion_state.clear_all();
             session.inline_suggestion = None;
             // Same as Closed: the subtab band/rail go away, so re-grid.
             regrid_after = true;
-            toast = Some((crate::ui::toasts::ToastKind::Error, error));
+            toast = Some((crate::ui::toasts::ToastKind::Error, message));
         }
         ConnEvent::SuggestionData {
             tag, candidates, ..

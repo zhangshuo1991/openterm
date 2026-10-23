@@ -188,19 +188,23 @@ pub fn view(app: &App) -> Element<'_, Message> {
     ]
     .spacing(14);
 
-    if let Phase::Failed(error) = &session.phase {
+    if let Phase::Failed(failure) = &session.phase {
         form = form.push(
-            container(text(error.clone()).size(13).color(theme::status_error()))
-                .padding([8, 12])
-                .style(|_| container::Style {
-                    background: Some(theme::with_alpha(theme::status_error(), 0.10).into()),
-                    border: iced::Border {
-                        color: theme::with_alpha(theme::status_error(), 0.3),
-                        width: 1.0,
-                        radius: 8.0.into(),
-                    },
-                    ..Default::default()
-                }),
+            container(
+                text(failure.message.clone())
+                    .size(13)
+                    .color(theme::status_error()),
+            )
+            .padding([8, 12])
+            .style(|_| container::Style {
+                background: Some(theme::with_alpha(theme::status_error(), 0.10).into()),
+                border: iced::Border {
+                    color: theme::with_alpha(theme::status_error(), 0.3),
+                    width: 1.0,
+                    radius: 8.0.into(),
+                },
+                ..Default::default()
+            }),
         );
     }
 

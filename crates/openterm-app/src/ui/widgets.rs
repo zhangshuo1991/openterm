@@ -247,7 +247,7 @@ pub fn phase_color(phase: &Phase) -> Color {
         Phase::Connected => theme::status_ok(),
         Phase::Connecting | Phase::Reconnecting => theme::status_warn(),
         Phase::Failed(_) => theme::status_error(),
-        Phase::Idle => theme::status_idle(),
+        Phase::Idle | Phase::Closed(_) => theme::status_idle(),
     }
 }
 

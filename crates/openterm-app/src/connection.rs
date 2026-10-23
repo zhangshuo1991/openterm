@@ -282,7 +282,7 @@ pub enum Event {
     },
     Failed {
         session_id: u64,
-        error: String,
+        failure: crate::session::Failure,
         /// True for failures another attempt cannot fix (bad credentials,
         /// missing username). Auto-reconnect must stop on these — retrying a
         /// wrong password forever just locks the account.
@@ -397,7 +397,7 @@ async fn run_connection(
                 let _ = out
                     .send(Event::Failed {
                         session_id,
-                        error: error.to_string(),
+                        failure: crate::session::Failure::from_ssh(&error),
                         fatal,
                     })
                     .await;
@@ -421,7 +421,7 @@ async fn run_connection(
                 let _ = out
                     .send(Event::Failed {
                         session_id,
-                        error: error.to_string(),
+                        failure: crate::session::Failure::from_ssh(&error),
                         fatal,
                     })
                     .await;
@@ -1387,7 +1387,10 @@ pub fn local_worker(session_id: u64) -> impl iced::futures::Stream<Item = Event>
                 let _ = out
                     .send(Event::Failed {
                         session_id,
-                        error: e.to_string(),
+                        failure: crate::session::Failure::new(
+                            crate::session::FailureKind::Connection,
+                            e.to_string(),
+                        ),
                         fatal: true,
                     })
                     .await;
@@ -2026,7 +2029,9 @@ mod tests {
         loop {
             match stream.next().await {
                 Some(Event::Connected { .. }) => break,
-                Some(Event::Failed { error, .. }) => panic!("local shell failed: {error}"),
+                Some(Event::Failed { failure, .. }) => {
+                    panic!("local shell failed: {}", failure.message)
+                }
                 Some(_) => continue,
                 None => panic!("worker stream ended before Connected"),
             }
@@ -2096,21 +2101,33 @@ mod tests {
     }
 
     /// Build a route to the live test server (mirrors openterm-ssh's harness).
+    /// `OPENTERM_TEST_HOST`, `OPENTERM_TEST_PORT` and `OPENTERM_TEST_USER`
+    /// point it at another server, e.g. a loopback sshd.
     fn test_route() -> ConnectRoute {
+        use openterm_ssh::AuthMethod;
+        test_route_with_auth(AuthMethod::PrivateKey {
+            path: live_key_path(),
+            passphrase: None,
+        })
+    }
+
+    fn test_route_with_auth(auth: openterm_ssh::AuthMethod) -> ConnectRoute {
         use openterm_core::HostProfile;
-        use openterm_ssh::{AuthMethod, ConnectOptions, HostKeyPolicy};
-        let key = live_key_path();
-        let mut profile = HostProfile::new("live", "82.157.57.178");
-        profile.port = 22;
-        profile.username = Some("ubuntu".to_string());
+        use openterm_ssh::{ConnectOptions, HostKeyPolicy};
+        let host = std::env::var("OPENTERM_TEST_HOST").unwrap_or_else(|_| "82.157.57.178".into());
+        let user = std::env::var("OPENTERM_TEST_USER").unwrap_or_else(|_| "ubuntu".into());
+        let port = std::env::var("OPENTERM_TEST_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(22);
+        let mut profile = HostProfile::new("live", &host);
+        profile.port = port;
+        profile.username = Some(user.clone());
         ConnectRoute {
             target: profile,
             target_options: ConnectOptions {
-                username: "ubuntu".to_string(),
-                auth: AuthMethod::PrivateKey {
-                    path: key,
-                    passphrase: None,
-                },
+                username: user,
+                auth,
                 trust_unknown_host_keys: true,
                 host_key_policy: HostKeyPolicy::TrustAll,
                 timeout: std::time::Duration::from_secs(15),
@@ -2315,7 +2332,9 @@ mod tests {
             loop {
                 match stream.next().await {
                     Some(Event::Connected { .. }) => break,
-                    Some(Event::Failed { error, .. }) => panic!("local shell failed: {error}"),
+                    Some(Event::Failed { failure, .. }) => {
+                        panic!("local shell failed: {}", failure.message)
+                    }
                     Some(_) => continue,
                     None => panic!("worker stream ended before Connected"),
                 }
@@ -2465,6 +2484,115 @@ mod tests {
 
             let _ = sender.send(Command::Disconnect).await;
         }
+
+        /// Feed worker events into `session` the way `update` does, until an
+        /// event matching `until` has been applied.
+        async fn pump(
+            stream: &mut (impl StreamExt<Item = Event> + Unpin),
+            session: &mut crate::session::Session,
+            until: fn(&Event) -> bool,
+        ) {
+            use crate::session::Phase;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(25);
+            loop {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "timed out in phase {:?}",
+                    session.phase
+                );
+                let event =
+                    match tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+                        .await
+                    {
+                        Ok(Some(event)) => event,
+                        Ok(None) => panic!("worker stream ended in phase {:?}", session.phase),
+                        Err(_) => continue,
+                    };
+                let done = until(&event);
+                match event {
+                    Event::Connected { .. } => {
+                        session.phase = Phase::Connected;
+                        session.exit_code = None;
+                    }
+                    Event::Exit { code, .. } => session.exit_code = Some(code),
+                    Event::Closed { clean, .. } => session.on_closed(clean, true),
+                    Event::Failed { failure, fatal, .. } => session.on_failed(failure, fatal),
+                    _ => {}
+                }
+                if done {
+                    return;
+                }
+            }
+        }
+
+        /// The session state model against a real server: a shell exited on
+        /// purpose, the user's Disconnect and rejected credentials each land
+        /// in their own phase, and none of them auto-reconnects.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn session_phase_tracks_real_ssh_lifecycle() {
+            use crate::session::{CloseReason, FailureKind, Phase, Session, SessionConfig};
+            if live_test_key().is_none() {
+                return;
+            }
+            let mut stream = Box::pin(worker(22));
+            let sender = match stream.next().await {
+                Some(Event::Ready { sender, .. }) => sender,
+                _ => panic!("expected Ready"),
+            };
+            let mut session = Session::new(22, SessionConfig::blank("u".into(), "k".into()), 80, 24);
+            let connect = |route| {
+                Command::Connect(ConnectParams {
+                    route,
+                    persistence: false,
+                    cols: 80,
+                    rows: 24,
+                    term: "xterm-256color".to_string(),
+                })
+            };
+            let connected = |e: &Event| matches!(e, Event::Connected { .. });
+            let closed = |e: &Event| matches!(e, Event::Closed { .. });
+
+            // The shell exits with a status: Closed(Exited), not a reconnect.
+            // OpenSSH sends EOF and the exit status in either order, so one
+            // round would only catch a lost status by luck.
+            for code in 1..=8u32 {
+                sender.send(connect(test_route())).await.unwrap();
+                pump(&mut stream, &mut session, connected).await;
+                assert_eq!(session.phase.label(), "Connected");
+                assert_eq!(session.status_detail(), None);
+                sender
+                    .send(Command::Write(format!("exit {code}\r\n").into_bytes()))
+                    .await
+                    .unwrap();
+                pump(&mut stream, &mut session, closed).await;
+                assert_eq!(session.phase, Phase::Closed(CloseReason::Exited(code)));
+                assert!(session.reconnect_at.is_none());
+            }
+            assert_eq!(session.status_detail().as_deref(), Some("Exit status 8"));
+
+            // The user's Disconnect: Closed(User).
+            sender.send(connect(test_route())).await.unwrap();
+            pump(&mut stream, &mut session, connected).await;
+            session.user_disconnect = true;
+            assert_eq!(session.status_detail().as_deref(), Some("Disconnecting…"));
+            sender.send(Command::Disconnect).await.unwrap();
+            pump(&mut stream, &mut session, closed).await;
+            assert_eq!(session.phase, Phase::Closed(CloseReason::User));
+            assert_eq!(session.phase.label(), "Disconnected");
+            assert!(session.reconnect_at.is_none());
+
+            // A rejected password: Failed(Auth), shown as such on the pill.
+            let wrong = openterm_ssh::AuthMethod::Password("openterm-wrong-password".into());
+            sender.send(connect(test_route_with_auth(wrong))).await.unwrap();
+            pump(&mut stream, &mut session, |e| matches!(e, Event::Failed { .. })).await;
+            match &session.phase {
+                Phase::Failed(failure) => assert_eq!(failure.kind, FailureKind::Auth),
+                other => panic!("expected an auth failure, got {other:?}"),
+            }
+            assert_eq!(session.phase.label(), "Authentication failed");
+
+            let _ = sender.send(Command::Disconnect).await;
+        }
     }
     mod tmux_persistence_tests {
         use super::*;
@@ -2481,7 +2609,9 @@ mod tests {
                 assert!(tokio::time::Instant::now() < deadline, "{what} timed out");
                 match tokio::time::timeout(std::time::Duration::from_secs(5), stream.next()).await {
                     Ok(Some(Event::Connected { .. })) => return,
-                    Ok(Some(Event::Failed { error, .. })) => panic!("{what} failed: {error}"),
+                    Ok(Some(Event::Failed { failure, .. })) => {
+                        panic!("{what} failed: {}", failure.message)
+                    }
                     Ok(Some(_)) => continue,
                     Ok(None) => panic!("{what} ended without Connected"),
                     Err(_) => continue,
