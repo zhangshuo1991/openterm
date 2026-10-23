@@ -136,6 +136,13 @@ const TRANSFER_ATTEMPTS: usize = 4;
 const TRANSFER_RETRY_BACKOFF: Duration = Duration::from_millis(750);
 const TRANSFER_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(8);
 
+/// How long an interactive shell waits for the channel close after the
+/// server's EOF. OpenSSH may send EOF *before* the exit status, so stopping at
+/// EOF loses the status and a deliberate `exit` looks like a dropped
+/// connection. RFC 4254 puts the close last; the grace only bounds a server
+/// that never sends it.
+const SHELL_CLOSE_GRACE: Duration = Duration::from_secs(2);
+
 /// Run `fut` with a deadline, mapping expiry to [`SshError::Timeout`]. On
 /// timeout the in-flight future is dropped, which closes its channel and
 /// releases the channel-semaphore permit it held.
@@ -951,6 +958,7 @@ impl RusshSession {
 
         let (mut reader, writer) = channel.split();
         let mut exit_status = 0;
+        let mut eof = false;
 
         loop {
             tokio::select! {
@@ -976,10 +984,12 @@ impl RusshSession {
                             exit_status = code;
                             let _ = events.send(PtyEvent::ExitStatus(code)).await;
                         }
-                        Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+                        Some(ChannelMsg::Eof) => eof = true,
+                        Some(ChannelMsg::Close) | None => break,
                         _ => {}
                     }
                 }
+                _ = tokio::time::sleep(SHELL_CLOSE_GRACE), if eof => break,
             }
         }
 
